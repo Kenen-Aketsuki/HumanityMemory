@@ -1,0 +1,30 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# --- 本地数据 ---
+*.db
+*.db-wal
+*.db-shm
+.data/
+.env
+
+# --- 记忆库工作区（令牌含工作区绑定与可选凭据，绝不入库）---
+.ai_memory/
+**/memory.token.json
+**/active.token.json
+*.token.json
+
+# --- 随项目附带的三方二进制（体积大，按需下载）---
+tools/bin/
+
+# --- 编辑器 ---
+.vscode/
+.idea/
+.DS_Store
