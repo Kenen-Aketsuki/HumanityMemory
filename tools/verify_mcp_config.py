@@ -44,6 +44,14 @@ EXPECTED_TOOLS = {
     "memory_stats",
     "memory_maintenance",
     "memory_use_workspace",
+    "memory_archive",
+    "memory_unarchive",
+    "memory_purge_candidates",
+    "memory_purge",
+    "memory_compress_preview",
+    "memory_compress_apply",
+    "memory_recompress_preview",
+    "memory_recompress_apply",
 }
 
 

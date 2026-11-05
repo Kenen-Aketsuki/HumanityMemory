@@ -27,22 +27,39 @@ from .paths import (
     resolve_layout,
     write_last_workspace,
 )
-from .store import MemoryStore, NotFound, ScopeError
+from .store import MemoryStore, NotFound, ScopeError, _norm_kind
 from .token import Token, TokenError, resolve_token_path
 
 INSTRUCTIONS_TAIL = """\
 记忆使用纪律：
-- 事实（fact）是长期结论，写简短陈述句；被推翻时追加新事实并用 invalidates 指向旧事实，
-  禁止改写或删除历史。
-- 日志（log）是当天的原始记录，只追加、不改写。白天对话里写日志，别急着写事实。
+存放纪律（先想 kind，再落笔）：
+- knowledge 知识：换个单号/任务 ID 仍然成立的机制与约定，能指出代码落点。
+- state 现状：当前为真但会变的东西（版本、依赖、路径、资源配置），200 字内，
+  给 source；换代时用 invalidates 顶掉旧的，别让旧现状烂在库里。
+- case 案例：一次具体事件的「现象 → 根因 → 落点」，≤300 字，一个问题一条。
+  带单号的排查结论放这里 —— 它换个单号就不成立，不是知识。
+- narrative 叙述：当天过程、试错与判断转折。
+- 日志（log）是当天的原始记录，只追加、不改写。白天先写日志，复盘时再压缩。
+- state 不会因为被检索到就续命：必须 memory_write(kind="state", verifies=<id>) 才算确认。
 - 复盘时先用 consolidate_preview 取素材，总结后用 consolidate_apply 提交。
 - 一个 server 可以服务多个项目：如果在某个具体项目里工作，而 memory_stats 显示的工作区
   不是你预期的那个，先调用 memory_use_workspace 传入项目根目录再继续。
+- 记忆有生命周期：长期不用会被归档（默认检索不到但内容还在）。想清理时先
+  memory_archive 预览、memory_purge_candidates 看候选，**永远不要自动删**。
 """
 
 
 def _ok(**payload: Any) -> dict[str, Any]:
     return {"ok": True, **payload}
+
+
+def _as_list(kinds: list[str] | str | None) -> list[str]:
+    """kinds 允许 None / "all" / "knowledge" / ["knowledge","case"] 混着传。"""
+    if kinds is None:
+        return []
+    if isinstance(kinds, str):
+        return [kinds]
+    return [str(k) for k in kinds]
 
 
 def _err(message: str) -> dict[str, Any]:
@@ -138,99 +155,135 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
             note="已写入。信条为静态注入，下次会话启动才生效。",
         )
 
-    # ------------------------------------------------------------- 事实
+    # ------------------------------------------------------------- 陈述
 
     @app.tool(
-        name="fact_write",
-        description="写入长期事实（简短陈述句）。推翻旧事实时用 invalidates 传旧 id，不要改旧记录。",
+        name="memory_write",
+        description=(
+            "唯一的写入口，按 kind 分派：knowledge（知识）/ state（现状）/ case（案例）"
+            "/ narrative（叙述）。名字不精确就是灾难——先看 kind 怎么选。"
+        ),
     )
-    def fact_write(
-        content: str,
+    def memory_write(
+        kind: str,
+        content: str = "",
         tags: list[str] | None = None,
         importance: float | None = None,
         scope: str = "workspace",
         invalidates: str | None = None,
+        verifies: str | None = None,
         source: str | None = None,
+        day: str | None = None,
     ) -> dict[str, Any]:
         """
         Args:
-            content: 一句话事实。必须简短精确，不要写事件过程；超过 500 字会被拒。
+            kind:
+                knowledge — 知识。**换个单号/任务 ID/资源名仍然成立**，能指出代码落点。
+                    机制、约定、坑。上限 500 字。
+                state — 现状。当前为真但会随版本变化（版本号、依赖、路径、资源配置）。
+                    上限 200 字，必须给 source。会变的东西别写成 knowledge。
+                case — 案例。一次具体事件压成「现象 → 根因 → 落点」，上限 300 字，
+                    一个问题一条。带单号的排查结论放这里，不要放 knowledge。
+                narrative — 叙述。当天过程、试错、判断转折，可长。
+            content: 正文。**空 content 只允许 kind=state 且带 verifies**（纯确认）。
             tags: 标签，用于过滤。
-            importance: 0~1，默认 0.8。
-            scope: workspace（项目）| global（跨项目，数量要很少）。
-            invalidates: 被这条事实推翻的旧事实 id。
-            source: 来源标识。
+            importance: 0~1。默认 knowledge 0.8 / state 0.85 / case 0.75 / narrative 0.4。
+            scope: workspace（项目）| global（跨项目，仅陈述类支持且数量要很少）。
+            invalidates: 被这条取代的旧条目 id。state 换代必须用它，别让旧现状烂在库里。
+            verifies: 确认某条 state 仍然成立并续命（不写新内容时用它）。
+            source: 来源标识；写 state 时建议写清「凭什么认为它是这样」。
+            day: 仅 case / narrative 用，默认今天。
         """
         try:
-            fact = _st().write_fact(
-                content, tags=tags, importance=importance, scope=scope, source=source
+            item = _st().write_memory(
+                content,
+                kind=kind,
+                tags=tags,
+                importance=importance,
+                scope=scope,
+                invalidates=invalidates,
+                verifies=verifies,
+                source=source,
+                day=day,
             )
-        except (ScopeError, ValueError) as exc:
+        except (ScopeError, ValueError, NotFound) as exc:
             return _err(str(exc))
         except Exception as exc:  # noqa: BLE001
             return _err(f"写入失败：{type(exc).__name__}: {exc}")
-
-        invalidated = None
-        warning = None
-        if invalidates:
-            try:
-                invalidated = _st().invalidate_fact(
-                    invalidates, invalidated_by=fact.id
-                ).to_dict()
-            except NotFound as exc:
-                warning = f"新事实已写入，但旧事实取消失败：{exc}"
-
-        return _ok(
-            fact=fact.to_dict(),
-            invalidated=invalidated,
-            embedded=fact.embedded,
-            warning=warning,
-            hint=None if fact.embedded else "embedding 不可用，当前仅能被关键词检索",
-        )
+        return _ok(item=item.to_dict(), kind=item.kind, embedded=item.embedded)
 
     @app.tool(
-        name="fact_invalidate",
-        description="让一条事实失效（不删除，保留历史）。用于事实过时但暂无替代的情况。",
+        name="memory_invalidate",
+        description="让一条条目失效（不删除，保留历史）。现状过时但暂无替代时用它。",
     )
-    def fact_invalidate(fact_id: str, invalidated_by: str | None = None) -> dict[str, Any]:
+    def memory_invalidate(item_id: str, invalidated_by: str | None = None) -> dict[str, Any]:
         try:
-            fact = _st().invalidate_fact(fact_id, invalidated_by=invalidated_by)
+            item = _st().invalidate(item_id, invalidated_by=invalidated_by)
         except NotFound as exc:
             return _err(str(exc))
-        return _ok(fact=fact.to_dict())
+        return _ok(item=item.to_dict())
 
     @app.tool(
-        name="fact_promote",
-        description="把项目事实提升为全局事实（跨项目可用）。旧条目标记失效并指向新条目。",
+        name="memory_promote",
+        description="把项目条目提升为全局条目（跨项目可用）。旧条目标记失效并指向新条目。",
     )
-    def fact_promote(fact_id: str) -> dict[str, Any]:
+    def memory_promote(item_id: str) -> dict[str, Any]:
         try:
-            old, new = _st().promote_fact(fact_id)
+            old, new = _st().promote(item_id)
         except (NotFound, ValueError, ScopeError) as exc:
             return _err(str(exc))
         stats = _st().stats()
         return _ok(
             promoted=new.to_dict(),
             invalidated=old.to_dict(),
-            global_facts=stats.get("global_facts"),
+            global_knowledge=stats.get("global_knowledge"),
             warning=stats.get("hint"),
         )
 
-    @app.tool(name="fact_list", description="列出事实，默认只列有效的。")
-    def fact_list(
-        scope: str = "all", include_invalid: bool = False, limit: int = 30
+    @app.tool(name="memory_list", description="列出条目，默认只列有效的。kinds 不传即全部。")
+    def memory_list(
+        kinds: list[str] | str | None = None,
+        scope: str = "all",
+        include_invalid: bool = False,
+        limit: int = 30,
     ) -> dict[str, Any]:
         """
         Args:
+            kinds: all | knowledge | state | case | narrative | log 的子集。
             scope: all | workspace | global
         """
         try:
-            facts = _st().list_facts(
-                scope=scope, include_invalid=include_invalid, limit=max(1, min(limit, 200))
-            )
+            picked = {_norm_kind(k) for k in _as_list(kinds)}
+            want_all = not picked or "all" in picked
+            items: list[dict[str, Any]] = []
+            if want_all or picked & {"knowledge", "state"}:
+                items += [
+                    k.to_dict()
+                    for k in _st().list_knowledge(
+                        kinds=None if want_all else sorted(picked & {"knowledge", "state"}),
+                        scope=scope,
+                        include_invalid=include_invalid,
+                        limit=max(1, min(limit, 200)),
+                    )
+                ]
+            if want_all or picked & {"case", "narrative"}:
+                items += [
+                    e.to_dict()
+                    for e in _st().list_episodes(
+                        kinds=None if want_all else sorted(picked & {"case", "narrative"}),
+                        limit=max(1, min(limit, 200)),
+                    )
+                ]
+            if want_all or "log" in picked:
+                items += [
+                    log.to_dict()
+                    for log in _st().list_logs(
+                        include_consolidated=include_invalid, limit=max(1, min(limit, 500))
+                    )
+                ]
         except ScopeError as exc:
             return _err(str(exc))
-        return _ok(count=len(facts), facts=[f.to_dict() for f in facts])
+        return _ok(count=len(items), items=items)
 
     # ------------------------------------------------------------- 日志
 
@@ -282,21 +335,26 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
 
     @app.tool(
         name="memory_search",
-        description="跨层混合检索（事实 + 经历 + 日志，自动含全局事实）。不改变访问强度。",
+        description=(
+            "跨层混合检索（知识 + 现状 + 案例 + 叙述 + 日志，自动含全局库）。"
+            "不改访问强度；要续命 state 请用 memory_write(verifies=)。"
+        ),
     )
     def memory_search(
         query: str,
-        kinds: list[str] | None = None,
+        kinds: list[str] | str | None = None,
         scope: str = "all",
         include_invalid: bool = False,
         limit: int = 8,
+        format: str = "lines",
     ) -> dict[str, Any]:
         """
         Args:
             query: 自然语言查询。
-            kinds: fact / episode / log 的子集，默认全部。
+            kinds: all / knowledge / state / case / narrative / log 的子集，默认全部。
             scope: all | workspace | global
-            include_invalid: 是否包含已失效事实（查历史用）。
+            include_invalid: 是否包含已失效条目（查历史用）。
+            format: lines（默认，一行一条，省 token）| full（带分数与元数据）。
         """
         try:
             hits = _st().search(
@@ -310,22 +368,30 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
             return _err(str(exc))
         except Exception as exc:  # noqa: BLE001
             return _err(f"检索失败：{type(exc).__name__}: {exc}")
-        return _ok(
-            count=len(hits),
-            results=[h.to_dict() for h in hits],
-            degraded=None if _st().embedder.available else "embedding 不可用，本次为关键词检索",
-        )
+        payload: dict[str, Any] = {
+            "count": len(hits),
+            "lines": [h.to_line() for h in hits],
+            "degraded": None if _st().embedder.available else "embedding 不可用，本次为关键词检索",
+        }
+        if format == "full":
+            payload["results"] = [h.to_dict() for h in hits]
+        return _ok(**payload)
 
     @app.tool(
         name="memory_recall",
-        description="按当前话题召回并强化命中项。返回可直接拼进上下文的 lines。",
+        description="按当前话题召回并强化命中项。只回 lines（省 token），需要元数据用 memory_search。",
     )
     def memory_recall(
-        context: str, kinds: list[str] | None = None, limit: int = 6
+        context: str,
+        kinds: list[str] | str | None = None,
+        limit: int = 6,
+        format: str = "lines",
     ) -> dict[str, Any]:
         """
         Args:
             context: 当前在做什么。写具体情境，别只写关键词。
+            kinds: all / knowledge / state / case / narrative / log 的子集。
+            format: lines（默认）| full。
         """
         try:
             hits = _st().recall(context, kinds=kinds, limit=max(1, min(limit, 20)))
@@ -333,11 +399,13 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
             return _err(str(exc))
         except Exception as exc:  # noqa: BLE001
             return _err(f"召回失败：{type(exc).__name__}: {exc}")
-        return _ok(
-            count=len(hits),
-            lines=[h.to_line() for h in hits],
-            results=[h.to_dict() for h in hits],
-        )
+        payload: dict[str, Any] = {
+            "count": len(hits),
+            "lines": [h.to_line() for h in hits],
+        }
+        if format == "full":
+            payload["results"] = [h.to_dict() for h in hits]
+        return _ok(**payload)
 
     # ------------------------------------------------------------- 复盘
 
@@ -348,7 +416,8 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
     def consolidate_preview(day: str | None = None, limit: int = 300) -> dict[str, Any]:
         """
         Args:
-            day: YYYY-MM-DD / today / yesterday，默认今天。
+            day: YYYY-MM-DD / today / yesterday。**不传时自动找最近一个仍有待复盘
+                 日志的日期**，适合定时任务补齐积压。
         """
         try:
             return _ok(
@@ -359,28 +428,34 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
 
     @app.tool(
         name="consolidate_apply",
-        description="提交复盘结果：写入提炼的事实与压缩经历，标记日志已处理，可选清空原始日志。",
+        description="提交复盘结果：写入提炼的知识/现状与案例/叙述，标记日志已处理，可选清空原始日志。",
     )
     def consolidate_apply(
         day: str | None = None,
-        facts: list[dict[str, Any]] | None = None,
-        episodes: list[str] | None = None,
+        knowledge: list[dict[str, Any]] | None = None,
+        episodes: list[dict[str, Any] | str] | None = None,
         summary: str | None = None,
         purge: bool = True,
     ) -> dict[str, Any]:
         """
         Args:
             day: 复盘哪一天，默认今天。
-            facts: 事实数组，每项 {"content": str, "tags": [str],
-                   "importance": float, "invalidates": "旧fact_id"}。
-            episodes: 压缩后的经历叙述，1~3 段。
+            knowledge: 陈述数组，每项 {"content": str, "kind": "knowledge"|"state",
+                   "tags": [str], "importance": float, "invalidates": "旧id", "source": str}。
+                   kind 不传按 knowledge。**带单号的排查结论不要放这里**，
+                   它换个单号就不成立了 —— 那是 case。
+            episodes: 经历数组。每项 {"content": str, "kind": "case"|"narrative",
+                   "importance": float, "tags": [str]}。
+                   case 只写「现象 → 根因 → 落点」，≤300 字，一个问题一条；
+                   narrative 写当天过程与判断转折，importance 决定初始详细程度
+                   （≥0.75 完整叙述 / 0.45~0.75 要点 / <0.45 一句话）。
             summary: 当天一句话总结（可选）。
             purge: 是否物理清空已复盘的原始日志，默认 true。
         """
         try:
             result = _st().consolidate_apply(
                 day=day,
-                facts=facts,
+                knowledge=knowledge,
                 episodes=episodes,
                 summary=summary,
                 purge=purge,
@@ -437,9 +512,140 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
             persisted=persist,
         )
 
+    # ------------------------------------------------------------- 生命维持
+
+    @app.tool(
+        name="memory_archive",
+        description="按「久未触碰 + 访问少」归档低价值记忆。默认只预览，dry_run=false 才执行。",
+    )
+    def memory_archive(dry_run: bool = True) -> dict[str, Any]:
+        """
+        归档 = 默认检索不到，但内容一字未改，`include_archived=true` 仍能查回。
+        信条不参与；陈述与经历按**行级 kind** 各自 TTL 判定：
+          knowledge 3 年 / state 30 天 / case 1 年 / narrative 1 年。
+        state 的续命不看访问次数，只认 verified_at —— 反复被查往往说明它已经不准了。
+
+        Args:
+            dry_run: true（默认）只列候选不动数据；false 才真正归档。
+        """
+        try:
+            with state_lock:
+                return _ok(report=_st().archive_pass(dry_run=dry_run))
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"归档失败：{type(exc).__name__}: {exc}")
+
+    @app.tool(name="memory_unarchive", description="把已归档的记忆恢复正常（会重新嵌入）。")
+    def memory_unarchive(memory_id: str) -> dict[str, Any]:
+        try:
+            with state_lock:
+                return _ok(result=_st().unarchive(memory_id))
+        except (NotFound, ValueError) as exc:
+            return _err(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"恢复失败：{type(exc).__name__}: {exc}")
+
+    @app.tool(
+        name="memory_purge_candidates",
+        description="列出「已归档且长期未再访问」的删除候选。只报告，不删除。",
+    )
+    def memory_purge_candidates(after_days: float | None = None) -> dict[str, Any]:
+        """
+        Args:
+            after_days: 归档后静默多少天算候选；不传用配置默认（180 天）。
+        """
+        try:
+            items = _st().purge_candidates(after_days=after_days)
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"查询失败：{type(exc).__name__}: {exc}")
+        return _ok(
+            count=len(items),
+            candidates=items,
+            note="删除不可恢复。确认后调用 memory_purge(ids=[...])；不确认就保留，它们已不参与检索。",
+        )
+
+    @app.tool(
+        name="memory_purge",
+        description="物理删除指定记忆（含向量）。不可恢复，只能删已归档的条目。",
+    )
+    def memory_purge(ids: list[str], confirm: bool = False) -> dict[str, Any]:
+        """
+        Args:
+            ids: 要删除的记忆 id 列表。
+            confirm: 必须显式传 true 才会执行 —— 防止误调用。
+        """
+        if not confirm:
+            return _err("拒绝执行：物理删除不可恢复，请显式传 confirm=true")
+        try:
+            with state_lock:
+                return _ok(result=_st().purge_items(ids))
+        except (NotFound, ValueError, ScopeError) as exc:
+            return _err(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"删除失败：{type(exc).__name__}: {exc}")
+
+    @app.tool(
+        name="memory_compress_preview",
+        description="列出可压缩的经历（同一天多条）。只读，实际压缩要你总结后调 compress_apply。",
+    )
+    def memory_compress_preview() -> dict[str, Any]:
+        try:
+            return _ok(preview=_st().compress_candidates())
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"查询失败：{type(exc).__name__}: {exc}")
+
+    @app.tool(
+        name="memory_compress_apply",
+        description="把多条经历合并成一条摘要，原条目转为归档（不删除）。",
+    )
+    def memory_compress_apply(ids: list[str], summary: str, day: str | None = None) -> dict[str, Any]:
+        """
+        Args:
+            ids: 要合并的经历 id 列表。
+            summary: 合并后的叙述，保留因果与结论，不要流水账。
+            day: 合并后归属的日期，默认取第一条的日期。
+        """
+        try:
+            with state_lock:
+                return _ok(result=_st().compress_apply(ids, summary, day=day))
+        except (NotFound, ValueError, ScopeError) as exc:
+            return _err(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"压缩失败：{type(exc).__name__}: {exc}")
+
+    @app.tool(
+        name="memory_recompress_preview",
+        description="列出该被进一步压缩的经历（按年龄分档：30 天→level1，180 天→level2）。",
+    )
+    def memory_recompress_preview() -> dict[str, Any]:
+        try:
+            return _ok(preview=_st().recompress_preview())
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"查询失败：{type(exc).__name__}: {exc}")
+
+    @app.tool(
+        name="memory_recompress_apply",
+        description="把经历改写成更短的版本并提升压缩级别（1=去冗余，2=只留结论）。",
+    )
+    def memory_recompress_apply(items: list[dict[str, Any]], level: int) -> dict[str, Any]:
+        """
+        经历的压缩是**渐进**的：刚复盘时是完整叙述（level 0），
+        随时间逐级变短。比起步就压缩到位，这样刚发生的细节还能查得到。
+
+        Args:
+            items: [{"id": "e_xxx", "content": "改写后的更短版本"}]
+            level: 目标级别，1（去冗余保关键步骤）或 2（只留结论与根因）。
+        """
+        try:
+            with state_lock:
+                return _ok(result=_st().recompress_apply(items, level=level))
+        except (NotFound, ValueError, ScopeError) as exc:
+            return _err(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"压缩失败：{type(exc).__name__}: {exc}")
+
     @app.tool(
         name="memory_stats",
-        description="查看两库统计：事实/经历/日志数量、待复盘、待嵌入、全局事实是否膨胀。",
+        description="查看两库统计：知识/现状/案例/经历/日志数量、待复盘、待嵌入、全局库是否膨胀。",
     )
     def memory_stats() -> dict[str, Any]:
         try:

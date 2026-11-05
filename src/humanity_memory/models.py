@@ -1,4 +1,16 @@
-"""领域模型：事实 / 经历 / 日志。"""
+"""领域模型：陈述（知识/现状） / 经历（案例/叙述） / 日志。
+
+命名取舍
+--------
+这一层原来叫「事实（fact）」，但那是个误导性的名字 ——
+"Bug #10805 的根因是 X" 也是一条事实，而它恰恰不该进这个库。
+它要收的是**可迁移**的东西，所以陈述层分两种 kind：
+
+    knowledge  知识：离开具体实例仍成立，靠被使用保值，不参与失效
+    state      现状：当前为真但会变（版本、依赖、路径、资源配置），必须能失效
+
+经历层同理：case 是压到三句话的定论，narrative 是保留过程的叙述。
+"""
 
 from __future__ import annotations
 
@@ -10,7 +22,22 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 Scope = Literal["workspace", "global"]
-MemoryType = Literal["fact", "episode", "log"]
+MemoryType = Literal["knowledge", "state", "case", "narrative", "log"]
+
+KnowledgeKind = Literal["knowledge", "state"]
+EpisodeKind = Literal["case", "narrative"]
+
+KNOWLEDGE_KINDS: tuple[str, ...] = ("knowledge", "state")
+EPISODE_KINDS: tuple[str, ...] = ("case", "narrative")
+ALL_KINDS: tuple[str, ...] = ("knowledge", "state", "case", "narrative", "log")
+
+_KIND_LABEL = {
+    "knowledge": "知识",
+    "state": "现状",
+    "case": "案例",
+    "narrative": "经历",
+    "log": "日志",
+}
 
 
 def now_ms() -> int:
@@ -58,11 +85,13 @@ def _loads(text: str | None, default: Any) -> Any:
         return default
 
 
-# ---------------------------------------------------------------- 事实
+# ---------------------------------------------------------------- 陈述层
 
 
 @dataclass(slots=True)
-class Fact:
+class Knowledge:
+    """一条陈述：知识（knowledge）或现状（state）。"""
+
     rowid: int
     id: str
     content: str
@@ -77,12 +106,16 @@ class Fact:
     valid_at: int | None
     invalid_at: int | None
     invalidated_by: str | None
+    archived_at: int | None
     embedded: bool
+    kind: str = "knowledge"
+    verified_at: int | None = None
     meta: dict[str, Any] = field(default_factory=dict)
     db: str = "workspace"
 
     @classmethod
-    def from_row(cls, row: Any, db: str = "workspace") -> "Fact":
+    def from_row(cls, row: Any, db: str = "workspace") -> "Knowledge":
+        keys = row.keys()
         return cls(
             rowid=row["rowid"],
             id=row["id"],
@@ -98,7 +131,10 @@ class Fact:
             valid_at=row["valid_at"],
             invalid_at=row["invalid_at"],
             invalidated_by=row["invalidated_by"],
+            archived_at=row["archived_at"],
             embedded=bool(row["embedded"]),
+            kind=row["kind"] if "kind" in keys else "knowledge",
+            verified_at=row["verified_at"] if "verified_at" in keys else None,
             meta=_loads(row["meta"], {}),
             db=db,
         )
@@ -107,9 +143,18 @@ class Fact:
     def live(self) -> bool:
         return self.invalid_at is None
 
+    @property
+    def archived(self) -> bool:
+        return self.archived_at is not None
+
+    @property
+    def is_state(self) -> bool:
+        return self.kind == "state"
+
     def to_dict(self) -> dict[str, Any]:
         data = {
-            "type": "fact",
+            "type": "knowledge",
+            "kind": self.kind,
             "id": self.id,
             "content": self.content,
             "tags": self.tags,
@@ -117,12 +162,16 @@ class Fact:
             "scope": self.scope,
             "db": self.db,
             "live": self.live,
+            "archived": self.archived,
             "created_at": self.created_at,
             "created_iso": iso(self.created_at),
             "access_count": self.access_count,
         }
         if self.source:
             data["source"] = self.source
+        if self.verified_at:
+            data["verified_at"] = self.verified_at
+            data["verified_iso"] = iso(self.verified_at)
         if self.invalid_at:
             data["invalid_at"] = self.invalid_at
             data["invalid_iso"] = iso(self.invalid_at)
@@ -133,14 +182,21 @@ class Fact:
     def to_line(self) -> str:
         mark = "" if self.live else "·已失效"
         scope = "全局" if self.scope == "global" else "项目"
-        return f"[{self.id}] ({scope}事实{mark}) {self.content}"
+        label = _KIND_LABEL.get(self.kind, "知识")
+        return f"[{self.id}] ({scope}{label}{mark}) {self.content}"
 
 
-# ---------------------------------------------------------------- 经历
+# 旧名保留为别名，方便外部脚本过渡；新代码一律用 Knowledge
+Fact = Knowledge
+
+
+# ---------------------------------------------------------------- 经历层
 
 
 @dataclass(slots=True)
 class Episode:
+    """一次具体事件：案例（case）或叙述（narrative）。"""
+
     rowid: int
     id: str
     content: str
@@ -152,12 +208,16 @@ class Episode:
     created_at: int
     last_accessed_at: int | None
     digest_id: str | None
+    archived_at: int | None
+    compression_level: int
     embedded: bool
+    kind: str = "narrative"
     meta: dict[str, Any] = field(default_factory=dict)
     db: str = "workspace"
 
     @classmethod
     def from_row(cls, row: Any, db: str = "workspace") -> "Episode":
+        keys = row.keys()
         return cls(
             rowid=row["rowid"],
             id=row["id"],
@@ -170,14 +230,26 @@ class Episode:
             created_at=int(row["created_at"]),
             last_accessed_at=row["last_accessed_at"],
             digest_id=row["digest_id"],
+            archived_at=row["archived_at"],
+            compression_level=int(row["compression_level"] or 0),
             embedded=bool(row["embedded"]),
+            kind=row["kind"] if "kind" in keys else "narrative",
             meta=_loads(row["meta"], {}),
             db=db,
         )
 
+    @property
+    def archived(self) -> bool:
+        return self.archived_at is not None
+
+    @property
+    def is_case(self) -> bool:
+        return self.kind == "case"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "type": "episode",
+            "kind": self.kind,
             "id": self.id,
             "content": self.content,
             "day": self.day,
@@ -186,14 +258,17 @@ class Episode:
             "tags": self.tags,
             "importance": round(self.importance, 3),
             "digest_id": self.digest_id,
+            "archived": self.archived,
+            "compression_level": self.compression_level,
             "db": self.db,
         }
 
     def to_line(self) -> str:
-        return f"[{self.id}] ({self.day}) {self.content}"
+        label = "案例" if self.is_case else "经历"
+        return f"[{self.id}] ({self.day}·{label}) {self.content}"
 
 
-# ---------------------------------------------------------------- 日志
+# ---------------------------------------------------------------- 日志层
 
 
 @dataclass(slots=True)
@@ -234,9 +309,14 @@ class LogEntry:
             db=db,
         )
 
+    @property
+    def kind(self) -> str:
+        return "log"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "type": "log",
+            "kind": "log",
             "id": self.id,
             "content": self.content,
             "day": self.day,
@@ -257,7 +337,7 @@ class LogEntry:
 
 @dataclass(slots=True)
 class Hit:
-    item: Any  # Fact | Episode | LogEntry
+    item: Any  # Knowledge | Episode | LogEntry
     score: float
     vector_similarity: float | None = None
     lexical_score: float | None = None
@@ -265,8 +345,7 @@ class Hit:
 
     @property
     def kind(self) -> str:
-        name = type(self.item).__name__
-        return {"Fact": "fact", "Episode": "episode", "LogEntry": "log"}.get(name, "unknown")
+        return getattr(self.item, "kind", "unknown")
 
     def to_dict(self) -> dict[str, Any]:
         data = self.item.to_dict()

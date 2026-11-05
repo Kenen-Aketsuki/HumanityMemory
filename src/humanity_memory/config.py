@@ -8,11 +8,39 @@ from pathlib import Path
 
 DEFAULT_HOME = Path.home() / ".humanity-memory"
 
-# 半衰期默认值（天）：事实几乎不忘，经历慢忘，日志最快
-DEFAULT_HALFLIFE = {"fact": 3650.0, "episode": 180.0, "log": 14.0}
+# 半衰期默认值（天）。陈述层几乎不忘，经历慢忘，日志最快。
+# state 与 knowledge 同半衰期 —— 现状不是"衰减"掉的，是被显式更新掉的。
+DEFAULT_HALFLIFE = {
+    "knowledge": 3650.0,
+    "state": 3650.0,
+    "case": 180.0,
+    "narrative": 180.0,
+    "log": 14.0,
+}
 
-# 不同记忆层的默认重要性
-DEFAULT_IMPORTANCE = {"fact": 0.80, "episode": 0.40, "log": 0.30}
+# 不同 kind 的默认重要性。case 是压过的定论，起点就该比叙述高。
+DEFAULT_IMPORTANCE = {
+    "knowledge": 0.80,
+    "state": 0.85,
+    "case": 0.75,
+    "narrative": 0.40,
+    "log": 0.30,
+}
+
+# 归档判据：超过 ttl 天没被碰过、且访问次数不超过 max_access → 归档。
+#   knowledge 3 年；state 只有 30 天（现状会变，且续命必须显式确认）；
+#   case / narrative 1 年。都不自动删除，只置 archived_at。
+DEFAULT_ARCHIVE_TTL = {
+    "knowledge": 1095.0,
+    "state": 30.0,
+    "case": 365.0,
+    "narrative": 365.0,
+}
+DEFAULT_ARCHIVE_MAX_ACCESS = 1
+
+# 经历的渐进压缩：刚复盘是完整叙述（level 0），随时间逐级变短
+# level 0 → 1 → 2 → 3（归档时），触发门槛见下
+DEFAULT_RECOMPRESS_DAYS = {"1": 30.0, "2": 180.0}
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -73,7 +101,12 @@ class Config:
 
     # 生命周期
     halflife: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_HALFLIFE))
-    archive_strength: float = 0.05
+    archive_ttl: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_ARCHIVE_TTL))
+    archive_max_access: int = DEFAULT_ARCHIVE_MAX_ACCESS
+    purge_after_days: float = 180.0
+    recompress_days: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_RECOMPRESS_DAYS)
+    )
     reinforce_boost: float = 0.20
 
     # 其它
@@ -126,9 +159,22 @@ class Config:
         db_path = Path(get("HM_DB_PATH", str(home / "memory.db"))).expanduser()
 
         halflife = dict(DEFAULT_HALFLIFE)
-        halflife["fact"] = get_float("HM_HALFLIFE_FACT", halflife["fact"])
-        halflife["episode"] = get_float("HM_HALFLIFE_EPISODE", halflife["episode"])
+        halflife["knowledge"] = get_float("HM_HALFLIFE_KNOWLEDGE", halflife["knowledge"])
+        halflife["state"] = get_float("HM_HALFLIFE_STATE", halflife["state"])
+        halflife["case"] = get_float("HM_HALFLIFE_CASE", halflife["case"])
+        halflife["narrative"] = get_float("HM_HALFLIFE_EPISODE", halflife["narrative"])
         halflife["log"] = get_float("HM_HALFLIFE_LOG", halflife["log"])
+
+        archive_ttl = {
+            "knowledge": get_float(
+                "HM_ARCHIVE_TTL_KNOWLEDGE", DEFAULT_ARCHIVE_TTL["knowledge"]
+            ),
+            "state": get_float("HM_ARCHIVE_TTL_STATE", DEFAULT_ARCHIVE_TTL["state"]),
+            "case": get_float("HM_ARCHIVE_TTL_CASE", DEFAULT_ARCHIVE_TTL["case"]),
+            "narrative": get_float(
+                "HM_ARCHIVE_TTL_EPISODE", DEFAULT_ARCHIVE_TTL["narrative"]
+            ),
+        }
 
         return cls(
             home=home,
@@ -144,7 +190,13 @@ class Config:
             w_importance=get_float("HM_W_IMPORTANCE", 0.12),
             w_strength=get_float("HM_W_STRENGTH", 0.16),
             halflife=halflife,
-            archive_strength=get_float("HM_ARCHIVE_STRENGTH", 0.05),
+            archive_ttl=archive_ttl,
+            archive_max_access=get_int("HM_ARCHIVE_MAX_ACCESS", DEFAULT_ARCHIVE_MAX_ACCESS),
+            purge_after_days=get_float("HM_PURGE_AFTER_DAYS", 180.0),
+            recompress_days={
+                "1": get_float("HM_RECOMPRESS_L0_DAYS", DEFAULT_RECOMPRESS_DAYS["1"]),
+                "2": get_float("HM_RECOMPRESS_L1_DAYS", DEFAULT_RECOMPRESS_DAYS["2"]),
+            },
             reinforce_boost=get_float("HM_REINFORCE_BOOST", 0.20),
             vec_extension=get("HM_VEC_EXTENSION", "") or None,
             global_facts_warn=get_int("HM_GLOBAL_FACTS_WARN", 50),
@@ -173,5 +225,8 @@ class Config:
                 "strength": self.w_strength,
             },
             "halflife_days": self.halflife,
-            "archive_threshold": self.archive_strength,
+            "archive_ttl_days": self.archive_ttl,
+            "archive_max_access": self.archive_max_access,
+            "purge_after_days": self.purge_after_days,
+            "recompress_days": self.recompress_days,
         }

@@ -132,3 +132,79 @@ def test_lifecycle_strength_rewards_usage() -> None:
     idle = lifecycle_strength(int(created), 0, int(now), 180)
     used = lifecycle_strength(int(created), 20, int(now), 180)
     assert used > idle
+
+
+# ---------------------------------------------------------------- 归档判据
+
+
+def test_archive_decision_young_item_kept() -> None:
+    from humanity_memory.lifecycle import archive_decision
+
+    now = 1000 * DAY_MS
+    should, reason = archive_decision(int(now - 10 * DAY_MS), None, 0, int(now), 540, 1)
+    assert should is False
+    assert "未到" in reason
+
+
+def test_archive_decision_old_unused_archived() -> None:
+    from humanity_memory.lifecycle import archive_decision
+
+    now = 1000 * DAY_MS
+    should, reason = archive_decision(int(now - 700 * DAY_MS), None, 0, int(now), 540, 1)
+    assert should is True
+    assert "700 天" in reason
+
+
+def test_archive_decision_frequently_used_kept() -> None:
+    from humanity_memory.lifecycle import archive_decision
+
+    now = 1000 * DAY_MS
+    should, _ = archive_decision(int(now - 700 * DAY_MS), int(now - 700 * DAY_MS), 5, int(now), 540, 1)
+    assert should is False
+
+
+def test_archive_decision_uses_last_access_not_created() -> None:
+    """刚被用过就应该续命，即使创建得很早。"""
+    from humanity_memory.lifecycle import archive_decision
+
+    now = 1000 * DAY_MS
+    should, _ = archive_decision(int(now - 900 * DAY_MS), int(now - 5 * DAY_MS), 0, int(now), 540, 1)
+    assert should is False
+
+
+# ---------------------------------------------------------------- 归档判据
+
+
+def test_archive_decision_young_item_kept() -> None:
+    from humanity_memory.lifecycle import archive_decision
+
+    now = 1000 * DAY_MS
+    should, reason = archive_decision(int(now - 10 * DAY_MS), None, 0, int(now), 540, 1)
+    assert should is False
+    assert "未到" in reason
+
+
+def test_archive_decision_old_unused_archived() -> None:
+    from humanity_memory.lifecycle import archive_decision
+
+    now = 1000 * DAY_MS
+    should, reason = archive_decision(int(now - 700 * DAY_MS), None, 0, int(now), 540, 1)
+    assert should is True
+    assert "700 天" in reason
+
+
+def test_archive_decision_frequently_used_kept() -> None:
+    from humanity_memory.lifecycle import archive_decision
+
+    now = 1000 * DAY_MS
+    should, _ = archive_decision(int(now - 700 * DAY_MS), int(now - 700 * DAY_MS), 5, int(now), 540, 1)
+    assert should is False
+
+
+def test_archive_decision_uses_last_access_not_created() -> None:
+    """刚被用过就应该续命，即使创建得很早。"""
+    from humanity_memory.lifecycle import archive_decision
+
+    now = 1000 * DAY_MS
+    should, _ = archive_decision(int(now - 900 * DAY_MS), int(now - 5 * DAY_MS), 0, int(now), 540, 1)
+    assert should is False

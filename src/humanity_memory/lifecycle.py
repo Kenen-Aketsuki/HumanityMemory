@@ -92,3 +92,73 @@ def lifecycle_strength(
     recency = recency_factor(max(0, now_ms - created_ms), halflife_days)
     usage = usage_factor(access_count)
     return recency_weight * recency + (1.0 - recency_weight) * usage
+
+
+def archive_decision(
+    created_ms: int,
+    last_access_ms: int | None,
+    access_count: int,
+    now_ms: int,
+    ttl_days: float,
+    max_access: int,
+    *,
+    verified_ms: int | None = None,
+    access_extends: bool = True,
+) -> tuple[bool, str]:
+    """判断一条记忆该不该归档。
+
+    为什么不用 strength 阈值：`usage_factor` 有 0.5 底分（新内容不该被惩罚），
+    导致再冷的条目强度也跌不到 0，拿绝对阈值归档会永远不触发。
+    改用两个显性条件 —— 「多久没被碰过」+「被访问过几次」，更好解释也好调。
+
+    `access_extends=False` 用于 state：被检索到**不算续命**，必须有人显式确认
+    「我看过了，它还是这样」才刷新 verified_at。否则一条早就过时的
+    「Unity 2022.3」会因为反复被查而永远赖在库里 —— 而反复被查，
+    恰恰可能是它写得太模糊、或者已经不准的信号。
+
+    归档是**可逆的**：只置 archived_at，默认检索不到，内容一行不动。
+    """
+    if access_extends:
+        touch = last_access_ms if last_access_ms is not None else created_ms
+    else:
+        touch = max(created_ms, verified_ms or 0)
+    age_days = max(0.0, now_ms - touch) / DAY_MS
+
+    if access_extends and access_count > max_access:
+        return False, f"访问 {access_count} 次（阈值 {max_access}），保留"
+    if age_days < ttl_days:
+        return False, f"{age_days:.0f} 天未确认（未到 {ttl_days:.0f} 天）"
+    if not access_extends:
+        return True, f"{age_days:.0f} 天未被确认，现状可能已过时"
+    return True, f"{age_days:.0f} 天未用且仅访问 {access_count} 次"
+
+
+# ---------------------------------------------------------------- 初始粒度
+# 仿生记忆的第一个维度：**重要的事一开始就记得细，琐事一开始就模糊**。
+# 不能所有经历都从「完整叙述」起步 —— 那等于把「昨天吃了什么」也录成纪录片。
+
+INITIAL_LEVEL_THRESHOLDS = ((0.75, 0), (0.45, 1), (0.0, 2))
+
+
+def initial_compression_level(importance: float) -> int:
+    """由重要性推导初始压缩级别。
+
+    0.75 以上 → level 0（完整叙述）
+    0.45~0.75 → level 1（要点）
+    0.45 以下 → level 2（一句话）
+    """
+    value = max(0.0, min(1.0, float(importance)))
+    for floor, level in INITIAL_LEVEL_THRESHOLDS:
+        if value >= floor:
+            return level
+    return 2
+
+
+def recompress_threshold(base_days: float, importance: float) -> float:
+    """压缩门槛按重要性缩放：重要的压得慢，琐碎的压得快。
+
+    importance 0.9 → 1.5 倍门槛；0.2 → 0.8 倍。
+    这样「被用户骂了」能比「修了个拼写」多保留一倍的细节时长。
+    """
+    value = max(0.0, min(1.0, float(importance)))
+    return base_days * (0.6 + value)
