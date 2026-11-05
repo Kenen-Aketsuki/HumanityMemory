@@ -360,6 +360,7 @@ class MemoryStore:
         digest_id: str | None = None,
         source: str | None = None,
         meta: dict[str, Any] | None = None,
+        compression_level: int | None = None,
     ) -> Episode:
         """写一条经历。case 要短（≤300 字），narrative 可以有过程。"""
         k = _norm_kind(kind)
@@ -382,7 +383,10 @@ class MemoryStore:
         imp = importance if importance is not None else DEFAULT_IMPORTANCE.get(k, 0.4)
         imp = max(0.0, min(1.0, float(imp)))
         # case 已经是最简形态，不参与后续压缩；narrative 按重要性定起点
-        lvl = 0 if k == "case" else initial_compression_level(imp)
+        if compression_level is not None:
+            lvl = int(compression_level)
+        else:
+            lvl = 0 if k == "case" else initial_compression_level(imp)
         ep_id = new_id("c" if k == "case" else "e")
         vectors = self.embedder.try_embed([text])
         vec = vectors[0] if vectors else None
@@ -1095,6 +1099,7 @@ class MemoryStore:
             at=at,
             day=day,
             digest_id=digest_id,
+            compression_level=compression_level,
         )
 
     def _purge_logs(self, digest_id: str) -> int:
@@ -1280,9 +1285,11 @@ class MemoryStore:
 
         for _db_name, conn in self._all_dbs("workspace"):
             for spec in (KNOWLEDGE, EPISODE):
+                # verified_at 只有陈述层有；经历层补 NULL 占位，省一个分支
+                verified_col = "verified_at" if spec is KNOWLEDGE else "NULL AS verified_at"
                 rows = conn.execute(
                     f"SELECT rowid, id, kind, content, created_at, last_accessed_at,"
-                    f" access_count, verified_at FROM {spec.table}"
+                    f" access_count, {verified_col} FROM {spec.table}"
                     f" WHERE archived_at IS NULL"
                 ).fetchall()
                 for row in rows:
@@ -1567,10 +1574,10 @@ class MemoryStore:
 
         global_live = result["dbs"].get("global", {}).get("knowledge_live", 0)
         result["global_knowledge"] = global_live
-        result["global_knowledge_warn"] = global_live > self.cfg.global_facts_warn
+        result["global_knowledge_warn"] = global_live > self.cfg.global_knowledge_warn
         if result["global_knowledge_warn"]:
             result["hint"] = (
-                f"全局条目已有 {global_live} 条（阈值 {self.cfg.global_facts_warn}）。"
+                f"全局条目已有 {global_live} 条（阈值 {self.cfg.global_knowledge_warn}）。"
                 "跨项目内容本该很少：规则类应写进 CORE_RULES.md，"
                 "项目细节应留在各自的 workspace 库。"
             )

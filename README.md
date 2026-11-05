@@ -12,8 +12,10 @@
                             │ 不参与检索
                             ▼
 ┌──────────────────────────────────────────────────────────────┐
-│  事实层  facts       简短陈述句 · 遗忘极慢 · 追加式失效         │
-│  经历层  episodes    复盘压缩出的叙述 · 慢遗忘                  │
+│  陈述层  knowledge   kind=knowledge 知识 · 遗忘极慢 · 不失效    │
+│                      kind=state     现状 · 30 天不确认即归档   │
+│  经历层  episodes    kind=case      案例 · 三句话定论 · 高权重 │
+│                      kind=narrative 叙述 · 保留过程 · 可压缩   │
 │  日志层  logs        当天原始记录 · append-only · 复盘后清空    │
 └──────────────────────────────────────────────────────────────┘
         │                                    │
@@ -25,7 +27,12 @@
 ## 为什么这么分层
 
 人类不会把每件事都记成永久结论。当天发生的事先粗略记下（日志），
-过一晚沉淀出可复用的经验（事实），细节自然淡出。
+过一晚沉淀出可复用的经验（知识），细节自然淡出。
+
+**为什么陈述层要分「知识」和「现状」**：知识离开具体实例仍成立，只会过时、不会变假；
+现状（版本号、依赖、路径、资源配置）当前为真但随时会变。两者的遗忘曲线差一个数量级 ——
+混在一张表里时，失效机制永远等不到触发条件（实践里 47 条事实 0 条失效）。
+分 kind 之后 `invalid_at` 有了明确的适用对象：**现状**。
 
 这套结构把这个过程显式化了，而且用**数据库触发器**保证纪律：
 
@@ -37,7 +44,8 @@
 ## 特性
 
 - **信条不进检索**：硬约束靠静态注入 100% 命中，不赌召回率
-- **三层分离**：事实/经历/日志各有半衰期（3650 / 180 / 14 天）
+- **kind 分离**：知识/现状/案例/叙述/日志各有半衰期与 TTL（3650 / 3650 / 180 / 180 / 14 天）
+- **现状必须显式续命**：被检索到不算，只有 `verifies` 才算 —— 反复被查往往是它已不准的信号
 - **物理隔离**：项目记忆在项目目录，删项目即删记忆，零残留
 - **跨库检索**：全局事实无论当前在哪个项目都参与召回
 - **混合检索**：余弦向量 KNN + FTS5 trigram + bigram 兜底
@@ -67,8 +75,10 @@ cp .env.example ~/.humanity-memory/.env
 cd D:/proj/YourProject
 D:/proj/HumanityMemory/.venv/Scripts/humanity-memory.exe init
 humanity-memory log add "今天排查了 XXX，根因是 YYY"
-humanity-memory fact add "这个项目的 UI 用 UGUI" --tags Unity
-humanity-memory search "UI 用什么"
+humanity-memory memory add "ResolveTask 末尾的兜底会被短路" --kind knowledge
+humanity-memory memory add "项目是 Unity 2022.3.62f1" --kind state --source ProjectVersion.txt
+humanity-memory memory add "Bug #10805 引导不指餐厅：三条静默出口" --kind case
+humanity-memory search "引导为什么不触发"
 ```
 
 ## 配置
@@ -84,10 +94,15 @@ MCP server 的工作目录不固定，项目级 `.env` 换个目录就失效。
 | `HM_EMBED_MODEL` | — | 例如 `BAAI/bge-m3` |
 | `HM_EMBED_API_KEY` | — | 本地 Ollama 可留空 |
 | `HM_EMBED_DIM` | `1024` | **必须与模型实际维度一致** |
-| `HM_HALFLIFE_FACT` | `3650` | 事实半衰期（天） |
-| `HM_HALFLIFE_EPISODE` | `180` | 经历半衰期 |
+| `HM_HALFLIFE_KNOWLEDGE` | `3650` | 知识半衰期（天） |
+| `HM_HALFLIFE_STATE` | `3650` | 现状半衰期（衰减靠 TTL，不靠这个） |
+| `HM_HALFLIFE_CASE` | `180` | 案例半衰期 |
+| `HM_HALFLIFE_EPISODE` | `180` | 叙述半衰期 |
 | `HM_HALFLIFE_LOG` | `14` | 日志半衰期 |
-| `HM_GLOBAL_FACTS_WARN` | `50` | 全局事实膨胀阈值 |
+| `HM_ARCHIVE_TTL_STATE` | `30` | 现状多久未确认就归档 |
+| `HM_ARCHIVE_TTL_KNOWLEDGE` | `1095` | 知识多久未用就归档 |
+| `HM_ARCHIVE_TTL_CASE` / `_EPISODE` | `365` | 案例 / 叙述归档周期 |
+| `HM_GLOBAL_KNOWLEDGE_WARN` | `50` | 全局条目膨胀阈值（兼容旧名 `HM_GLOBAL_FACTS_WARN`） |
 | `HM_W_RETRIEVAL` | `0.72` | 检索相似度权重 |
 | `HM_W_IMPORTANCE` | `0.12` | 重要性权重 |
 | `HM_W_STRENGTH` | `0.16` | 新鲜度/使用频次权重 |
@@ -222,24 +237,42 @@ memory_use_workspace(path="D:/proj/YourProject")
 
 需要指向别处时用 `--rules <路径>` 或环境变量 `HM_RULES_PATH`。
 
-## 导出 Markdown 视图
+## 导出 Markdown 视图（仅手动）
 
-数据库是唯一事实源，但人是需要翻文件的。导出成项目约定的 Markdown：
+数据库是唯一事实源，但人是需要翻文件的。导出**只在人主动执行时发生**：
 
 ```bash
-humanity-memory --workspace D:/proj/YourProject export
-# 默认写到 <项目>/.workbuddy/memory/
+humanity-memory --workspace D:/proj/YourProject export \
+  --out D:/proj/YourProject/.ai_memory/export
 ```
+
+`--out` 必填，没有默认落点。这是刻意的：一旦允许自动推导目录，就等于给了它一条
+「悄悄往项目记忆目录写文件」的路径，手写笔记与渲染产物会混在同一层——而两者
+的处置方式完全相反（手写要保留，渲染要能随时整份覆盖）。
+
+同样地，**不提供任何自动/定时/写入后回调的导出**：MCP 侧没有导出工具，
+复盘完成也不会自动刷新视图。要最新视图就跑一次上面的命令。
 
 生成：
 
 | 文件 | 内容 |
 | --- | --- |
-| `事实知识.md` | 每条事实一行，带标签注释 |
+| `知识现状.md` | 知识 / 现状分两节，每条一行，现状带确认时间 |
 | `经历/YYYY-MM-DD-<摘要>.md` | 一次复盘产出的经历，一个文件 |
 | `日志/YYYY-MM-DD.md` | 按天归档的原始日志 |
 
-**导出是只读视图**，手改会被下次导出覆盖。信条文件不在导出范围内——它本来就是手写的。
+**导出是只读视图，不是备份**：不含 id、`access_count`、`verified_at` 与向量，
+恢复后 id 全变、引用链会断。要能回滚就复制 `.db`（WAL 下连 `-wal` / `-shm` 一起）。
+信条文件不在导出范围内——它本来就是手写的。
+
+想保留一键入口就在项目里放个脚本，但落点必须写死、不能靠默认值：
+
+```bat
+@echo off
+D:/proj/HumanityMemory/.venv/Scripts/humanity-memory.exe ^
+  --workspace "D:/proj/YourProject" ^
+  export --out "D:/proj/YourProject/.ai_memory/export"
+```
 
 ## 安装 Skill
 
@@ -262,10 +295,10 @@ skills/humanity-memory/
 | 工具 | 说明 |
 | --- | --- |
 | `rules_get` / `rules_append` | 读/追加信条（只追加，不改既有内容） |
-| `fact_write` | 写事实，可带 `invalidates` 取代旧事实 |
-| `fact_invalidate` | 让事实失效（不删除） |
-| `fact_promote` | 项目事实 → 全局事实 |
-| `fact_list` | 列事实 |
+| `memory_write` | **唯一写入口**，`kind` = knowledge / state / case / narrative |
+| `memory_invalidate` | 让条目失效（不删除） |
+| `memory_promote` | 项目条目 → 全局条目 |
+| `memory_list` | 列条目，`kinds` 支持 `all` |
 | `log_append` | 追加日志（唯一允许的日志写操作） |
 | `log_list` | 按日期列日志 |
 | `memory_search` | 跨层跨库检索，不改访问强度 |
@@ -280,24 +313,62 @@ skills/humanity-memory/
 由**当前会话的模型**执行，不额外调 LLM：
 
 ```
-consolidate_preview(day="today")          → 拿到原始日志 + 现有事实
+consolidate_preview(day="today")          → 拿到原始日志 + 现有陈述
         ↓  你自己读、提炼
-consolidate_apply(facts=[...], episodes=[...], purge=true)
+consolidate_apply(knowledge=[...], episodes=[...], purge=true)
 ```
 
-配成定时任务时，prompt 里写清这三步即可。不想清空原始日志就传 `purge=false`。
+复盘产出三块，**先想 kind 再落笔**：
+
+- `knowledge` — 换掉单号、任务 ID 仍然成立的机制与约定
+- `state` — 当前为真但会变的（版本、依赖、路径），必须带 `source`
+- `episodes` — `case`（现象→根因→落点，≤300 字，一单一条）与 `narrative`（当天过程）
+
+配成定时任务时，**每个工作区各建一个**（只复盘自己那个库，不要跨项目扫），
+prompt 直接引用 `skills/humanity-memory/references/consolidate-task.md`。
+不想清空原始日志就传 `purge=false`。
 
 ## 数据模型
 
 | 表 | 关键字段 |
 | --- | --- |
-| `facts` | `invalid_at`（失效时间）、`invalidated_by`（被谁取代）、`scope`（workspace/global） |
-| `episodes` | `at`（事件时间）、`day`、`digest_id`（哪次复盘产出） |
+| `knowledge` | `kind`（knowledge/state）、`invalid_at`、`invalidated_by`、`verified_at`（现状确认时间）、`scope` |
+| `episodes` | `kind`（case/narrative）、`at`、`day`、`digest_id`（哪次复盘产出）、`compression_level` |
 | `logs` | `at`、`day`、`consolidated`、`digest_id` |
 | `digests` | 每次复盘的审计：处理了几条日志、产出了几条事实/经历 |
 
-向量：`facts_vec` / `episodes_vec` / `logs_vec`（vec0，cosine 度量），rowid 与主表对齐。
-全文：三张 `_fts` 表，trigram 分词，触发器同步。
+向量：`knowledge_vec` / `episodes_vec` / `logs_vec`（vec0，cosine 度量，`chunk_size=64`），
+rowid 与主表对齐。全文：三张 `_fts` 表，trigram 分词，触发器同步。
+
+数据库层还钉了三条绕不过的约束：正文不可改、`invalid_at` 不可逆、
+**`kind` 不可改**（知识变现状只能新写一条 —— 两类生命周期不同，改 kind 等于换了个东西）。
+
+### 记忆的生命周期
+
+三层都有淘汰机制，但**只归档、不自动删**：
+
+| kind | 归档条件 | 压缩 |
+| --- | --- | --- |
+| 信条 | 不参与（它不在库里） | 不参与 |
+| `knowledge` | 3 年未触碰且访问 ≤1 次 | 不压缩 |
+| `state` | **30 天未确认**（被检索不算续命） | 不压缩 |
+| `case` | 1 年未触碰且访问 ≤1 次 | 不压缩（已是最简形态） |
+| `narrative` | 1 年未触碰且访问 ≤1 次 | ✅ 可合并 |
+
+归档 = 置 `archived_at`，正文不动，默认检索不到，`include_archived=true` 可查回。
+物理删除必须 `memory_purge(ids, confirm=true)`，且**只能删已归档的**。
+
+用 CLI 操作：
+
+```bash
+humanity-memory lifecycle archive --dry-run   # 预览会归档哪些
+humanity-memory lifecycle archive             # 执行
+humanity-memory lifecycle candidates          # 删除候选（只报告）
+humanity-memory lifecycle compress            # 可压缩的经历分组
+```
+
+判据用「多久没碰 + 访问几次」而不是强度阈值 —— 因为 `usage_factor` 有 0.5 底分，
+强度永远跌不到 0，拿绝对阈值归档会永远不触发。
 
 ### 检索打分
 
@@ -306,7 +377,8 @@ final = type_weight × (0.72 × retrieval + 0.12 × importance + 0.16 × strengt
 
 retrieval = (0.70 × vec_sim + 0.30 × lex_sim) / 可用通路权重和
 strength  = 0.55 × 新鲜度(按层半衰期) + 0.45 × 使用频次(对数，20 次饱和，底分 0.5)
-type_weight: fact 1.00 / episode 0.96 / log 0.90
+type_weight: knowledge 1.00 / state 1.00 / case 0.90 / narrative 0.96 / log 0.90
+             （narrative 再乘压缩级别权重 0.88~0.96）
 ```
 
 `usage_factor` 给从未被召回的内容 0.5 底分——新写入的不该因为"还没被用过"而吃亏。
@@ -323,7 +395,7 @@ type_weight: fact 1.00 / episode 0.96 / log 0.90
 ## 开发
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q                    # 55 项单元测试
+./.venv/Scripts/python.exe -m pytest -q                    # 85 项单元测试
 ./.venv/Scripts/python.exe tools/verify_mcp_config.py      # MCP 端到端（隔离环境）
 ```
 

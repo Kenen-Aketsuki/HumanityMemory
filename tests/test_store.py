@@ -187,7 +187,7 @@ def test_search_hits_fact_and_log(env) -> None:
     hits = store.search("存档怎么组织")
     assert hits
     kinds = {h.kind for h in hits}
-    assert "fact" in kinds
+    assert "knowledge" in kinds
 
 
 def test_cross_db_search(env) -> None:
@@ -346,7 +346,7 @@ def test_stats_shape(env) -> None:
 
 def test_global_facts_warning(env) -> None:
     cfg, _, store = env
-    for i in range(cfg.global_facts_warn + 1):
+    for i in range(cfg.global_knowledge_warn + 1):
         store.write_memory(f"全局事实 {i}", scope="global")
     stats = store.stats()
     assert stats["global_knowledge_warn"] is True
@@ -866,3 +866,237 @@ def test_recompress_threshold_scales_with_importance(env) -> None:
     ids = {it["id"] for g in preview["groups"] for it in g["items"]}
     assert light.id in ids
     assert heavy.id not in ids
+
+
+# ---------------------------------------------------------------- v3：kind 语义
+
+
+def test_kind_is_immutable(env) -> None:
+    _, _, store = env
+    item = store.write_memory("知识条目")
+    fs = store.workspace_conn
+    with pytest.raises(sqlite3.IntegrityError):
+        with tx(fs):
+            fs.execute("UPDATE knowledge SET kind = 'state' WHERE id = ?", (item.id,))
+
+
+def test_state_short_limit(env) -> None:
+    _, _, store = env
+    with pytest.raises(ValueError):
+        store.write_memory("很长" * 120, kind="state")
+    # 同样长度当知识是允许的
+    assert store.write_memory("很长" * 120, kind="knowledge").kind == "knowledge"
+
+
+def test_case_is_capped(env) -> None:
+    _, _, store = env
+    with pytest.raises(ValueError):
+        store.write_memory("过程" * 200, kind="case")
+    assert store.write_memory("现象→根因→落点", kind="case").kind == "case"
+
+
+def test_kinds_all_aliases(env) -> None:
+    _, _, store = env
+    store.write_memory("知识一条", kind="knowledge")
+    store.write_memory("现状一条", kind="state")
+    store.write_memory("案例一条", kind="case")
+    for kinds in (None, "all", ["all"], []):
+        hits = store.search("一条", kinds=kinds)
+        got = {h.kind for h in hits}
+        assert {"knowledge", "state", "case"} <= got
+
+
+def test_state_archive_requires_verify(env) -> None:
+    """state 被反复检索也不续命：只有 verified_at 算确认。"""
+    from humanity_memory.models import now_ms
+
+    _, _, store = env
+    day = 86_400_000
+    item = store.write_memory("项目是 Unity 2022.3", kind="state")
+    ws = store.workspace_conn
+    ws.execute(
+        "UPDATE knowledge SET created_at = ?, last_accessed_at = ?, access_count = 9"
+        " WHERE id = ?",
+        (now_ms() - 40 * day, now_ms(), item.id),
+    )
+
+    report = store.archive_pass(dry_run=True)
+    assert [x["id"] for x in report["archived"]] == [item.id]
+    assert "确认" in report["archived"][0]["reason"]
+
+    # 显式确认之后重新计时，不再进候选
+    store.verify_state(item.id)
+    report = store.archive_pass(dry_run=True)
+    assert item.id not in {x["id"] for x in report["archived"]}
+
+
+def test_knowledge_frequent_access_still_kept(env) -> None:
+    """knowledge 仍按「访问次数」留人，和 state 的规则不同。"""
+    from humanity_memory.models import now_ms
+
+    _, _, store = env
+    day = 86_400_000
+    item = store.write_memory("被反复用到的机制")
+    ws = store.workspace_conn
+    ws.execute(
+        "UPDATE knowledge SET created_at = ?, last_accessed_at = ?, access_count = 9"
+        " WHERE id = ?",
+        (now_ms() - 2000 * day, now_ms(), item.id),
+    )
+    report = store.archive_pass(dry_run=True)
+    assert item.id not in {x["id"] for x in report["archived"]}
+
+
+def test_case_outranks_narrative(env) -> None:
+    """同样的内容，case 的权重必须高于刚复盘的叙述（0.96×0.88）。"""
+    from humanity_memory.store import CASE_WEIGHT, EPISODE_LEVEL_WEIGHT
+
+    assert CASE_WEIGHT > 0.96 * EPISODE_LEVEL_WEIGHT[0]
+
+
+def test_state_supersede_with_invalidates(env) -> None:
+    _, _, store = env
+    old = store.write_memory("项目是 Unity 2021.3", kind="state")
+    new = store.write_memory(
+        "项目已升级到 Unity 2022.3", kind="state", invalidates=old.id
+    )
+    assert store.get_knowledge(old.id).invalidated_by == new.id
+    assert not store.get_knowledge(old.id).live
+    live = store.list_knowledge(kinds=["state"])
+    assert [x.id for x in live] == [new.id]
+
+
+def test_write_rejects_verifies_for_knowledge(env) -> None:
+    _, _, store = env
+    item = store.write_memory("一条知识")
+    with pytest.raises(ValueError):
+        store.write_memory("", kind="knowledge", verifies=item.id)
+
+
+def test_global_scope_rejects_episodes(env) -> None:
+    _, _, store = env
+    with pytest.raises(ValueError):
+        store.write_memory("案例不该进全局库", kind="case", scope="global")
+
+
+def test_legacy_kind_aliases(env) -> None:
+    _, _, store = env
+    assert store.write_memory("旧词映射", kind="fact").kind == "knowledge"
+    assert store.write_memory("旧词映射叙述", kind="episode").kind == "narrative"
+
+
+# ---------------------------------------------------------------- v3：kind 语义
+
+
+def test_kind_is_immutable(env) -> None:
+    _, _, store = env
+    item = store.write_memory("知识条目")
+    fs = store.workspace_conn
+    with pytest.raises(sqlite3.IntegrityError):
+        with tx(fs):
+            fs.execute("UPDATE knowledge SET kind = 'state' WHERE id = ?", (item.id,))
+
+
+def test_state_short_limit(env) -> None:
+    _, _, store = env
+    with pytest.raises(ValueError):
+        store.write_memory("很长" * 120, kind="state")
+    # 同样长度当知识是允许的
+    assert store.write_memory("很长" * 120, kind="knowledge").kind == "knowledge"
+
+
+def test_case_is_capped(env) -> None:
+    _, _, store = env
+    with pytest.raises(ValueError):
+        store.write_memory("过程" * 200, kind="case")
+    assert store.write_memory("现象→根因→落点", kind="case").kind == "case"
+
+
+def test_kinds_all_aliases(env) -> None:
+    _, _, store = env
+    store.write_memory("知识一条", kind="knowledge")
+    store.write_memory("现状一条", kind="state")
+    store.write_memory("案例一条", kind="case")
+    for kinds in (None, "all", ["all"], []):
+        hits = store.search("一条", kinds=kinds)
+        got = {h.kind for h in hits}
+        assert {"knowledge", "state", "case"} <= got
+
+
+def test_state_archive_requires_verify(env) -> None:
+    """state 被反复检索也不续命：只有 verified_at 算确认。"""
+    from humanity_memory.models import now_ms
+
+    _, _, store = env
+    day = 86_400_000
+    item = store.write_memory("项目是 Unity 2022.3", kind="state")
+    ws = store.workspace_conn
+    ws.execute(
+        "UPDATE knowledge SET created_at = ?, last_accessed_at = ?, access_count = 9"
+        " WHERE id = ?",
+        (now_ms() - 40 * day, now_ms(), item.id),
+    )
+
+    report = store.archive_pass(dry_run=True)
+    assert [x["id"] for x in report["archived"]] == [item.id]
+    assert "确认" in report["archived"][0]["reason"]
+
+    # 显式确认之后重新计时，不再进候选
+    store.verify_state(item.id)
+    report = store.archive_pass(dry_run=True)
+    assert item.id not in {x["id"] for x in report["archived"]}
+
+
+def test_knowledge_frequent_access_still_kept(env) -> None:
+    """knowledge 仍按「访问次数」留人，和 state 的规则不同。"""
+    from humanity_memory.models import now_ms
+
+    _, _, store = env
+    day = 86_400_000
+    item = store.write_memory("被反复用到的机制")
+    ws = store.workspace_conn
+    ws.execute(
+        "UPDATE knowledge SET created_at = ?, last_accessed_at = ?, access_count = 9"
+        " WHERE id = ?",
+        (now_ms() - 2000 * day, now_ms(), item.id),
+    )
+    report = store.archive_pass(dry_run=True)
+    assert item.id not in {x["id"] for x in report["archived"]}
+
+
+def test_case_outranks_narrative(env) -> None:
+    """同样的内容，case 的权重必须高于刚复盘的叙述（0.96×0.88）。"""
+    from humanity_memory.store import CASE_WEIGHT, EPISODE_LEVEL_WEIGHT
+
+    assert CASE_WEIGHT > 0.96 * EPISODE_LEVEL_WEIGHT[0]
+
+
+def test_state_supersede_with_invalidates(env) -> None:
+    _, _, store = env
+    old = store.write_memory("项目是 Unity 2021.3", kind="state")
+    new = store.write_memory(
+        "项目已升级到 Unity 2022.3", kind="state", invalidates=old.id
+    )
+    assert store.get_knowledge(old.id).invalidated_by == new.id
+    assert not store.get_knowledge(old.id).live
+    live = store.list_knowledge(kinds=["state"])
+    assert [x.id for x in live] == [new.id]
+
+
+def test_write_rejects_verifies_for_knowledge(env) -> None:
+    _, _, store = env
+    item = store.write_memory("一条知识")
+    with pytest.raises(ValueError):
+        store.write_memory("", kind="knowledge", verifies=item.id)
+
+
+def test_global_scope_rejects_episodes(env) -> None:
+    _, _, store = env
+    with pytest.raises(ValueError):
+        store.write_memory("案例不该进全局库", kind="case", scope="global")
+
+
+def test_legacy_kind_aliases(env) -> None:
+    _, _, store = env
+    assert store.write_memory("旧词映射", kind="fact").kind == "knowledge"
+    assert store.write_memory("旧词映射叙述", kind="episode").kind == "narrative"

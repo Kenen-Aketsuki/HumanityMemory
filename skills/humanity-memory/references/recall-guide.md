@@ -32,20 +32,24 @@
 ```json
 {
   "count": 3,
-  "lines": ["[f_abc] (项目事实) 设施存档用总文件…", "[e_def] (2026-11-03) 重构了…"],
+  "lines": ["[k_abc] (项目知识) 设施存档用总文件…", "[k_def] (项目现状) 项目是 Unity 2022.3…",
+            "[e_ghi] (2026-11-03·案例) 引导不指餐厅 → StockBread…"],
   "results": [
-    {"type": "fact", "id": "f_abc", "score": 0.87, "vector_similarity": 0.79,
-     "lexical_score": 1.0, "db": "workspace"}
+    {"type": "knowledge", "kind": "knowledge", "id": "k_abc", "score": 0.87,
+     "vector_similarity": 0.79, "lexical_score": 1.0, "db": "workspace"}
   ]
 }
 ```
 
 - **`lines`** 是给上下文用的紧凑格式，直接拼进去
-- **`type`** 三种：`fact`（事实）/ `episode`（经历）/ `log`（日志）
-  - 事实最可信，直接当结论用
-  - 经历是压缩叙述，可信但要留意它是"当时的理解"
-  - 日志是原始记录，注意它的时间
-- **`db`**：`workspace` 是当前项目，`global` 是跨项目事实
+- **`type`** 三种物理来源：`knowledge` / `episode` / `log`；
+  真正要看的是 **`kind`**（一级概念，决定该不该直接当结论用）：
+  - `knowledge` 知识最可信，直接当结论用
+  - `state` 现状直接可用，但要留意 `verified_iso`——越旧越可疑
+  - `case` 案例是「现象→根因→落点」，能复用排查路径，但别当成通用机制
+  - `narrative` 叙述是压缩过的事件，可信但要留意它是"当时的理解"
+  - `log` 原始记录，注意它的时间
+- **`db`**：`workspace` 是当前项目，`global` 是跨项目知识
 - **`vector_similarity` / `lexical_score`** 看这条是怎么被找到的：
   - 两者都有 → 语义和字面都命中，最可信
   - 只有向量 → 语义相近但用词不同，留意是否跑偏
@@ -59,9 +63,9 @@
 
 1. **query 太短或太泛** → 改成具体情境，收益最大
 2. **记忆在别的项目里** → 项目之间是物理隔离的，查不到就是没有。
-   如果这条确实该跨项目，考虑用 `fact_promote` 提升为全局事实
-3. **事实被取代了** → `include_invalid=true` 看历史
-4. **日志已复盘清空** → 原始日志没了，但压缩后的 `episodes` 还在，查 `kinds=["episode"]`
+   如果这条确实该跨项目，考虑用 `memory_promote` 提升为全局条目
+3. **条目被取代了** → `include_invalid=true` 看历史
+4. **日志已复盘清空** → 原始日志没了，但压缩后的叙述还在，查 `kinds=["narrative","case"]`
 5. **压根没记过** → `memory_stats` 看总数
 6. **embedding 没生效** → 返回里的 `degraded` 字段会提示，跑 `memory_maintenance`
 
@@ -75,7 +79,8 @@
 - 只是查证、不想影响排序 → `memory_search`
 
 强化是"用进废退"的「进」：对数增长，20 次召回后饱和，不会无限放大。
-「退」由时间衰减负责：事实半衰期 3650 天（几乎不忘）、经历 180 天、日志 14 天。
+「退」由时间衰减负责：知识/现状半衰期 3650 天（几乎不忘）、案例与叙述 180 天、日志 14 天。
+现状另有硬门槛：30 天没被 `verifies` 确认会被归档，被检索到不算续命。
 
 ## 注入上下文时
 

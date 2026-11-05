@@ -132,7 +132,7 @@ def cmd_memory(args: argparse.Namespace) -> int:
                 return 2
             item = store.write_memory(
                 content,
-                kind=args.kind,
+                kind=args.kind or "knowledge",
                 tags=args.tags,
                 importance=args.importance,
                 scope=args.scope,
@@ -591,9 +591,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_mem.add_argument("text", nargs="?", default=None, help="add 时的内容")
     p_mem.add_argument(
         "--kind",
-        default="knowledge",
+        default=None,
         choices=["knowledge", "state", "case", "narrative", "all"],
-        help="add 时的类型；list 时传 all 或某一类",
+        help="add 时的类型（默认 knowledge）；list 时不传即全部",
     )
     p_mem.add_argument("--tags", nargs="*", default=None)
     p_mem.add_argument("--importance", type=float, default=None)

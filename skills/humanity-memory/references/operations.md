@@ -83,18 +83,18 @@ humanity-memory doctor
 **这不是 bug，是设计。** 你想改日志内容，应该：
 
 - 追加一条新日志说明更正
-- 或等复盘时把正确结论提炼成事实
+- 或等复盘时把正确结论提炼成知识
 
 日志是原始凭证，改了就不叫凭证了。
 
 ### `未复盘的日志不可删除，请先执行 consolidate`
 
 同理。日志在执行 `consolidate_apply` 之前是唯一的原始素材，
-删了就没法复盘了。确实要删就先复盘（哪怕只提一条事实）。
+删了就没法复盘了。确实要删就先复盘（哪怕只提一条知识）。
 
-### `facts 正文不可修改：请追加新事实并使旧事实失效`
+### `正文不可修改`
 
-事实的正文是历史记录。要更正就 `fact_write(invalidates=旧id)`。
+条目正文是历史记录。要更正就 `memory_write(kind=..., content=新, invalidates=旧id)`。
 
 ### `无法加载 sqlite-vec 扩展`
 
@@ -138,20 +138,20 @@ humanity-memory reindex --reset-vectors
 
 想导入别的机器：把 `.ai_memory/` 整个拷过去即可，路径无关。
 
-## 全局事实膨胀
+## 全局知识膨胀
 
-`memory_stats` 里 `global_facts_warn: true` 说明全局事实超过阈值（默认 50）。
+`memory_stats` 里 `global_knowledge_warn: true` 说明全局知识超过阈值（默认 50）。
 
-跨项目事实本该很少。膨胀通常意味着：
+跨项目知识本该很少。膨胀通常意味着：
 
 - 有些规则类内容该搬到 `CORE_RULES.md`（它们需要 100% 命中，不该靠检索）
 - 有些项目细节该留在各自的 workspace 库
-- 有些陈旧的该 `fact_invalidate`
+- 有些陈旧的该 `memory_invalidate`
 
 ## 查看复盘历史
 
 ```sql
-SELECT day, log_count, fact_count, episode_count, summary, purged
+SELECT day, log_count, knowledge_count, episode_count, summary, purged
 FROM digests ORDER BY at DESC LIMIT 20;
 ```
 

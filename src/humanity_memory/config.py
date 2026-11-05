@@ -113,7 +113,7 @@ class Config:
     vec_extension: str | None = None
     candidate_multiplier: int = 8
     max_candidates: int = 240
-    global_facts_warn: int = 50  # 全局事实超过此数量时提示整理
+    global_knowledge_warn: int = 50  # 全局条目超过此数量时提示整理
 
     # ---- 派生属性 ----
     @property
@@ -199,7 +199,9 @@ class Config:
             },
             reinforce_boost=get_float("HM_REINFORCE_BOOST", 0.20),
             vec_extension=get("HM_VEC_EXTENSION", "") or None,
-            global_facts_warn=get_int("HM_GLOBAL_FACTS_WARN", 50),
+            global_knowledge_warn=get_int(
+                "HM_GLOBAL_KNOWLEDGE_WARN", get_int("HM_GLOBAL_FACTS_WARN", 50)
+            ),
         )
 
     def describe(self) -> dict[str, object]:

@@ -3,11 +3,11 @@
 ## 为什么需要复盘
 
 日志是原始素材：杂乱、带时间上下文、会随时间失去意义。
-事实是提炼后的结论：简短、长期有效、可复用。
+知识是提炼后的结论：简短、长期有效、可复用。带单号的一次性结论不算知识，压成案例。
 
 中间这一步压缩，就是复盘。它同时做三件事：
 
-1. **提炼** —— 从当天日志里抽出长期有效的事实
+1. **提炼** —— 从当天日志里抽出长期有效的知识/现状，把一次性事件压成案例
 2. **压缩** —— 把当天的过程压成一段保留因果的叙述
 3. **清理** —— 清空原始日志，防止噪音堆积
 
@@ -21,7 +21,7 @@
 ```
 consolidate_preview(day="today")   → 你拿到原始日志
    ↓（你自己读、想、提炼）
-consolidate_apply(facts=[...], episodes=[...], purge=true)  → 提交
+consolidate_apply(knowledge=[...], episodes=[...], purge=true)  → 提交
 ```
 
 ## preview 返回什么
@@ -31,20 +31,20 @@ consolidate_apply(facts=[...], episodes=[...], purge=true)  → 提交
   "day": "2026-11-03",
   "log_count": 12,
   "logs": [{"id": "l_xxx", "at_iso": "...", "content": "...", "tags": []}],
-  "existing_facts": [{"id": "f_xxx", "content": "...", "live": true}],
+  "existing_knowledge": [{"id": "k_xxx", "kind": "knowledge", "content": "...", "live": true}],
   "instructions": "..."
 }
 ```
 
-`existing_facts` 很重要——**先看它，避免把已有结论重复提取一遍**。
-重复的事实会被 `consolidate_apply` 自动跳过，但你的 token 已经浪费了。
+`existing_knowledge` 很重要——**先看它，避免把已有结论重复提取一遍**，同时留意哪条现状已经变了。
+重复的条目会被 `consolidate_apply` 自动跳过，但你的 token 已经浪费了。
 
-## 提炼事实的判断标准
+## 提炼知识的判断标准
 
-从日志里挑，只有满足全部三条的才提：
+从日志里挑，只有满足全部三条的才提成 `kind="knowledge"`：
 
 1. 明天、下个月、明年都还成立
-2. 一句话能说清，不需要"那天"这个上下文
+2. 一句话能说清，不需要"那天"这个上下文（换掉单号/任务 ID 仍成立）
 3. 是结论，不是过程
 
 ```
@@ -54,12 +54,15 @@ consolidate_apply(facts=[...], episodes=[...], purge=true)  → 提交
 ❌ 不提取："试了 ScaleWithScreenSize"   // 中间尝试，已被排除
 ```
 
-**一般是 0~3 条。** 如果一天能提炼出 10 条"事实"，说明你的标准太松了——
+**一般是 0~3 条。** 如果一天能提炼出 10 条"知识"，说明你的标准太松了——
 那些八成还是日志级别的内容。
 
-## 压缩经历
+带单号的排查结论不是知识，但它值得留：写成 `kind="case"`，
+一句话「现象 → 根因 → 落点」，≤300 字，一个问题一条。别为了省事把它塞进 knowledge。
 
-把当天的事写成 1~3 段叙述，保留**因果链**：
+## 压缩叙述
+
+把当天的事写成 1~3 段 `kind="narrative"` 的叙述，保留**因果链**：
 
 ```
 ✅ "重构记忆库的存储层。先踩到 mcp 2.3 的 API 改名（FastMCP→MCPServer），
@@ -74,16 +77,16 @@ consolidate_apply(facts=[...], episodes=[...], purge=true)  → 提交
 
 ## 冲突处理
 
-提炼出新事实，而旧事实与之矛盾时：
+提炼出新知识（或现状换代），而旧条目与之矛盾时：
 
 ```json
 {
   "content": "项目改用 UI Toolkit 做 UI",
-  "invalidates": "f_旧事实的id"
+  "invalidates": "k_旧条目的id"
 }
 ```
 
-旧的自动失效，指向新的。**不要**手工去删旧事实——历史是有价值的，
+旧的自动失效，指向新的。**不要**手工去删旧条目——历史是有价值的，
 "曾经用 UGUI"这个信息在排查老问题时可能有用。
 
 ## purge 的取舍
@@ -105,6 +108,6 @@ consolidate_apply(facts=[...], episodes=[...], purge=true)  → 提交
 ## 什么不该做
 
 - 不要把日志原文直接塞进 `episodes`（那是复制，不是压缩）
-- 不要为了"显得有产出"而硬造事实
+- 不要为了"显得有产出"而硬造知识
 - 不要跳过 preview 直接 apply——你没有素材就没法总结
 - 不要在 purge=true 之后后悔：原始日志删了就没了（`digests` 表里只留了 id 和统计）

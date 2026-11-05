@@ -31,10 +31,10 @@ ENTRY = "humanity-memory"
 EXPECTED_TOOLS = {
     "rules_get",
     "rules_append",
-    "fact_write",
-    "fact_invalidate",
-    "fact_promote",
-    "fact_list",
+    "memory_write",
+    "memory_invalidate",
+    "memory_promote",
+    "memory_list",
     "log_append",
     "log_list",
     "memory_search",
@@ -100,40 +100,59 @@ async def run_main_flow(work: dict, env: dict, proj: pathlib.Path) -> list[str]:
             rg = payload(await s.call_tool("rules_get", {}))
             print(f"[OK] rules_get: 全局 {rg.get('global_rules', {}).get('items')} 条")
 
-            fw = payload(
+            st0 = payload(
                 await s.call_tool(
-                    "fact_write",
-                    {"content": "本项目用 bge-m3 做向量检索，维度 1024", "tags": ["向量"]},
+                    "memory_write",
+                    {
+                        "kind": "state",
+                        "content": "本项目用 bge-m3 做向量检索，维度 1024",
+                        "tags": ["向量"],
+                        "source": "e2e",
+                    },
                 )
             )
-            fid = fw.get("fact", {}).get("id")
+            sid = st0.get("item", {}).get("id")
             print(
-                f"[{'OK' if fw.get('embedded') else 'WARN'}] fact_write: {fid} "
-                f"embedded={fw.get('embedded')}"
+                f"[{'OK' if st0.get('embedded') else 'WARN'}] memory_write(state): {sid} "
+                f"embedded={st0.get('embedded')}"
             )
-            if not fw.get("ok"):
-                failures.append("fact_write 失败")
+            if not st0.get("ok"):
+                failures.append("memory_write(state) 失败")
 
-            gw = payload(
+            kn = payload(
                 await s.call_tool(
-                    "fact_write", {"content": "主人偏好结构化输出与表格", "scope": "global"}
+                    "memory_write",
+                    {
+                        "kind": "knowledge",
+                        "content": "跨项目约定：回复用中文并用表格",
+                        "scope": "global",
+                    },
                 )
             )
-            print(f"[OK] 全局事实: {gw.get('fact', {}).get('id')}")
+            print(f"[OK] 全局知识: {kn.get('item', {}).get('id')}")
 
-            fw2 = payload(
+            st2 = payload(
                 await s.call_tool(
-                    "fact_write",
-                    {"content": "本项目改用 Qwen3-Embedding", "invalidates": fid},
+                    "memory_write",
+                    {
+                        "kind": "state",
+                        "content": "本项目改用 Qwen3-Embedding",
+                        "invalidates": sid,
+                    },
                 )
             )
-            inv = fw2.get("invalidated") or {}
+            inv = st2.get("item") or {}
+            listed = payload(
+                await s.call_tool("memory_list", {"kinds": "state"})
+            )
+            ids = {x.get("id") for x in listed.get("items", [])}
+            old_gone = sid not in ids
             print(
-                f"[{'OK' if inv.get('live') is False else 'FAIL'}] 取代旧事实: "
-                f"old.live={inv.get('live')}"
+                f"[{'OK' if old_gone else 'FAIL'}] 现状换代: 旧条目仍 live={not old_gone} "
+                f"新条目={inv.get('id')}"
             )
-            if inv.get("live") is not False:
-                failures.append("取代旧事实失败")
+            if not old_gone:
+                failures.append("取代旧现状失败")
 
             for text in ["排查 mcp 2.3 的 MCPServer 改名", "doctor 双连接导致 database is locked"]:
                 lg = payload(await s.call_tool("log_append", {"content": text}))
@@ -156,8 +175,15 @@ async def run_main_flow(work: dict, env: dict, proj: pathlib.Path) -> list[str]:
                     "consolidate_apply",
                     {
                         "day": "today",
-                        "facts": [{"content": "mcp 2.x 的 FastMCP 更名为 MCPServer"}],
-                        "episodes": ["完成了三层记忆重构与复盘流程验证。"],
+                        "knowledge": [
+                            {"content": "mcp 2.x 的 FastMCP 更名为 MCPServer", "kind": "knowledge"}
+                        ],
+                        "episodes": [
+                            {
+                                "content": "MCP 2.x 把 FastMCP 改名为 MCPServer，导入路径随之调整",
+                                "kind": "case",
+                            }
+                        ],
                         "summary": "三层记忆验证",
                         "purge": True,
                     },
@@ -165,8 +191,8 @@ async def run_main_flow(work: dict, env: dict, proj: pathlib.Path) -> list[str]:
             )
             r = ca.get("result", {})
             print(
-                f"[OK] consolidate_apply: 日志 {r.get('log_count')} → 事实 "
-                f"{len(r.get('created_facts', []))} 经历 {len(r.get('created_episodes', []))} "
+                f"[OK] consolidate_apply: 日志 {r.get('log_count')} → 陈述 "
+                f"{len(r.get('created_knowledge', []))} 经历 {len(r.get('created_episodes', []))} "
                 f"清空 {r.get('purged')}"
             )
             if not r.get("digest_id"):
@@ -187,8 +213,14 @@ async def run_main_flow(work: dict, env: dict, proj: pathlib.Path) -> list[str]:
             if not sw.get("ok"):
                 failures.append("切换工作区失败")
 
-            await s.call_tool("fact_write", {"content": "另一个项目专属事实：用 UI Toolkit"})
-            scoped = payload(await s.call_tool("memory_search", {"query": "UI 方案", "limit": 5}))
+            await s.call_tool(
+                "memory_write", {"kind": "state", "content": "另一个项目专属：用 UI Toolkit"}
+            )
+            scoped = payload(
+                await s.call_tool(
+                    "memory_search", {"query": "UI 方案", "limit": 5, "format": "full"}
+                )
+            )
             got = [x.get("content", "") for x in scoped.get("results", [])]
             leaked = any("bge-m3" in c for c in got)
             print(
@@ -201,9 +233,10 @@ async def run_main_flow(work: dict, env: dict, proj: pathlib.Path) -> list[str]:
             st = payload(await s.call_tool("memory_stats", {}))
             wsinfo = st.get("stats", {}).get("dbs", {}).get("workspace", {})
             print(
-                f"[OK] memory_stats: facts={wsinfo.get('facts_live')} "
+                f"[OK] memory_stats: knowledge={wsinfo.get('knowledge_live')} "
+                f"state={wsinfo.get('state')} cases={wsinfo.get('cases')} "
                 f"episodes={wsinfo.get('episodes')} "
-                f"global_facts={st.get('stats', {}).get('global_facts')}"
+                f"global={st.get('stats', {}).get('global_knowledge')}"
             )
 
             mt = payload(await s.call_tool("memory_maintenance", {}))
