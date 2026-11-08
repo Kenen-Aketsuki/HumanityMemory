@@ -599,36 +599,49 @@ function drawStarfield(){
   }
 }
 function screen(n){return [(n.x+view.x)*view.k,(n.y+view.y)*view.k];}
+function drawEdge(e,hot){
+  const [x1,y1]=[e.s.x,e.s.y],[x2,y2]=[e.t.x,e.t.y];
+  let rgb,a,w,dash=[];
+  if(e.type==='semantic'){
+    rgb='111,182,255';a=0.08+Math.min(.5,(e.w-.5)*.9);w=.4+Math.max(.2,(e.w-.5)*3);
+  }else if(e.type==='invalidates'){
+    rgb='255,196,107';a=.75;w=1.5;
+  }else if(e.type==='digest'){
+    rgb='255,224,138';a=.28;w=.7;dash=[3,4];
+  }else{
+    rgb='95,214,160';a=.42;w=.5;
+  }
+  if(hot){a=Math.max(a,.9);w=Math.max(w,2.2);}
+  ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);
+  ctx.strokeStyle='rgba('+rgb+','+a+')';ctx.lineWidth=w;ctx.setLineDash(dash);
+  ctx.stroke();ctx.setLineDash([]);
+  if(e.type==='invalidates'){
+    const ang=Math.atan2(y2-y1,x2-x1),h=8;
+    ctx.beginPath();
+    ctx.moveTo(x2,y2);
+    ctx.lineTo(x2-h*Math.cos(ang-.4),y2-h*Math.sin(ang-.4));
+    ctx.lineTo(x2-h*Math.cos(ang+.4),y2-h*Math.sin(ang+.4));
+    ctx.closePath();ctx.fillStyle=hot?'rgba(255,196,107,1)':'rgba(255,196,107,.8)';ctx.fill();
+  }
+}
 function draw(){
   drawStarfield();
   ctx.save();
   ctx.translate(view.x*view.k,view.y*view.k);
   ctx.scale(view.k,view.k);
   const q=document.getElementById('search').value.trim().toLowerCase();
+  const focusSet=new Set();
+  for(const n of nodes){
+    if(!kinds[n.kind])continue;
+    if(n===hover||(q&&(n.content.toLowerCase().includes(q)||n.tags.join(' ').toLowerCase().includes(q))))focusSet.add(n);
+  }
+  const hotEdges=[];
   for(const e of edges){
     if(!visible(e))continue;
-    const [x1,y1]=[e.s.x,e.s.y],[x2,y2]=[e.t.x,e.t.y];
-    ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);
-    if(e.type==='semantic'){
-      ctx.strokeStyle='rgba(111,182,255,'+(0.08+Math.min(.5,(e.w-.5)*.9))+')';
-      ctx.lineWidth=.4+Math.max(.2,(e.w-.5)*3);ctx.setLineDash([]);
-    }else if(e.type==='invalidates'){
-      ctx.strokeStyle='rgba(255,196,107,.75)';ctx.lineWidth=1.5;ctx.setLineDash([]);
-    }else if(e.type==='digest'){
-      ctx.strokeStyle='rgba(255,224,138,.28)';ctx.lineWidth=.7;ctx.setLineDash([3,4]);
-    }else{
-      ctx.strokeStyle='rgba(95,214,160,.42)';ctx.lineWidth=.5;ctx.setLineDash([]);
-    }
-    ctx.stroke();ctx.setLineDash([]);
-    if(e.type==='invalidates'){
-      const ang=Math.atan2(y2-y1,x2-x1),h=8;
-      ctx.beginPath();
-      ctx.moveTo(x2,y2);
-      ctx.lineTo(x2-h*Math.cos(ang-.4),y2-h*Math.sin(ang-.4));
-      ctx.lineTo(x2-h*Math.cos(ang+.4),y2-h*Math.sin(ang+.4));
-      ctx.closePath();ctx.fillStyle='rgba(255,196,107,.8)';ctx.fill();
-    }
+    if(focusSet.has(e.s)||focusSet.has(e.t)){hotEdges.push(e);continue;}
+    drawEdge(e,false);
   }
+  for(const e of hotEdges)drawEdge(e,true);
   const labelCandidates=[];
   for(const n of nodes){
     if(!kinds[n.kind])continue;
@@ -747,7 +760,8 @@ function buildUI(){
     '<span style="color:#6fb6ff">虚线粗细 = 语义相似度</span><br>'+
     '<span style="color:#ffc46b">琥珀箭头 = 失效 / 换代</span><br>'+
     '<span style="color:#ffe08a">黄色恒星 = 复盘批次</span><br>'+
-    '<span style="color:#5fd6a0">绿色实线 = 标签共现</span>';
+    '<span style="color:#5fd6a0">绿色实线 = 标签共现</span><br>'+
+    '<span style="color:#cfe0ff">悬停星点 = 加粗其可见连线</span>';
   const notes=document.getElementById('notes');
   notes.innerHTML='<h2>数据源说明</h2>'+(m.notes.length?m.notes.map(x=>'<div class="kv">'+esc(x)+'</div>').join(''):
     '<div class="kv"><span>无额外提示</span></div>')+
