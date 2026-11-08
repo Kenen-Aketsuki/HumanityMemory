@@ -55,7 +55,7 @@
 ## 快速开始
 
 ```bash
-cd D:/proj/HumanityMemory
+cd Your/Path/To/HumanityMemory
 
 python -m venv .venv
 ./.venv/Scripts/python.exe -m pip install -e .        # Windows
@@ -73,7 +73,7 @@ cp .env.example ~/.humanity-memory/.env
 
 ```bash
 cd D:/proj/YourProject
-D:/proj/HumanityMemory/.venv/Scripts/humanity-memory.exe init
+Your/Path/To/HumanityMemory/.venv/Scripts/humanity-memory.exe init
 humanity-memory log add "今天排查了 XXX，根因是 YYY"
 humanity-memory memory add "ResolveTask 末尾的兜底会被短路" --kind knowledge
 humanity-memory memory add "项目是 Unity 2022.3.62f1" --kind state --source ProjectVersion.txt
@@ -124,7 +124,7 @@ MCP server 的工作目录不固定，项目级 `.env` 换个目录就失效。
 {
   "mcpServers": {
     "humanity-memory": {
-      "command": "D:/proj/HumanityMemory/.venv/Scripts/python.exe",
+      "command": "Your/Path/To/HumanityMemory/.venv/Scripts/python.exe",
       "args": ["-m", "humanity_memory.mcp_server"],
       "env": {
         "HM_EMBED_BASE_URL": "https://api.siliconflow.cn/v1",
@@ -145,7 +145,7 @@ MCP server 的工作目录不固定，项目级 `.env` 换个目录就失效。
 
 ```json
 "humanity-memory-project-island": {
-  "command": "D:/proj/HumanityMemory/.venv/Scripts/python.exe",
+  "command": "Your/Path/To/HumanityMemory/.venv/Scripts/python.exe",
   "args": [
     "-m", "humanity_memory.mcp_server",
     "--workspace", "D:/proj/YourProject"
@@ -269,7 +269,7 @@ humanity-memory --workspace D:/proj/YourProject export \
 
 ```bat
 @echo off
-D:/proj/HumanityMemory/.venv/Scripts/humanity-memory.exe ^
+Your/Path/To/HumanityMemory/.venv/Scripts/humanity-memory.exe ^
   --workspace "D:/proj/YourProject" ^
   export --out "D:/proj/YourProject/.ai_memory/export"
 ```

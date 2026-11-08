@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "humanity-memory"
-version = "0.1.0"
+version = "0.2.0"
 description = "SQLite + sqlite-vec based long-term memory store, exposed as an MCP server and a Skill set"
 readme = "README.md"
 requires-python = ">=3.10"

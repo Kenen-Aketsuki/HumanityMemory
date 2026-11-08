@@ -21,7 +21,6 @@ from .paths import (
     Layout,
     ensure_rules,
     find_project_root,
-    find_project_root,
     find_workspace_dir,
     read_last_workspace,
     resolve_layout,

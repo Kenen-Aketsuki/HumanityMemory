@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from .config import Config
-from .models import Episode, Fact, Hit, LogEntry
+from .models import Episode, Fact, Hit, Knowledge, LogEntry
 from .paths import Layout, resolve_layout
 from .store import MemoryStore, NotFound, ScopeError
 
@@ -19,6 +19,7 @@ __all__ = [
     "Episode",
     "Fact",
     "Hit",
+    "Knowledge",
     "Layout",
     "LogEntry",
     "MemoryStore",

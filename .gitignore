@@ -21,6 +21,9 @@ dist/
 **/active.token.json
 *.token.json
 
+# --- 客户端本地目录（本项目记忆已走 .ai_memory，不再用 .workbuddy/memory）---
+.workbuddy/
+
 # --- 随项目附带的三方二进制（体积大，按需下载）---
 tools/bin/
 

@@ -515,7 +515,7 @@ def cmd_lifecycle(args: argparse.Namespace) -> int:
                 return 0
             print(f"需要压缩 {preview['total']} 条：")
             for g in preview["groups"]:
-                print(f"  → level {g['target_level']}（超过 {g['age_threshold_days']:.0f} 天）共 {g['count']} 条")
+                print(f"  → level {g['target_level']}（基准 {g['base_days']:.0f} 天）共 {g['count']} 条")
                 for it in g["items"][:5]:
                     print(f"     [{it['id']}] level={it['current_level']} {it['age_days']}天  {it['content'][:40]}")
             print(f"\n{preview['note']}")
