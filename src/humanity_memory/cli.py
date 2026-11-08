@@ -564,6 +564,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_starmap(args: argparse.Namespace) -> int:
+    """CLI 专用的只读星图；延迟 import，未调用时零开销、零副作用。"""
+    from .starmap import run
+
+    return run(args)
+
+
 # ---------------------------------------------------------------- 入口
 
 
@@ -672,6 +679,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_re = sub.add_parser("reindex", help="重建向量")
     p_re.add_argument("--reset-vectors", action="store_true")
     p_re.set_defaults(func=cmd_reindex)
+
+    p_star = sub.add_parser(
+        "starmap", help="只读星图：分析目录里的记忆库，生成单文件 HTML（CLI 专用）"
+    )
+    p_star.add_argument("path", help="拖入的目录（.ai_memory / 项目根），或直接给 workspace.db")
+    p_star.add_argument("--out", required=True, help="HTML 输出路径（必填，不提供默认落点）")
+    p_star.add_argument("--min-score", type=float, default=0.55, help="语义边最低相似度")
+    p_star.add_argument("--top-k", type=int, default=6, help="每个节点最多保留几条语义边")
+    p_star.add_argument("--max-nodes", type=int, default=400, help="全对相似度计算的节点上限")
+    p_star.set_defaults(func=cmd_starmap)
 
     sub.add_parser("serve", help="以 stdio 启动 MCP server").set_defaults(func=cmd_serve)
 
