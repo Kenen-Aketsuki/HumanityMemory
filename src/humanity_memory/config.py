@@ -67,14 +67,21 @@ def parse_env_file(path: Path) -> dict[str, str]:
     return out
 
 
+# 唯一的 .env 来源：相对本文件定位到仓库根，避免把机器绝对路径写进源码。
+# 本包以 editable 方式安装，config.py 位于 <仓库根>/src/humanity_memory/ 下，
+# parents[2] 即仓库根；仓库整体搬走时无需改任何代码。
+ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+
+
 def _collect_env() -> dict[str, str]:
-    """优先级：真实环境变量 > 就近 .env > 用户目录 .env。"""
-    home = Path(os.environ.get("HM_HOME") or DEFAULT_HOME)
-    merged: dict[str, str] = {}
-    # 先叠加低优先级（用户目录），再叠加高优先级（当前目录）
-    for candidate in (home / ".env", Path.cwd() / ".env"):
-        if candidate.is_file():
-            merged.update(parse_env_file(candidate))
+    """优先级：真实环境变量 > ENV_FILE（唯一的 .env 来源）。
+
+    只读 ENV_FILE 这一个文件，不再叠加 ~/.humanity-memory/.env 或 cwd/.env：
+    配置加载与启动目录彻底解耦，避免 cwd 漂移让凭据静默失效。
+    真实环境变量仍作为最高优先级保留 —— 令牌注入、mcp.json 的 env、
+    CLI / 工具的显式覆盖都依赖这一层。
+    """
+    merged = parse_env_file(ENV_FILE)
     merged.update({k: v for k, v in os.environ.items() if v != ""})
     return merged
 

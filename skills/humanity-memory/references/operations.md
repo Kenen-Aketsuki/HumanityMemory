@@ -9,12 +9,16 @@
 
 ~/.humanity-memory/
 ├── global.db           # 全局库：跨项目 facts
-├── CORE_RULES.md       # 全局信条
-└── .env                # 配置（放这里，任何目录都能读到）
+└── CORE_RULES.md       # 全局信条
+
+<仓库根>/.env            # 配置唯一来源
 ```
 
-**配置必须放在 `~/.humanity-memory/.env`**，不要只放在项目目录。
-MCP server 和 CLI 的工作目录不固定，项目级 `.env` 换个目录就读不到，embedding 会静默失效。
+**`.env` 只认仓库根这一份**（`<仓库根>/.env`，由 `config.py` 相对源码自身位置
+定位，源码不含硬编码绝对路径）。不再读 `~/.humanity-memory/.env` 或 cwd 下的
+`.env`；无论 MCP server / CLI 从哪个目录启动，读到的都是同一份配置，
+不会出现「换个目录 embedding 静默失效」。真实环境变量仍是最高优先级
+（令牌、`mcp.json` 的 env、命令行覆盖都依赖它）。
 
 工作区查找规则：从 cwd 向上逐级找 `.ai_memory`，命中即用。
 都没有时，如果 cwd 处在一个「像项目」的目录树里（含 `.git`、`ProjectSettings`、

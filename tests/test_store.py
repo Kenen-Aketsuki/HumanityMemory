@@ -328,6 +328,146 @@ def test_consolidate_invalidates_old_fact(env) -> None:
     assert not store.get_knowledge(old.id).live
 
 
+# --------------------------------------------- 复盘：整批拒绝与原子回滚
+
+
+def _consolidation_counts(store):
+    """复盘前后对照计数：证明失败时零写入、原始日志没被动过。"""
+    return {
+        "logs": len(store.list_logs(include_consolidated=True)),
+        "pending": len(store.list_logs(include_consolidated=False)),
+        "knowledge": len(store.list_knowledge(scope="workspace")),
+        "episodes": len(store.list_episodes()),
+        "digests": store.workspace_conn.execute(
+            "SELECT COUNT(*) FROM digests"
+        ).fetchone()[0],
+    }
+
+
+def test_consolidate_rejects_state_in_episodes_without_any_write(env) -> None:
+    """复现 11-08 事故：state 误入 episodes。旧版静默跳过并清空了日志。"""
+    _, _, store = env
+    store.append_log("事件 A")
+    store.append_log("事件 B")
+    before = _consolidation_counts(store)
+
+    with pytest.raises(ValueError, match=r"episodes\[0\].*放错了数组"):
+        store.consolidate_apply(
+            episodes=[{"content": "某现状", "kind": "state"}], purge=True
+        )
+
+    assert _consolidation_counts(store) == before
+    assert before["pending"] == 2
+
+
+def test_consolidate_rejects_oversized_item_before_any_write(env) -> None:
+    """超长 case / state 必须在写库之前就被拦下，不能等写入时静默丢。"""
+    _, _, store = env
+    store.append_log("事件 A")
+    before = _consolidation_counts(store)
+
+    with pytest.raises(ValueError, match=r"episodes\[1\].*上限"):
+        store.consolidate_apply(
+            knowledge=[{"content": "本来会被写进去的合法结论"}],
+            episodes=[
+                {"content": "合法叙述", "kind": "narrative"},
+                {"content": "超长案例" * 200, "kind": "case"},
+            ],
+            purge=True,
+        )
+    assert _consolidation_counts(store) == before
+
+    with pytest.raises(ValueError, match=r"knowledge\[0\].*上限"):
+        store.consolidate_apply(
+            knowledge=[{"content": "超长现状" * 100, "kind": "state"}], purge=True
+        )
+    assert _consolidation_counts(store) == before
+
+
+def test_consolidate_rolls_back_on_mid_write_failure(env, monkeypatch) -> None:
+    """前置校验覆盖不到的运行时故障：整个提交回滚，日志与 digest 都不动。"""
+    _, _, store = env
+    store.append_log("事件 A")
+    before = _consolidation_counts(store)
+
+    def boom(*args, **kwargs):
+        raise ValueError("模拟写入期故障")
+
+    monkeypatch.setattr(store, "write_episode", boom)
+    with pytest.raises(ValueError, match=r"episodes\[0\] 写入失败"):
+        store.consolidate_apply(
+            knowledge=[{"content": "先写进去又该被回滚的结论"}],
+            episodes=["一条叙述"],
+            purge=True,
+        )
+    assert _consolidation_counts(store) == before
+
+
+def test_consolidate_retry_after_rejection_succeeds(env) -> None:
+    """被拒后日志仍可复盘：改对参数原样重跑，不必手工补数据。"""
+    _, _, store = env
+    store.append_log("事件 A")
+    with pytest.raises(ValueError):
+        store.consolidate_apply(
+            episodes=[{"content": "某现状", "kind": "state"}], purge=True
+        )
+    result = store.consolidate_apply(
+        knowledge=[{"content": "某现状", "kind": "state", "source": "重跑"}],
+        episodes=["修好后的叙述"],
+        purge=True,
+    )
+    assert result["purged"] == 1
+    assert len(result["created_knowledge"]) == 1
+
+
+def test_consolidate_receipt_is_auditable(env) -> None:
+    """回执必须能对照「请求几条 / 真写几条」，不能只看 ok=true。"""
+    _, _, store = env
+    store.append_log("事件 A")
+    store.append_log("事件 B")
+    result = store.consolidate_apply(
+        knowledge=[
+            {"content": "结论一"},
+            {"content": "结论二", "kind": "state", "source": "测试"},
+        ],
+        episodes=[{"content": "叙述一", "kind": "narrative"}],
+        purge=True,
+    )
+    assert result["requested_knowledge"] == 2 == len(result["created_knowledge"])
+    assert result["requested_episodes"] == 1 == len(result["created_episodes"])
+    assert result["skipped_knowledge"] == []
+    assert result["warnings"] == []
+    assert result["purged"] == 2
+
+
+def test_consolidate_warns_on_zero_output_and_summary_fallback(env) -> None:
+    """漏传数组 / summary 被当成叙述，都要在回执里显式提示。"""
+    _, _, store = env
+    store.append_log("事件 A")
+    zero = store.consolidate_apply(purge=False)
+    assert any("零产出" in w for w in zero["warnings"])
+
+    store.append_log("事件 B")
+    result = store.consolidate_apply(summary="只有一句话总结", purge=False)
+    assert len(result["created_episodes"]) == 1
+    assert any("summary" in w for w in result["warnings"])
+
+
+def test_consolidate_default_day_follows_preview(env) -> None:
+    """day 不传时与 preview 对齐，补历史不会把经历 / digest 记到今天。"""
+    from humanity_memory.lifecycle import DAY_MS
+    from humanity_memory.models import now_ms
+
+    _, _, store = env
+    store.append_log("昨天的日志", at=int(now_ms() - DAY_MS))
+    preview = store.consolidate_preview()
+    assert preview["log_count"] == 1
+
+    result = store.consolidate_apply(episodes=["昨天的复盘"], purge=True)
+    assert result["day"] == preview["day"]
+    assert store.list_episodes()[0].day == preview["day"]
+
+
 # ---------------------------------------------------------------- 统计
 
 

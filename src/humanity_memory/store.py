@@ -66,6 +66,11 @@ KNOWLEDGE_MAX_CHARS = 500
 STATE_MAX_CHARS = 200
 CASE_MAX_CHARS = 300
 
+# consolidate_apply 的两个数组各自接受的 kind。放错数组是最容易犯的错
+# （把 state 塞进 episodes 会被旧版静默跳过），前置校验必须按这里硬拦。
+_KNOWLEDGE_KINDS = frozenset({"knowledge", "state"})
+_EPISODE_KINDS = frozenset({"case", "narrative"})
+
 
 @dataclass(frozen=True)
 class TableSpec:
@@ -109,6 +114,13 @@ class ScopeError(RuntimeError):
     """需要工作区但当前目录没有。"""
 
 
+class ConsolidationRejected(ValueError):
+    """复盘提交被拒：入参不合法或写入中途失败。
+
+    整批拒绝，不做任何写入，原始日志保持待复盘。调用方改正参数后可原样重跑。
+    """
+
+
 def serialize_float32(vector: Sequence[float]) -> bytes:
     return struct.pack(f"{len(vector)}f", *vector)
 
@@ -134,6 +146,110 @@ def _norm_kind(kind: str | None) -> str:
     """归一化 kind：旧词 fact/episode 映射到新词，其余原样返回。"""
     value = (kind or "knowledge").strip().lower()
     return _KIND_ALIASES.get(value, value)
+
+
+def _check_writable(content: str, kind: str, *, label: str = "写入") -> tuple[str, str]:
+    """写入前的唯一内容判据：归一化 kind、去空白、按 kind 卡长度。
+
+    write_knowledge / write_episode / consolidate_apply 共用这一套规则，
+    杜绝「前置校验放行、真正写入却被拒」的规则漂移。返回 (正文, 归一化 kind)。
+    """
+    k = _norm_kind(kind)
+    if k not in _KNOWLEDGE_KINDS | _EPISODE_KINDS:
+        raise ValueError(f"{label}: 未知 kind={kind!r}")
+    text = (content or "").strip()
+    if not text:
+        raise ValueError(f"{label}: 内容不能为空")
+    limit = {
+        "knowledge": KNOWLEDGE_MAX_CHARS,
+        "state": STATE_MAX_CHARS,
+        "case": CASE_MAX_CHARS,
+    }.get(k)
+    if limit is not None and len(text) > limit:
+        hint = (
+            "现状要短（版本号、路径、选型，一两句）" if k == "state"
+            else "案例只保留「现象 → 根因 → 落点」，过程请写日志或叙述" if k == "case"
+            else "知识要能一句话说清；带过程的排查细节请写日志，复盘时再压成案例"
+        )
+        raise ValueError(f"{label}: {k} 上限 {limit} 字（当前 {len(text)} 字）。{hint}")
+    return text, k
+
+
+def _prepare_apply_items(
+    knowledge: Sequence[dict[str, Any]] | None,
+    facts: Sequence[dict[str, Any]] | None,
+    episodes: Sequence[Any] | None,
+    summary: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """复盘提交的整批前置校验：纯函数，不碰数据库。
+
+    旧版把校验失败 `except ValueError: continue` 静默跳过，结果「ok=true
+    但少了几条结论、原始日志已被清空」。现在任何一项不合法都整批拒绝，
+    此时一条结论都没写、日志仍是 pending，改完参数可原样重跑。
+    """
+    prepared_knowledge: list[dict[str, Any]] = []
+    prepared_episodes: list[dict[str, Any]] = []
+    buckets = (
+        ("knowledge", list(knowledge or []) + list(facts or []), _KNOWLEDGE_KINDS, "knowledge"),
+        ("episodes", list(episodes or []), _EPISODE_KINDS, "narrative"),
+    )
+    for bucket, raws, allowed, default_kind in buckets:
+        for index, raw in enumerate(raws):
+            where = f"{bucket}[{index}]"
+            if isinstance(raw, str):
+                raw = {"content": raw}
+            if not isinstance(raw, dict):
+                raise ConsolidationRejected(f"{where} 必须是对象或字符串")
+            kind = _norm_kind(raw.get("kind") or default_kind)
+            if kind not in allowed:
+                hint = (
+                    "state 属于 knowledge 数组（写成带 kind='state' 的陈述项）"
+                    if kind == "state" and bucket == "episodes"
+                    else f"{bucket} 只接受 {sorted(allowed)}"
+                )
+                raise ConsolidationRejected(f"{where} kind={kind!r} 放错了数组；{hint}")
+            try:
+                text, kind = _check_writable(
+                    str(raw.get("content", "")), kind, label=where
+                )
+            except ValueError as exc:
+                raise ConsolidationRejected(str(exc)) from exc
+
+            importance = raw.get("importance")
+            if importance is not None:
+                try:
+                    importance = float(importance)
+                except (TypeError, ValueError) as exc:
+                    raise ConsolidationRejected(
+                        f"{where} importance 必须是数字"
+                    ) from exc
+                if not 0.0 <= importance <= 1.0:
+                    raise ConsolidationRejected(f"{where} importance 必须在 0~1")
+
+            item: dict[str, Any] = {
+                "content": text,
+                "kind": kind,
+                "importance": importance,
+                "tags": raw.get("tags"),
+            }
+            if bucket == "knowledge":
+                item["source"] = raw.get("source")
+                item["invalidates"] = raw.get("invalidates")
+            else:
+                item["level"] = raw.get("level")
+            (prepared_knowledge if bucket == "knowledge" else prepared_episodes).append(item)
+
+    # 兼容旧行为：没给 episodes 却给了 summary，就把 summary 记成一条叙述。
+    # 显式打标记，回执里会提示，避免调用方以为只写了 digest。
+    summary_as_narrative = False
+    if not prepared_episodes and summary and summary.strip():
+        text, _ = _check_writable(summary, "narrative", label="summary")
+        prepared_episodes.append(
+            {"content": text, "kind": "narrative", "importance": None,
+             "tags": None, "level": None}
+        )
+        summary_as_narrative = True
+    return prepared_knowledge, prepared_episodes, summary_as_narrative
 
 
 def _row_kinds(kinds: Sequence[str] | None, allowed: Sequence[str]) -> set[str] | None:
@@ -297,22 +413,10 @@ class MemoryStore:
         meta: dict[str, Any] | None = None,
     ) -> Knowledge:
         k = _norm_kind(kind)
-        if k not in ("knowledge", "state"):
+        if k not in _KNOWLEDGE_KINDS:
             raise ValueError(f"write_knowledge 不接受 kind={kind!r}")
 
-        content = (content or "").strip()
-        if not content:
-            raise ValueError("内容不能为空，也不要写一堆过程 —— 一句话说清")
-        limit = STATE_MAX_CHARS if k == "state" else KNOWLEDGE_MAX_CHARS
-        if len(content) > limit:
-            hint = (
-                "现状要短（版本号、路径、选型，一两句）"
-                if k == "state"
-                else "知识要能一句话说清；带过程的排查细节请写日志，复盘时再压成案例"
-            )
-            raise ValueError(
-                f"{k} 上限 {limit} 字（当前 {len(content)} 字）。{hint}"
-            )
+        content, _ = _check_writable(content, k, label="write_knowledge")
 
         db_name, conn = self._conn_for(scope)
         now = now_ms()
@@ -364,17 +468,10 @@ class MemoryStore:
     ) -> Episode:
         """写一条经历。case 要短（≤300 字），narrative 可以有过程。"""
         k = _norm_kind(kind)
-        if k not in ("case", "narrative"):
+        if k not in _EPISODE_KINDS:
             raise ValueError(f"write_episode 不接受 kind={kind!r}")
 
-        text = (content or "").strip()
-        if not text:
-            raise ValueError("内容不能为空")
-        if k == "case" and len(text) > CASE_MAX_CHARS:
-            raise ValueError(
-                f"案例上限 {CASE_MAX_CHARS} 字（当前 {len(text)} 字）。"
-                "案例只保留「现象 → 根因 → 落点」，过程请写日志或叙述。"
-            )
+        text, _ = _check_writable(content, k, label="write_episode")
 
         if self.workspace_conn is None:
             raise ScopeError("当前目录没有 .ai_memory 工作区，无法写经历")
@@ -956,8 +1053,20 @@ class MemoryStore:
         `facts` 是旧参数名，保留兼容：默认按 knowledge 落库。
         `knowledge` 里每项可带 `kind`（knowledge / state）。
         `episodes` 每项可带 `kind`（case / narrative），不传按 narrative。
+
+        两道闸门，防止「结论没写全、原始日志却已被清空」：
+        1) 先整批前置校验。任何一项不合法抛 ConsolidationRejected，此时零写入、
+           原始日志保持 pending，改完参数可原样重跑。
+        2) 所有写入合进同一个事务，中途异常整体回滚；只有条目全部写成功，
+           才标记日志、写 digest、按 purge 删除原始日志。
         """
-        target = parse_day(day)
+        prepared_knowledge, prepared_episodes, summary_as_narrative = _prepare_apply_items(
+            knowledge, facts, episodes, summary
+        )
+
+        # day 不传时与 consolidate_preview 对齐：取最近一个仍有积压的日期。
+        # 旧版默认 today，补历史时会把经历和 digest 记到今天、并误删今天的日志。
+        target = parse_day(day if day is not None else self._latest_pending_day())
         db_name, conn = self._conn_for("workspace")
         pending = self.list_logs(day=target, include_consolidated=False, limit=1000)
         if not pending:
@@ -973,78 +1082,70 @@ class MemoryStore:
         now = now_ms()
         created_knowledge: list[Knowledge] = []
         created_episodes: list[Episode] = []
+        skipped_knowledge: list[dict[str, Any]] = []
 
         existing = {
             f.content.strip()
             for f in self.list_knowledge(scope="all", include_invalid=False, limit=1000)
         }
 
-        for raw in list(knowledge or []) + list(facts or []):
-            content = str(raw.get("content", "")).strip()
-            if not content or content in existing:
-                continue
-            try:
-                item = self.write_memory(
-                    content,
-                    kind=_norm_kind(raw.get("kind") or "knowledge"),
-                    tags=raw.get("tags"),
-                    importance=raw.get("importance"),
-                    scope="workspace",
-                    source=raw.get("source") or f"digest:{digest_id}",
-                )
-            except ValueError:
-                continue
-            if not isinstance(item, Knowledge):
-                continue
-            existing.add(content)
-            created_knowledge.append(item)
-            old_id = raw.get("invalidates")
-            if old_id:
-                try:
-                    self.invalidate(str(old_id), invalidated_by=item.id)
-                except NotFound:
-                    pass
-
-        ep_items: list[dict[str, Any]] = []
-        for raw in episodes or []:
-            if isinstance(raw, str):
-                text = raw.strip()
-                if text:
-                    ep_items.append({"content": text})
-            elif isinstance(raw, dict):
-                text = str(raw.get("content", "")).strip()
-                if text:
-                    ep_items.append(
-                        {
-                            "content": text,
-                            "kind": _norm_kind(raw.get("kind") or "narrative"),
-                            "importance": raw.get("importance"),
-                            "level": raw.get("level"),
-                            "tags": raw.get("tags"),
-                        }
-                    )
-        if not ep_items and summary and summary.strip():
-            ep_items = [{"content": summary.strip()}]
-
-        last_at = max(log.at for log in pending)
-        for item in ep_items:
-            try:
-                created_episodes.append(
-                    self.write_episode(
-                        item["content"],
-                        kind=item.get("kind") or "narrative",
-                        importance=item.get("importance"),
-                        tags=item.get("tags"),
-                        at=last_at,
-                        day=target,
-                        digest_id=digest_id,
-                        source=f"digest:{digest_id}",
-                    )
-                )
-            except (ValueError, ScopeError):
-                continue
-
+        # 整个提交一个事务：write_* 内部的事务会退化成 SAVEPOINT，
+        # 任何一步抛异常都整体回滚，日志与 digest 都不会被改动。
         with transaction(conn):
+            for index, raw in enumerate(prepared_knowledge):
+                content = raw["content"]
+                if content in existing:
+                    skipped_knowledge.append(
+                        {"index": index, "content": content, "reason": "duplicate"}
+                    )
+                    continue
+                try:
+                    item = self.write_memory(
+                        content,
+                        kind=raw["kind"],
+                        tags=raw.get("tags"),
+                        importance=raw.get("importance"),
+                        scope="workspace",
+                        source=raw.get("source") or f"digest:{digest_id}",
+                    )
+                except (ValueError, ScopeError) as exc:
+                    raise ConsolidationRejected(
+                        f"knowledge[{index}] 写入失败：{exc}"
+                    ) from exc
+                if not isinstance(item, Knowledge):
+                    raise ConsolidationRejected(
+                        f"knowledge[{index}] 未生成 knowledge 记录，整批已回滚"
+                    )
+                existing.add(content)
+                created_knowledge.append(item)
+                old_id = raw.get("invalidates")
+                if old_id:
+                    try:
+                        self.invalidate(str(old_id), invalidated_by=item.id)
+                    except NotFound:
+                        pass
+
+            last_at = max(log.at for log in pending)
+            for index, item in enumerate(prepared_episodes):
+                try:
+                    created_episodes.append(
+                        self.write_episode(
+                            item["content"],
+                            kind=item["kind"],
+                            importance=item.get("importance"),
+                            tags=item.get("tags"),
+                            at=last_at,
+                            day=target,
+                            digest_id=digest_id,
+                            source=f"digest:{digest_id}",
+                        )
+                    )
+                except (ValueError, ScopeError) as exc:
+                    raise ConsolidationRejected(
+                        f"episodes[{index}] 写入失败：{exc}"
+                    ) from exc
+
+            # 只有条目全部写成功，才标记日志 / 写 digest / 删除原始日志
             for log in pending:
                 conn.execute(
                     "UPDATE logs SET consolidated = 1, digest_id = ? WHERE rowid = ?",
@@ -1067,15 +1168,30 @@ class MemoryStore:
                     json.dumps({"log_ids": [x.id for x in pending]}, ensure_ascii=False),
                 ),
             )
+            purged = self._purge_logs(digest_id) if purge else 0
 
-        purged = self._purge_logs(digest_id) if purge else 0
+        warnings: list[str] = []
+        if summary_as_narrative:
+            warnings.append(
+                "episodes 为空但传了 summary：已按兼容行为把 summary 记成一条 narrative；"
+                "若只想写 digest，请不要传 summary"
+            )
+        if pending and not prepared_knowledge and not prepared_episodes:
+            warnings.append(
+                f"当天有 {len(pending)} 条日志却零产出："
+                "确认不是漏传 knowledge / episodes 数组"
+            )
 
         return {
             "day": target,
             "digest_id": digest_id,
             "log_count": len(pending),
+            "requested_knowledge": len(prepared_knowledge),
+            "requested_episodes": len(prepared_episodes),
             "created_knowledge": [f.to_dict() for f in created_knowledge],
             "created_episodes": [e.to_dict() for e in created_episodes],
+            "skipped_knowledge": skipped_knowledge,
+            "warnings": warnings,
             "purged": purged,
         }
 

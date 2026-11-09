@@ -26,7 +26,7 @@ from .paths import (
     resolve_layout,
     write_last_workspace,
 )
-from .store import MemoryStore, NotFound, ScopeError, _norm_kind
+from .store import ConsolidationRejected, MemoryStore, NotFound, ScopeError, _norm_kind
 from .token import Token, TokenError, resolve_token_path
 
 INSTRUCTIONS_TAIL = """\
@@ -427,7 +427,9 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
 
     @app.tool(
         name="consolidate_apply",
-        description="提交复盘结果：写入提炼的知识/现状与案例/叙述，标记日志已处理，可选清空原始日志。",
+        description="提交复盘结果：写入提炼的知识/现状与案例/叙述，标记日志已处理，可选清空原始日志。"
+        "整批前置校验，任一项不合法（放错数组、超长、空内容）就整批拒绝、零写入且原始日志保留；"
+        "校验通过后所有写入原子提交，中途失败整体回滚、不删日志。",
     )
     def consolidate_apply(
         day: str | None = None,
@@ -438,18 +440,27 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
     ) -> dict[str, Any]:
         """
         Args:
-            day: 复盘哪一天，默认今天。
+            day: 复盘哪一天。不传时与 consolidate_preview 对齐，取最近一个仍有
+                 待复盘日志的日期；**补历史时务必显式传回 preview 返回的 day**。
             knowledge: 陈述数组，每项 {"content": str, "kind": "knowledge"|"state",
                    "tags": [str], "importance": float, "invalidates": "旧id", "source": str}。
+                   只接受 knowledge / state，knowledge 上限 500 字、state 200 字；
                    kind 不传按 knowledge。**带单号的排查结论不要放这里**，
-                   它换个单号就不成立了 —— 那是 case。
+                   它换个单号就不成立了 —— 那是 case。state 属于本数组，
+                   放进 episodes 会被整批拒绝。
             episodes: 经历数组。每项 {"content": str, "kind": "case"|"narrative",
-                   "importance": float, "tags": [str]}。
-                   case 只写「现象 → 根因 → 落点」，≤300 字，一个问题一条；
+                   "importance": float, "tags": [str]}，也可直接传字符串（按 narrative）。
+                   只接受 case / narrative，case 上限 300 字；
+                   case 只写「现象 → 根因 → 落点」，一个问题一条；
                    narrative 写当天过程与判断转折，importance 决定初始详细程度
                    （≥0.75 完整叙述 / 0.45~0.75 要点 / <0.45 一句话）。
-            summary: 当天一句话总结（可选）。
-            purge: 是否物理清空已复盘的原始日志，默认 true。
+            summary: 当天一句话总结（可选）。**episodes 为空时不要传** ——
+                   兼容行为会把它记成一条 narrative；只想写 digest 就别传。
+            purge: 是否物理清空已复盘的原始日志，默认 true。只有整批提交成功才会删。
+
+        返回回执含 requested_knowledge / requested_episodes / created_* /
+        skipped_knowledge / warnings：提交后请核对 created_* 条数是否与请求一致，
+        不要只看 ok=true。
         """
         try:
             result = _st().consolidate_apply(
@@ -460,10 +471,12 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
                 purge=purge,
                 model=cfg.embed_model or None,
             )
+        except ConsolidationRejected as exc:
+            return _err(f"复盘提交被拒绝：{exc}。整批未写入，原始日志保持待复盘")
         except (ValueError, ScopeError) as exc:
             return _err(str(exc))
         except Exception as exc:  # noqa: BLE001
-            return _err(f"复盘失败：{type(exc).__name__}: {exc}")
+            return _err(f"复盘失败：{type(exc).__name__}: {exc}；已回滚，原始日志未改动")
         return _ok(result=result)
 
     # ------------------------------------------------------------- 运维

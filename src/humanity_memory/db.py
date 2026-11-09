@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import re
 import sqlite3
 import time
@@ -304,9 +305,30 @@ def open_db(path: Path, cfg: Config) -> sqlite3.Connection:
     return conn
 
 
+_SAVEPOINT_SEQ = itertools.count(1)
+
+
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """显式写事务（autocommit 模式下必须手动 BEGIN）。"""
+    """显式写事务（autocommit 模式下必须手动 BEGIN）。
+
+    支持嵌套：已经在外层事务里时改用 SAVEPOINT，外层回滚会把内层一起回滚。
+    consolidate_apply 靠这个把「写结论 + 写经历 + 写 digest + 标记日志 +
+    purge」合成一次原子提交 —— 中途任何异常都不留残数据，也不删原始日志。
+    """
+    if conn.in_transaction:
+        name = f"hm_sp_{next(_SAVEPOINT_SEQ)}"
+        conn.execute(f"SAVEPOINT {name}")
+        try:
+            yield conn
+        except BaseException:
+            conn.execute(f"ROLLBACK TO {name}")
+            conn.execute(f"RELEASE {name}")
+            raise
+        else:
+            conn.execute(f"RELEASE {name}")
+        return
+
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
