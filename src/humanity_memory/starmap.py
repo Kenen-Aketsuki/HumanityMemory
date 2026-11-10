@@ -446,7 +446,7 @@ canvas{display:block;width:100%;height:100%;cursor:grab}
 canvas.drag{cursor:grabbing}
 #tip{position:absolute;right:16px;top:16px;width:300px;max-height:calc(100% - 32px);
   overflow-y:auto;background:rgba(13,20,34,.94);border:1px solid var(--line);border-radius:10px;
-  padding:14px;display:none;pointer-events:none}
+  padding:14px;display:none;pointer-events:auto;user-select:text;-webkit-user-select:text;cursor:text}
 #tip .kind{font-size:11px;color:var(--muted);letter-spacing:1px}
 #tip .body{margin:8px 0;font-size:12px;white-space:pre-wrap;word-break:break-word}
 #tip .meta{font-size:11px;color:var(--muted);border-top:1px solid var(--line);padding-top:8px}
@@ -478,7 +478,7 @@ canvas.drag{cursor:grabbing}
     </div>
     <div class="sec">
       <h2>查找</h2>
-      <input type="text" id="search" placeholder="输入关键词，高亮命中条目">
+      <input type="text" id="search" placeholder="输入关键词或节点 ID，高亮命中条目">
       <label class="row"><input type="checkbox" id="labels"> 显示更多星名</label>
       <button id="reset">重排</button><button id="fit">复位视角</button>
     </div>
@@ -487,7 +487,7 @@ canvas.drag{cursor:grabbing}
   <div id="main">
     <canvas id="cv"></canvas>
     <div id="tip"></div>
-    <div id="hud">拖拽移动 · 滚轮缩放 · 悬停看全文 · 点击固定星点</div>
+    <div id="hud">拖拽移动星点 · 滚轮缩放 · 悬停看全文 · 点击选中 / 再点或点空处取消</div>
     <div id="legend"></div>
   </div>
 </div>
@@ -500,7 +500,7 @@ const ET={semantic:'语义近邻',invalidates:'失效链',digest:'复盘溯源',
 const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
 const tip=document.getElementById('tip');
 let W=0,H=0,DPR=1,view={x:0,y:0,k:1};
-let alpha=1,frame=0,hover=null,dragging=null,panning=null,fixedHover=true;
+let alpha=1,frame=0,hover=null,selected=null,dragging=null,panning=null,fixedHover=true,downX=0,downY=0;
 const enabled={semantic:true,invalidates:true,digest:true,tag:false};
 const kinds={knowledge:true,state:true,case:true,narrative:true,log:true,digest:true};
 let minScore=DATA.meta.min_score;
@@ -528,6 +528,9 @@ function visible(e){
   if(!kinds[e.s.kind]||!kinds[e.t.kind])return false;
   if(e.type==='semantic'&&e.w<minScore)return false;
   return true;
+}
+function matchesQuery(n,q){
+  return !!q&&(n.content.toLowerCase().includes(q)||n.tags.join(' ').toLowerCase().includes(q)||n.id.toLowerCase().includes(q));
 }
 function activeNodes(){
   const s=new Set();
@@ -633,7 +636,7 @@ function draw(){
   const focusSet=new Set();
   for(const n of nodes){
     if(!kinds[n.kind])continue;
-    if(n===hover||(q&&(n.content.toLowerCase().includes(q)||n.tags.join(' ').toLowerCase().includes(q))))focusSet.add(n);
+    if(n===hover||n===selected||matchesQuery(n,q))focusSet.add(n);
   }
   const hotEdges=[];
   for(const e of edges){
@@ -647,8 +650,8 @@ function draw(){
     if(!kinds[n.kind])continue;
     const dim=n.live===false||n.archived;
     const col=C[n.kind]||'#8898ad';
-    const hit=q&&(n.content.toLowerCase().includes(q)||n.tags.join(' ').toLowerCase().includes(q));
-    const focus=n===hover||hit;
+    const hit=matchesQuery(n,q);
+    const focus=n===hover||n===selected||hit;
     ctx.globalAlpha=dim?.42:(focus?1:.9);
     ctx.beginPath();ctx.arc(n.x,n.y,n.r*2.4,0,6.2832);
     ctx.fillStyle=col;ctx.globalAlpha*=.10;ctx.fill();
@@ -664,6 +667,8 @@ function draw(){
       ctx.strokeStyle='rgba(255,255,255,.5)';ctx.lineWidth=1;ctx.stroke();}
     if(focus){ctx.beginPath();ctx.arc(n.x,n.y,n.r+8,0,6.2832);
       ctx.strokeStyle=col;ctx.lineWidth=.8;ctx.stroke();}
+    if(n===selected){ctx.beginPath();ctx.arc(n.x,n.y,n.r+11,0,6.2832);
+      ctx.strokeStyle='#ffffff';ctx.lineWidth=1.4;ctx.stroke();}
     labelCandidates.push({
       n:n,t:n.content.replace(/\s+/g,' ').slice(0,14),focus:focus,
       pri:(focus?1000:0)+(n.kind==='digest'?100:0)+n.deg
@@ -717,18 +722,21 @@ cv.addEventListener('mousemove',ev=>{
   if(dragging){dragging.x=(mx/view.k)-view.x;dragging.y=(my/view.k)-view.y;alpha=Math.max(alpha,.35);return;}
   if(panning){view.x+=(mx-panning.x)/view.k;view.y+=(my-panning.y)/view.k;panning={x:mx,y:my};return;}
   const n=pick(mx,my);
-  if(n!==hover){hover=n;showTip(n);}
+  if(n!==hover){hover=n;showTip(selected||n);}
 });
 cv.addEventListener('mousedown',ev=>{
+  downX=ev.clientX;downY=ev.clientY;
   const r=cv.getBoundingClientRect(),mx=ev.clientX-r.left,my=ev.clientY-r.top;
   const n=pick(mx,my);
-  if(n){dragging=n;n.fixed=true;cv.classList.add('drag');}
-  else{panning={x:mx,y:my};hover=null;showTip(null);cv.classList.add('drag');}
+  if(n){dragging=n;cv.classList.add('drag');}
+  else{panning={x:mx,y:my};hover=null;showTip(selected);cv.classList.add('drag');}
 });
 window.addEventListener('mouseup',()=>{dragging=null;panning=null;cv.classList.remove('drag');});
 cv.addEventListener('click',ev=>{
+  if(Math.hypot(ev.clientX-downX,ev.clientY-downY)>4)return;
   const r=cv.getBoundingClientRect(),n=pick(ev.clientX-r.left,ev.clientY-r.top);
-  if(n&&!n.fixed)n.fixed=true;else if(n)n.fixed=false;
+  if(n&&n===selected){selected=null;showTip(null);return;}
+  selected=n;showTip(selected||hover);
 });
 cv.addEventListener('wheel',ev=>{
   ev.preventDefault();
@@ -761,7 +769,7 @@ function buildUI(){
     '<span style="color:#ffc46b">琥珀箭头 = 失效 / 换代</span><br>'+
     '<span style="color:#ffe08a">黄色恒星 = 复盘批次</span><br>'+
     '<span style="color:#5fd6a0">绿色实线 = 标签共现</span><br>'+
-    '<span style="color:#cfe0ff">悬停星点 = 加粗其可见连线</span>';
+    '<span style="color:#cfe0ff">悬停 / 选中 / 搜中 = 加粗其可见连线</span>';
   const notes=document.getElementById('notes');
   notes.innerHTML='<h2>数据源说明</h2>'+(m.notes.length?m.notes.map(x=>'<div class="kv">'+esc(x)+'</div>').join(''):
     '<div class="kv"><span>无额外提示</span></div>')+
