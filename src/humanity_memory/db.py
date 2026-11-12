@@ -161,6 +161,8 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
 _COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("knowledge", "kind", "TEXT NOT NULL DEFAULT 'knowledge'"),
     ("knowledge", "verified_at", "INTEGER"),
+    # 老库里的现状按梯子顶端（7 天）起算：它们已经过了「刚写下来需要当天验证」的阶段
+    ("knowledge", "state_interval_days", "REAL NOT NULL DEFAULT 7.0"),
     ("knowledge", "archived_at", "INTEGER"),
     ("episodes", "kind", "TEXT NOT NULL DEFAULT 'narrative'"),
     ("episodes", "archived_at", "INTEGER"),

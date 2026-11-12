@@ -28,15 +28,25 @@ DEFAULT_IMPORTANCE = {
 }
 
 # 归档判据：超过 ttl 天没被碰过、且访问次数不超过 max_access → 归档。
-#   knowledge 3 年；state 只有 30 天（现状会变，且续命必须显式确认）；
-#   case / narrative 1 年。都不自动删除，只置 archived_at。
+#   knowledge 3 年；case / narrative 1 年。都不自动删除，只置 archived_at。
+#
+# state 是**例外**：它不走上面这套「久未触碰」判据，而是走下面的复核周期。
+#   archive_ttl["state"] 只在拿不到行级 state_interval_days 时兜底，等价于梯子顶端。
 DEFAULT_ARCHIVE_TTL = {
     "knowledge": 1095.0,
-    "state": 30.0,
+    "state": 7.0,
     "case": 365.0,
     "narrative": 365.0,
 }
 DEFAULT_ARCHIVE_MAX_ACCESS = 1
+
+# 现状的复核梯子（天）：新写入从 1 天起步，每次复核确认「没变」就升一档，
+# 到 7 天封顶。刚写下的现状当天就能被验证 —— 写错、写完就变的情况当场抓到。
+STATE_INTERVAL_LADDER: tuple[float, ...] = (1.0, 3.0, 5.0, 7.0)
+
+# 到期后仍给一次宽限，时长 = min(当前周期, 本值)。
+# 梯子只有 1/3/5/7 四档时，实际宽限是 1/3/5/5 天；封顶 5 是为了让「7 天档」不至于拖成两周。
+STATE_GRACE_CAP_DAYS = 5.0
 
 # 经历的渐进压缩：刚复盘是完整叙述（level 0），随时间逐级变短
 # level 0 → 1 → 2 → 3（归档时），触发门槛见下
@@ -110,6 +120,9 @@ class Config:
     halflife: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_HALFLIFE))
     archive_ttl: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_ARCHIVE_TTL))
     archive_max_access: int = DEFAULT_ARCHIVE_MAX_ACCESS
+    # 现状专用：复核周期梯子与宽限封顶
+    state_ladder: tuple[float, ...] = STATE_INTERVAL_LADDER
+    state_grace_cap_days: float = STATE_GRACE_CAP_DAYS
     purge_after_days: float = 180.0
     recompress_days: dict[str, float] = field(
         default_factory=lambda: dict(DEFAULT_RECOMPRESS_DAYS)
@@ -162,6 +175,19 @@ class Config:
             except (KeyError, ValueError):
                 return default
 
+        def get_ladder(key: str, default: tuple[float, ...]) -> tuple[float, ...]:
+            """解析 HM_STATE_LADDER="1,3,5,7"；非法值整体退回默认，不半途生效。"""
+            raw = get(key, "")
+            if not raw:
+                return default
+            try:
+                values = tuple(
+                    sorted({float(x) for x in raw.replace(" ", "").split(",") if x})
+                )
+            except ValueError:
+                return default
+            return values or default
+
         home = Path(get("HM_HOME", str(DEFAULT_HOME))).expanduser()
         db_path = Path(get("HM_DB_PATH", str(home / "memory.db"))).expanduser()
 
@@ -172,11 +198,15 @@ class Config:
         halflife["narrative"] = get_float("HM_HALFLIFE_EPISODE", halflife["narrative"])
         halflife["log"] = get_float("HM_HALFLIFE_LOG", halflife["log"])
 
+        state_ladder = get_ladder("HM_STATE_LADDER", STATE_INTERVAL_LADDER)
+        state_grace_cap = get_float("HM_STATE_GRACE_CAP", STATE_GRACE_CAP_DAYS)
+
         archive_ttl = {
             "knowledge": get_float(
                 "HM_ARCHIVE_TTL_KNOWLEDGE", DEFAULT_ARCHIVE_TTL["knowledge"]
             ),
-            "state": get_float("HM_ARCHIVE_TTL_STATE", DEFAULT_ARCHIVE_TTL["state"]),
+            # state 的实际节奏由 state_ladder 决定，这里只做兜底：默认取梯子顶端
+            "state": get_float("HM_ARCHIVE_TTL_STATE", state_ladder[-1]),
             "case": get_float("HM_ARCHIVE_TTL_CASE", DEFAULT_ARCHIVE_TTL["case"]),
             "narrative": get_float(
                 "HM_ARCHIVE_TTL_EPISODE", DEFAULT_ARCHIVE_TTL["narrative"]
@@ -199,6 +229,8 @@ class Config:
             halflife=halflife,
             archive_ttl=archive_ttl,
             archive_max_access=get_int("HM_ARCHIVE_MAX_ACCESS", DEFAULT_ARCHIVE_MAX_ACCESS),
+            state_ladder=state_ladder,
+            state_grace_cap_days=state_grace_cap,
             purge_after_days=get_float("HM_PURGE_AFTER_DAYS", 180.0),
             recompress_days={
                 "1": get_float("HM_RECOMPRESS_L0_DAYS", DEFAULT_RECOMPRESS_DAYS["1"]),
@@ -236,6 +268,11 @@ class Config:
             "halflife_days": self.halflife,
             "archive_ttl_days": self.archive_ttl,
             "archive_max_access": self.archive_max_access,
+            "state_review": {
+                "ladder_days": list(self.state_ladder),
+                "grace_cap_days": self.state_grace_cap_days,
+                "on_mismatch": "purge",
+            },
             "purge_after_days": self.purge_after_days,
             "recompress_days": self.recompress_days,
         }

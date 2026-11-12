@@ -110,6 +110,7 @@ class Knowledge:
     embedded: bool
     kind: str = "knowledge"
     verified_at: int | None = None
+    state_interval_days: float = 7.0
     meta: dict[str, Any] = field(default_factory=dict)
     db: str = "workspace"
 
@@ -135,6 +136,11 @@ class Knowledge:
             embedded=bool(row["embedded"]),
             kind=row["kind"] if "kind" in keys else "knowledge",
             verified_at=row["verified_at"] if "verified_at" in keys else None,
+            state_interval_days=(
+                float(row["state_interval_days"])
+                if "state_interval_days" in keys and row["state_interval_days"] is not None
+                else 7.0
+            ),
             meta=_loads(row["meta"], {}),
             db=db,
         )
@@ -172,6 +178,13 @@ class Knowledge:
         if self.verified_at:
             data["verified_at"] = self.verified_at
             data["verified_iso"] = iso(self.verified_at)
+        if self.is_state:
+            data["state_interval_days"] = round(self.state_interval_days, 1)
+            # 下次该复核的时刻：上次确认（或创建）之后过一个当前周期
+            due = (self.verified_at or self.created_at) + int(
+                self.state_interval_days * 86_400_000
+            )
+            data["review_due_iso"] = iso(due)
         if self.invalid_at:
             data["invalid_at"] = self.invalid_at
             data["invalid_iso"] = iso(self.invalid_at)

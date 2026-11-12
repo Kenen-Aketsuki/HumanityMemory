@@ -128,7 +128,7 @@ def cmd_memory(args: argparse.Namespace) -> int:
             if not content and not sys.stdin.isatty():
                 content = sys.stdin.read().strip()
             if not content:
-                print("错误：需要提供内容（state 纯确认请用 verify 子命令）", file=sys.stderr)
+                print("错误：需要提供内容（state 续命请用 review 子命令）", file=sys.stderr)
                 return 2
             item = store.write_memory(
                 content,
@@ -180,6 +180,15 @@ def cmd_memory(args: argparse.Namespace) -> int:
         if args.action == "verify":
             item = store.verify_state(args.id)
             _dump({"ok": True, "item": item.to_dict()})
+            return 0
+
+        if args.action == "review":
+            # 不带 id 就是「列出该复核的现状」，带了 id 才是逐条处理
+            if not args.id:
+                _dump({"ok": True, "report": store.state_due()})
+                return 0
+            result = store.review_state(args.id, matched=not args.stale)
+            _dump({"ok": True, "result": result})
             return 0
 
         if args.action == "invalidate":
@@ -594,7 +603,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_rules.set_defaults(func=cmd_rules)
 
     p_mem = sub.add_parser("memory", help="知识 / 现状 / 案例 / 叙述 操作")
-    p_mem.add_argument("action", choices=["add", "list", "verify", "invalidate", "promote"])
+    p_mem.add_argument(
+        "action", choices=["add", "list", "verify", "review", "invalidate", "promote"]
+    )
     p_mem.add_argument("text", nargs="?", default=None, help="add 时的内容")
     p_mem.add_argument(
         "--kind",
@@ -609,7 +620,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_mem.add_argument("--invalidates", default=None, help="add 时指定被取代的旧 id")
     p_mem.add_argument("--include-invalid", action="store_true")
     p_mem.add_argument("--limit", type=int, default=30)
-    p_mem.add_argument("--id", default=None, help="verify/invalidate/promote 的目标 id")
+    p_mem.add_argument("--id", default=None, help="verify/review/invalidate/promote 的目标 id")
+    p_mem.add_argument(
+        "--stale",
+        action="store_true",
+        help="review 时表示「现状已不符」：直接删除该条目；不传表示仍成立，续命并升档",
+    )
     p_mem.add_argument("--by", default=None)
     p_mem.set_defaults(func=cmd_memory)
 

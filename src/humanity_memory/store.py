@@ -21,19 +21,25 @@ import re
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 from .config import DEFAULT_IMPORTANCE, Config
 from .db import get_meta, open_db, transaction
 from .embeddings import EmbeddingProvider
 from .lifecycle import (
     DAY_MS,
+    REVIEW_DUE,
+    REVIEW_OK,
+    REVIEW_OVERDUE,
     archive_decision,
     combine_score,
     initial_compression_level,
     lifecycle_strength,
+    next_interval,
     recompress_threshold,
     similarity_from_cosine_distance,
+    state_deadlines,
+    state_review_status,
 )
 from .models import (
     ALL_KINDS,
@@ -42,6 +48,7 @@ from .models import (
     Knowledge,
     LogEntry,
     day_of,
+    iso,
     new_id,
     now_ms,
     parse_day,
@@ -365,6 +372,16 @@ class MemoryStore:
         if verifies and k != "state":
             raise ValueError("verifies 只能用于 state")
 
+        # 现状不许走「新条目顶掉旧条目」这条路：每次换代都留一条 invalid 记录，
+        # 久了就是一条没人愿意看的失效链，而中间每一条都曾是「当时的真相」。
+        # 现状的正确更替姿势是「复核发现不符 → 删掉旧条目 → 独立写新的」。
+        if invalidates and k == "state":
+            raise ValueError(
+                "state 不允许用 invalidates 换代：那会攒出冗长的失效链。"
+                "复核发现现状已经不成立时，用 memory_review(matched=false) 直接废弃旧条目，"
+                "再独立写一条新的现状。"
+            )
+
         if k in ("knowledge", "state"):
             item: Knowledge | Episode = self.write_knowledge(
                 content,
@@ -426,11 +443,18 @@ class MemoryStore:
         vectors = self.embedder.try_embed([content])
         vec = vectors[0] if vectors else None
 
+        # 新写下的现状最容易错（写的时候就可能已经变了），所以从梯子最低档起算，
+        # 复核确认几次都没变才逐步放宽。knowledge 这一列无意义，跟上默认值即可。
+        state_interval = (
+            min(self.cfg.state_ladder) if k == "state" else self.cfg.archive_ttl.get("state", 7.0)
+        )
+
         with transaction(conn):
             cur = conn.execute(
                 "INSERT INTO knowledge(id, kind, content, tags, importance, scope,"
-                " source, created_at, updated_at, valid_at, verified_at, embedded, meta)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " source, created_at, updated_at, valid_at, verified_at,"
+                " state_interval_days, embedded, meta)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     item_id,
                     k,
@@ -443,6 +467,7 @@ class MemoryStore:
                     now,
                     valid_at if valid_at is not None else now,
                     verified_at,
+                    float(state_interval),
                     1 if vec else 0,
                     json.dumps(meta or {}, ensure_ascii=False),
                 ),
@@ -539,27 +564,163 @@ class MemoryStore:
             return self.get_episode(memory_id)
         return self.get_knowledge(memory_id)
 
-    def verify_state(self, item_id: str) -> Knowledge:
-        """确认一条现状「仍然成立」并续命。
+    def review_state(self, item_id: str, *, matched: bool) -> dict[str, Any]:
+        """复核一条现状：这是 state 唯一的生命周期入口。
 
-        这是 state 唯一的续命方式：被检索到不算，必须有人明确说"我看过了"。
+        matched=True  → 描述仍然成立：续命，周期升一档（1→3→5→7），到顶就留在 7 天。
+        matched=False → 描述已经不成立：**直接物理删除**，不留历史、不建失效链。
+
+        为什么删除而不是归档：现状的价值只在「它现在是真的」。一条已经假了的现状，
+        留着只会污染检索 —— 它长得和真话一模一样，读的人没法从正文看出它过期了。
+        knowledge 可以归档是因为它有过时的余地，state 没有。
+        """
+        item = self.get_knowledge(item_id)
+        if not item.is_state:
+            raise ValueError(f"{item_id} 不是 state，不需要复核（知识不会过期）")
+        if item.archived:
+            raise ValueError(f"{item_id} 已归档，请先 memory_unarchive 再复核")
+
+        if matched:
+            updated = self.verify_state(item_id)
+            due, expire = state_deadlines(
+                updated.created_at,
+                updated.verified_at,
+                updated.state_interval_days,
+                self.cfg.state_grace_cap_days,
+            )
+            return {
+                "id": item_id,
+                "matched": True,
+                "action": "renewed",
+                "interval_days": round(updated.state_interval_days, 1),
+                "verified_at": updated.verified_at,
+                "verified_iso": iso(updated.verified_at),
+                "next_review_iso": iso(due),
+                "expire_iso": iso(expire),
+            }
+
+        _db_name, conn = self._conn_for(item.db)
+        with transaction(conn):
+            conn.execute(f"DELETE FROM {KNOWLEDGE.vec} WHERE rowid = ?", (item.rowid,))
+            conn.execute("DELETE FROM knowledge WHERE id = ?", (item_id,))
+        return {
+            "id": item_id,
+            "matched": False,
+            "action": "purged",
+            "content": item.content,
+            "scope": item.scope,
+            "note": "现状与实际不符，已物理删除（全文索引由触发器清理）。"
+            "需要记录新的现状，请另写一条，不要试图覆盖。",
+        }
+
+    def verify_state(self, item_id: str) -> Knowledge:
+        """确认一条现状「仍然成立」并续命，同时把复核周期升一档。
+
+        这是 state 唯一的续命方式：被检索到不算，必须有明确的「我看过了」。
         """
         item = self.get_knowledge(item_id)
         if not item.is_state:
             raise ValueError(f"{item_id} 不是 state，不需要确认（知识不会过期）")
         _, conn = self._conn_for(item.db)
         now = now_ms()
+        # 升档只升不降：连续确认没变，才配得上更长的复核间隔
+        upgraded = next_interval(item.state_interval_days, self.cfg.state_ladder)
         with transaction(conn):
             conn.execute(
                 "UPDATE knowledge SET verified_at = ?, updated_at = ?,"
-                " last_accessed_at = ?, access_count = access_count + 1"
-                " WHERE id = ?",
-                (now, now, now, item_id),
+                " last_accessed_at = ?, access_count = access_count + 1,"
+                " state_interval_days = ? WHERE id = ?",
+                (now, now, now, upgraded, item_id),
             )
         return self.get_knowledge(item_id)
 
-    def invalidate(self, item_id: str, *, invalidated_by: str | None = None) -> Knowledge:
+    def _review_state_rows(self, conn: Any, now: int) -> Iterator[tuple[Any, str, str, float, int, int]]:
+        """遍历一个库里所有在册的现状，产出 (row, 状态, 说明, 周期, 到期时刻, 失效时刻)。"""
+        default_ttl = self.cfg.archive_ttl.get("state", 7.0)
+        rows = conn.execute(
+            "SELECT rowid, id, content, kind, created_at, verified_at,"
+            " state_interval_days, source, scope, archived_at, invalid_at"
+            " FROM knowledge"
+            " WHERE kind = 'state' AND invalid_at IS NULL AND archived_at IS NULL"
+        ).fetchall()
+        for row in rows:
+            interval = float(row["state_interval_days"] or default_ttl)
+            status, reason = state_review_status(
+                int(row["created_at"]),
+                row["verified_at"],
+                interval,
+                now,
+                self.cfg.state_grace_cap_days,
+            )
+            due, expire = state_deadlines(
+                int(row["created_at"]),
+                row["verified_at"],
+                interval,
+                self.cfg.state_grace_cap_days,
+            )
+            yield row, status, reason, interval, due, expire
+
+    def state_due(self) -> dict[str, Any]:
+        """列出该复核的现状：已到期（due）与宽限已过（overdue）。
+
+        周期再短，没人来看也只是个数字 —— 这个清单就是让「到期」这件事发声的地方。
+        日常开会话、复盘前都该扫一眼，别等归档扫描把东西收走。
+        """
+        now = now_ms()
+        items: list[dict[str, Any]] = []
+        counts = {REVIEW_DUE: 0, REVIEW_OVERDUE: 0}
+        for db_name, conn in self._all_dbs("all"):
+            for row, status, reason, interval, due, expire in self._review_state_rows(conn, now):
+                if status == REVIEW_OK:
+                    continue
+                counts[status] = counts.get(status, 0) + 1
+                items.append(
+                    {
+                        "id": row["id"],
+                        "db": db_name,
+                        "scope": row["scope"],
+                        "status": status,
+                        "interval_days": round(interval, 1),
+                        "content": str(row["content"]),
+                        "source": row["source"],
+                        "due_iso": iso(due),
+                        "expire_iso": iso(expire),
+                        "reason": reason,
+                    }
+                )
+        # overdue 排前面：它们马上就要被归档扫描收走了
+        items.sort(key=lambda x: (x["status"] != REVIEW_OVERDUE, x["expire_iso"] or ""))
+        return {
+            "count": len(items),
+            "due": counts.get(REVIEW_DUE, 0),
+            "overdue": counts.get(REVIEW_OVERDUE, 0),
+            "items": items,
+            "rule": {
+                "ladder_days": list(self.cfg.state_ladder),
+                "grace_cap_days": self.cfg.state_grace_cap_days,
+            },
+            "howto": "仍成立 → memory_review(id, matched=true) 续命并升档；"
+            "已经不符 → memory_review(id, matched=false) 直接删除，再独立写新的。",
+        }
+
+    def invalidate(
+        self,
+        item_id: str,
+        *,
+        invalidated_by: str | None = None,
+        force: bool = False,
+    ) -> Knowledge:
+        """让一条条目失效（保留历史）。**现状不接受这条路**，除非内部强制。
+
+        state 的语义是「要么真、要么删」，中间态只会变成噪音，所以对外一律拒绝，
+        只留 promote 这类内部整体搬迁时用 force 通过。
+        """
         item = self.get_knowledge(item_id)
+        if item.is_state and not force:
+            raise ValueError(
+                f"{item_id} 是 state：现状不做「标记失效」，请用 memory_review(matched=false) "
+                "直接废弃并删除，或 memory_review(matched=true) 续命。"
+            )
         if not item.live:
             return item
         _, conn = self._conn_for(item.db)
@@ -586,7 +747,8 @@ class MemoryStore:
             source=f"promoted:{source.id}",
             verified_at=source.verified_at,
         )
-        self.invalidate(source.id, invalidated_by=promoted.id)
+        # 提升是「整体搬迁」，旧条目在这里走失效是内部行为，不受 state 的对外限制
+        self.invalidate(source.id, invalidated_by=promoted.id, force=True)
         return source, promoted
 
     def list_knowledge(
@@ -1384,49 +1546,68 @@ class MemoryStore:
     # 真正的物理删除必须由调用方显式指定 id 才会发生。
 
     def archive_pass(self, *, dry_run: bool = False) -> dict[str, Any]:
-        """把「很久没被碰过、且访问次数很少」的陈述与经历转为归档。
+        """把「该退场」的陈述与经历转为归档。
 
         归档 = 置 archived_at，正文一个字不动。默认检索不到，
         `include_archived=True` 仍可查回。信条不在此列（它根本不在库里）。
 
         TTL 按**行级 kind** 取，不是按表：
-          knowledge 3 年、state 30 天、case / narrative 1 年。
-        state 还有一条额外规则：被检索到不算续命，只有 verified_at 才算 ——
-        「反复被查」往往是它已经不准的信号，不能拿它当续命理由。
+          knowledge 3 年、case / narrative 1 年 —— 走「久未触碰 + 访问少」判据。
+          **state 不走这套**：它按复核梯子（1→3→5→7 天）+ 宽限判定，
+          只有宽限都过了（overdue）才归档。被检索到不算续命，只有 verified_at 算。
         """
         now = now_ms()
         shelved: list[dict[str, Any]] = []
         kept = 0
         actions: list[tuple[Any, TableSpec, int]] = []
 
-        for _db_name, conn in self._all_dbs("workspace"):
+        for _db_name, conn in self._all_dbs("all"):
             for spec in (KNOWLEDGE, EPISODE):
-                # verified_at 只有陈述层有；经历层补 NULL 占位，省一个分支
-                verified_col = "verified_at" if spec is KNOWLEDGE else "NULL AS verified_at"
+                # verified_at / state_interval_days 只有陈述层有；经历层补 NULL 占位
+                extra = (
+                    "verified_at, state_interval_days"
+                    if spec is KNOWLEDGE
+                    else "NULL AS verified_at, NULL AS state_interval_days"
+                )
                 rows = conn.execute(
                     f"SELECT rowid, id, kind, content, created_at, last_accessed_at,"
-                    f" access_count, {verified_col} FROM {spec.table}"
+                    f" access_count, {extra} FROM {spec.table}"
                     f" WHERE archived_at IS NULL"
                 ).fetchall()
                 for row in rows:
                     item_kind = str(row["kind"] or spec.kind)
-                    ttl = self.cfg.archive_ttl.get(item_kind)
-                    if ttl is None:
-                        continue
-                    is_state = item_kind == "state"
-                    should, reason = archive_decision(
-                        int(row["created_at"]),
-                        row["last_accessed_at"],
-                        int(row["access_count"]),
-                        now,
-                        ttl,
-                        self.cfg.archive_max_access,
-                        verified_ms=row["verified_at"] if is_state else None,
-                        access_extends=not is_state,
-                    )
-                    if not should:
-                        kept += 1
-                        continue
+
+                    if item_kind == "state":
+                        interval = float(
+                            row["state_interval_days"]
+                            or self.cfg.archive_ttl.get("state", 7.0)
+                        )
+                        status, reason = state_review_status(
+                            int(row["created_at"]),
+                            row["verified_at"],
+                            interval,
+                            now,
+                            self.cfg.state_grace_cap_days,
+                        )
+                        if status != REVIEW_OVERDUE:
+                            kept += 1
+                            continue
+                    else:
+                        ttl = self.cfg.archive_ttl.get(item_kind)
+                        if ttl is None:
+                            continue
+                        should, reason = archive_decision(
+                            int(row["created_at"]),
+                            row["last_accessed_at"],
+                            int(row["access_count"]),
+                            now,
+                            ttl,
+                            self.cfg.archive_max_access,
+                        )
+                        if not should:
+                            kept += 1
+                            continue
+
                     shelved.append(
                         {
                             "type": item_kind,
@@ -1441,7 +1622,7 @@ class MemoryStore:
             by_conn: dict[int, list[tuple[TableSpec, int]]] = {}
             for conn, spec, rowid in actions:
                 by_conn.setdefault(id(conn), []).append((spec, rowid))
-            for _db_name, conn in self._all_dbs("workspace"):
+            for _db_name, conn in self._all_dbs("all"):
                 group = by_conn.get(id(conn))
                 if not group:
                     continue
@@ -1465,6 +1646,11 @@ class MemoryStore:
             "rule": {
                 "ttl_days": self.cfg.archive_ttl,
                 "max_access": self.cfg.archive_max_access,
+                "state_review": {
+                    "ladder_days": list(self.cfg.state_ladder),
+                    "grace_cap_days": self.cfg.state_grace_cap_days,
+                    "note": "state 只按复核梯子 + 宽限归档；到期未复核不会立刻消失",
+                },
             },
             "note": "归档可逆：include_archived=True 仍能查回，正文未改动",
         }
@@ -1655,6 +1841,19 @@ class MemoryStore:
             info["knowledge_only"] = int(row["kn"] or 0)
             info["state"] = int(row["st"] or 0)
 
+            # 该复核的现状：让「到期」在每次看统计时都被看见，而不是等人想起来
+            review_now = now_ms()
+            due_n = overdue_n = 0
+            for _srow, status, _reason, _iv, _due, _exp in self._review_state_rows(
+                conn, review_now
+            ):
+                if status == REVIEW_DUE:
+                    due_n += 1
+                elif status == REVIEW_OVERDUE:
+                    overdue_n += 1
+            info["state_due"] = due_n
+            info["state_overdue"] = overdue_n
+
             if db_name == "workspace":
                 ep_row = conn.execute(
                     "SELECT COUNT(*) AS n,"
@@ -1697,6 +1896,26 @@ class MemoryStore:
                 "跨项目内容本该很少：规则类应写进 CORE_RULES.md，"
                 "项目细节应留在各自的 workspace 库。"
             )
+
+        due_all = sum(int(d.get("state_due", 0)) for d in result["dbs"].values())
+        overdue_all = sum(int(d.get("state_overdue", 0)) for d in result["dbs"].values())
+        result["state_review"] = {
+            "due": due_all,
+            "overdue": overdue_all,
+            "ladder_days": list(self.cfg.state_ladder),
+        }
+        if overdue_all:
+            extra = (
+                f"有 {overdue_all} 条现状已过宽限期，下次归档扫描会被收走。"
+                "先用 memory_review_list 看一眼：仍成立就 memory_review(matched=true) 续命。"
+            )
+            result["hint"] = (result.get("hint", "") + " " + extra).strip()
+        elif due_all:
+            extra = (
+                f"有 {due_all} 条现状到了复核时间（宽限期内，暂不归档）。"
+                "用 memory_review_list 处理。"
+            )
+            result["hint"] = (result.get("hint", "") + " " + extra).strip()
         return result
 
     def backfill_embeddings(self, *, limit: int = 500) -> dict[str, Any]:
@@ -1707,8 +1926,10 @@ class MemoryStore:
             for spec in ALL_SPECS:
                 if db_name == "global" and spec is not KNOWLEDGE:
                     continue
+                # 归档行也留着 embedded=0，但它们已经不参与检索，补向量纯属浪费
+                where = "embedded = 0" if spec is LOG else "embedded = 0 AND archived_at IS NULL"
                 rows = conn.execute(
-                    f"SELECT rowid, content FROM {spec.table} WHERE embedded = 0 LIMIT ?",
+                    f"SELECT rowid, content FROM {spec.table} WHERE {where} LIMIT ?",
                     (limit,),
                 ).fetchall()
                 if not rows:

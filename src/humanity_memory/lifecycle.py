@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import math
+from typing import Sequence
 
 DAY_MS = 86_400_000.0
 
@@ -105,16 +106,14 @@ def archive_decision(
     verified_ms: int | None = None,
     access_extends: bool = True,
 ) -> tuple[bool, str]:
-    """判断一条记忆该不该归档。
+    """判断一条记忆该不该归档（**现状已不走这里，见 state_review_status**）。
 
     为什么不用 strength 阈值：`usage_factor` 有 0.5 底分（新内容不该被惩罚），
     导致再冷的条目强度也跌不到 0，拿绝对阈值归档会永远不触发。
     改用两个显性条件 —— 「多久没被碰过」+「被访问过几次」，更好解释也好调。
 
-    `access_extends=False` 用于 state：被检索到**不算续命**，必须有人显式确认
-    「我看过了，它还是这样」才刷新 verified_at。否则一条早就过时的
-    「Unity 2022.3」会因为反复被查而永远赖在库里 —— 而反复被查，
-    恰恰可能是它写得太模糊、或者已经不准的信号。
+    `access_extends=False` 是 state 从前的用法（被检索到不算续命）。现状改用
+    复核梯子与宽限期后由 `state_review_status` 独立判定，这里的开关只为兼容保留。
 
     归档是**可逆的**：只置 archived_at，默认检索不到，内容一行不动。
     """
@@ -131,6 +130,71 @@ def archive_decision(
     if not access_extends:
         return True, f"{age_days:.0f} 天未被确认，现状可能已过时"
     return True, f"{age_days:.0f} 天未用且仅访问 {access_count} 次"
+
+
+# ---------------------------------------------------------------- 现状的复核
+# 现状不该靠「被读到」续命，也不该靠「访问次数」留人 —— 它只有一条命：
+# 到点了有人来看一眼。看一眼还在，续一段；发现不对，当场删掉。
+#
+# 周期不是固定的：刚写下的现状最容易错（写的时候就过时了），所以 1 天就验一次；
+# 连续验过几次都没变，才逐步放宽到 7 天。这就是「渐进式周期」。
+
+REVIEW_OK = "ok"
+REVIEW_DUE = "due"
+REVIEW_OVERDUE = "overdue"
+
+
+def next_interval(current_days: float, ladder: Sequence[float]) -> float:
+    """复核确认「没变」之后升一档；已在顶端就留在顶端。"""
+    steps = sorted(float(x) for x in ladder if x > 0) or [max(float(current_days), 1.0)]
+    for step in steps:
+        if step > current_days:
+            return step
+    return steps[-1]
+
+
+def state_grace_days(interval_days: float, cap_days: float) -> float:
+    """宽限期 = 一个当前周期，但不超过 cap。单次到期只宽限一次。"""
+    return min(max(float(interval_days), 0.0), max(float(cap_days), 0.0))
+
+
+def state_deadlines(
+    created_ms: int,
+    verified_ms: int | None,
+    interval_days: float,
+    grace_cap_days: float,
+) -> tuple[int, int]:
+    """返回 (该复核的时刻, 宽限结束的时刻)，单位毫秒。
+
+    起点取「创建」与「上次确认」中较晚者 —— 未确认过就从创建时刻起算。
+    """
+    base = max(int(created_ms), int(verified_ms or 0))
+    interval = max(float(interval_days), 0.0)
+    due = base + int(interval * DAY_MS)
+    expire = due + int(state_grace_days(interval, grace_cap_days) * DAY_MS)
+    return due, expire
+
+
+def state_review_status(
+    created_ms: int,
+    verified_ms: int | None,
+    interval_days: float,
+    now_ms: int,
+    grace_cap_days: float,
+) -> tuple[str, str]:
+    """现状的复核状态：ok / due（该复核了）/ overdue（宽限也过了）。
+
+    overdue 的条目在归档扫描时会被归档；due 的只进待复核清单，等有人来看。
+    """
+    due, expire = state_deadlines(created_ms, verified_ms, interval_days, grace_cap_days)
+    if now_ms < due:
+        left = (due - now_ms) / DAY_MS
+        return REVIEW_OK, f"还有 {left:.1f} 天到期"
+    if now_ms < expire:
+        left = (expire - now_ms) / DAY_MS
+        return REVIEW_DUE, f"已到期，宽限剩 {left:.1f} 天"
+    late = (now_ms - expire) / DAY_MS
+    return REVIEW_OVERDUE, f"宽限已过 {late:.1f} 天，应归档"
 
 
 # ---------------------------------------------------------------- 初始粒度

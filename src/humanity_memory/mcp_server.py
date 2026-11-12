@@ -33,13 +33,16 @@ INSTRUCTIONS_TAIL = """\
 记忆使用纪律：
 存放纪律（先想 kind，再落笔）：
 - knowledge 知识：换个单号/任务 ID 仍然成立的机制与约定，能指出代码落点。
-- state 现状：当前为真但会变的东西（版本、依赖、路径、资源配置），200 字内，
-  给 source；换代时用 invalidates 顶掉旧的，别让旧现状烂在库里。
+- state 现状：当前为真但会变的东西（版本、依赖、路径、资源配置），200 字内，给 source。
+  写进来只是「登记」，之后靠复核续命：用 memory_review 看一眼，仍成立就 matched=true
+  升档续命，不成立就 matched=false 当场删掉。**不要用 invalidates 换代**。
 - case 案例：一次具体事件的「现象 → 根因 → 落点」，≤300 字，一个问题一条。
   带单号的排查结论放这里 —— 它换个单号就不成立，不是知识。
 - narrative 叙述：当天过程、试错与判断转折。
 - 日志（log）是当天的原始记录，只追加、不改写。白天先写日志，复盘时再压缩。
-- state 不会因为被检索到就续命：必须 memory_write(kind="state", verifies=<id>) 才算确认。
+- state 不会因为被检索到就续命：复核周期是 1→3→5→7 天渐进，到期后再给一个
+  不超过 5 天的宽限，宽限过了归档扫描才把它收走。memory_stats 里的 state_review
+  就是「有几条欠复核」，一直涨说明该用 memory_review_list 处理了。
 - 复盘时先用 consolidate_preview 取素材，总结后用 consolidate_apply 提交。
 - 一个 server 可以服务多个项目：如果在某个具体项目里工作，而 memory_stats 显示的工作区
   不是你预期的那个，先调用 memory_use_workspace 传入项目根目录再继续。
@@ -180,7 +183,8 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
                 knowledge — 知识。**换个单号/任务 ID/资源名仍然成立**，能指出代码落点。
                     机制、约定、坑。上限 500 字。
                 state — 现状。当前为真但会随版本变化（版本号、依赖、路径、资源配置）。
-                    上限 200 字，必须给 source。会变的东西别写成 knowledge。
+                    上限 200 字，给 source。写进来只是「登记」，之后靠 memory_review
+                    定期复核：仍成立就续命，不成立就当场删掉。**不要用 invalidates 换代**。
                 case — 案例。一次具体事件压成「现象 → 根因 → 落点」，上限 300 字，
                     一个问题一条。带单号的排查结论放这里，不要放 knowledge。
                 narrative — 叙述。当天过程、试错、判断转折，可长。
@@ -188,9 +192,10 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
             tags: 标签，用于过滤。
             importance: 0~1。默认 knowledge 0.8 / state 0.85 / case 0.75 / narrative 0.4。
             scope: workspace（项目）| global（跨项目，仅陈述类支持且数量要很少）。
-            invalidates: 被这条取代的旧条目 id。state 换代必须用它，别让旧现状烂在库里。
-            verifies: 确认某条 state 仍然成立并续命（不写新内容时用它）。
-            source: 来源标识；写 state 时建议写清「凭什么认为它是这样」。
+            invalidates: 被这条取代的旧条目 id，**仅 knowledge 可用**。
+                state 不接受它 —— 现状更替一律走 memory_review(matched=false) 删旧再另写。
+            verifies: 确认某条 state 仍然成立并续命（等同 memory_review(matched=true)）。
+            source: 来源标识；写 state 时写清「凭什么认为它是这样」。
             day: 仅 case / narrative 用，默认今天。
         """
         try:
@@ -212,13 +217,56 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         return _ok(item=item.to_dict(), kind=item.kind, embedded=item.embedded)
 
     @app.tool(
+        name="memory_review",
+        description="复核一条现状：仍成立就续命并升档，已经不成立就当场物理删除。",
+    )
+    def memory_review(item_id: str, matched: bool = True) -> dict[str, Any]:
+        """现状（state）唯一的生命周期入口 —— 它取代了「写新条目覆盖旧条目」。
+
+        现状不是靠被读到续命的，也不该靠访问次数留人：它只有一条命，到点了有人来看一眼。
+        看一眼还在，续一段；发现不对，当场删掉。
+
+        Args:
+            item_id: 要复核的现状 id（s_ 开头）。
+            matched:
+                true  — 描述仍然成立：刷新确认时间，复核周期升一档（1→3→5→7 天）。
+                false — 描述已经不成立：**直接物理删除**，不留历史、不留失效链。
+                        要记录新的现状，请另写一条，不要试图覆盖。
+
+        不确定时，先把条目正文和实际现状（版本文件、依赖清单、配置）比对一遍再决定。
+        """
+        try:
+            with state_lock:
+                return _ok(result=_st().review_state(item_id, matched=matched))
+        except (NotFound, ValueError, ScopeError) as exc:
+            return _err(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"复核失败：{type(exc).__name__}: {exc}")
+
+    @app.tool(
+        name="memory_review_list",
+        description="列出到了复核时间的现状：due 还在宽限期内，overdue 即将被归档扫描收走。",
+    )
+    def memory_review_list() -> dict[str, Any]:
+        """到期清单 —— 让「7 天」从一个数字变成真的会发生的事。
+
+        返回按 overdue 优先排序。每条给出 id、正文、当前周期、到期与失效时刻、来源，
+        照着逐条 memory_review 即可。开会话时、复盘前都值得扫一眼。
+        """
+        try:
+            return _ok(report=_st().state_due())
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"查询失败：{type(exc).__name__}: {exc}")
+
+    @app.tool(
         name="memory_invalidate",
-        description="让一条条目失效（不删除，保留历史）。现状过时但暂无替代时用它。",
+        description="让一条 knowledge 失效（不删除，保留历史）。现状不接受这个操作。",
     )
     def memory_invalidate(item_id: str, invalidated_by: str | None = None) -> dict[str, Any]:
+        """知识过时但暂无替代时用它。**state 会被拒绝** —— 现状要么真、要么删。"""
         try:
             item = _st().invalidate(item_id, invalidated_by=invalidated_by)
-        except NotFound as exc:
+        except (NotFound, ValueError) as exc:
             return _err(str(exc))
         return _ok(item=item.to_dict())
 
@@ -533,9 +581,10 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
     def memory_archive(dry_run: bool = True) -> dict[str, Any]:
         """
         归档 = 默认检索不到，但内容一字未改，`include_archived=true` 仍能查回。
-        信条不参与；陈述与经历按**行级 kind** 各自 TTL 判定：
-          knowledge 3 年 / state 30 天 / case 1 年 / narrative 1 年。
-        state 的续命不看访问次数，只认 verified_at —— 反复被查往往说明它已经不准了。
+        信条不参与；陈述与经历按**行级 kind** 各自判据：
+          knowledge 3 年 / case 1 年 / narrative 1 年 —— 「久未触碰 + 访问少」。
+          state 则走复核梯子：1→3→5→7 天，到期后再宽限 min(周期, 5) 天，
+          宽限都过了才归档。被检索到不算续命，只有 verified_at 算。
 
         Args:
             dry_run: true（默认）只列候选不动数据；false 才真正归档。

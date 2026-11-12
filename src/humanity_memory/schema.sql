@@ -32,8 +32,12 @@ CREATE TABLE IF NOT EXISTS meta (
 -- ------------------------------------------------------------
 -- 陈述层：一句话陈述。
 --   kind='knowledge' 知识：可迁移的机制/约定，遗忘极慢，不参与失效
---   kind='state'     现状：版本、依赖、路径、资源配置，30 天不确认即归档
+--   kind='state'     现状：版本、依赖、路径、资源配置。
+--                    走复核梯子（1→3→5→7 天），到期未复核即归档，
+--                    复核发现不符则直接物理删除（不留历史、不建失效链）。
 -- 失效采用「追加式」：置 invalid_at，不删除、不改正文。
+--   **state 不使用 invalid_at** —— 它的更替语义是「删掉旧的、独立写新的」，
+--   invalidates 链只会攒出一堆没人看的中间态。
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS knowledge (
     rowid            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,6 +57,7 @@ CREATE TABLE IF NOT EXISTS knowledge (
     invalid_at       INTEGER,
     invalidated_by   TEXT,
     verified_at      INTEGER,
+    state_interval_days REAL NOT NULL DEFAULT 7.0,
     archived_at      INTEGER,
     embedded         INTEGER NOT NULL DEFAULT 0,
     meta             TEXT    NOT NULL DEFAULT '{}'

@@ -13,7 +13,7 @@
                             ▼
 ┌──────────────────────────────────────────────────────────────┐
 │  陈述层  knowledge   kind=knowledge 知识 · 遗忘极慢 · 不失效    │
-│                      kind=state     现状 · 30 天不确认即归档   │
+│                      kind=state     现状 · 1→3→5→7 天复核      │
 │  经历层  episodes    kind=case      案例 · 三句话定论 · 高权重 │
 │                      kind=narrative 叙述 · 保留过程 · 可压缩   │
 │  日志层  logs        当天原始记录 · append-only · 复盘后清空    │
@@ -296,7 +296,9 @@ skills/humanity-memory/
 | --- | --- |
 | `rules_get` / `rules_append` | 读/追加信条（只追加，不改既有内容） |
 | `memory_write` | **唯一写入口**，`kind` = knowledge / state / case / narrative |
-| `memory_invalidate` | 让条目失效（不删除） |
+| `memory_review` | 复核现状：`matched=true` 续命升档，`matched=false` 当场物理删除 |
+| `memory_review_list` | 列到了复核时间的现状（due / overdue） |
+| `memory_invalidate` | 让 **knowledge** 失效（不删除）；对 state 会拒绝 |
 | `memory_promote` | 项目条目 → 全局条目 |
 | `memory_list` | 列条目，`kinds` 支持 `all` |
 | `log_append` | 追加日志（唯一允许的日志写操作） |
@@ -321,7 +323,8 @@ consolidate_apply(knowledge=[...], episodes=[...], purge=true)
 复盘产出三块，**先想 kind 再落笔**：
 
 - `knowledge` — 换掉单号、任务 ID 仍然成立的机制与约定
-- `state` — 当前为真但会变的（版本、依赖、路径），必须带 `source`
+- `state` — 当前为真但会变的（版本、依赖、路径），带 `source`。写进来只是登记，
+  之后靠 `memory_review` 复核：仍成立就续命升档，不符就当场删掉，**不用 `invalidates`**
 - `episodes` — `case`（现象→根因→落点，≤300 字，一单一条）与 `narrative`（当天过程）
 
 配成定时任务时，**每个工作区各建一个**（只复盘自己那个库，不要跨项目扫），
@@ -345,20 +348,28 @@ rowid 与主表对齐。全文：三张 `_fts` 表，trigram 分词，触发器�
 
 ### 记忆的生命周期
 
-三层都有淘汰机制，但**只归档、不自动删**：
+三层都有淘汰机制，**常规路径只归档、不自动删**。唯一的例外是现状复核发现不符：
+那会直接物理删除（`memory_review(matched=false)`），因为它继续留着只会冒充真话。
 
 | kind | 归档条件 | 压缩 |
 | --- | --- | --- |
 | 信条 | 不参与（它不在库里） | 不参与 |
 | `knowledge` | 3 年未触碰且访问 ≤1 次 | 不压缩 |
-| `state` | **30 天未确认**（被检索不算续命） | 不压缩 |
+| `state` | **复核梯子到期 + 宽限已过**（1→3→5→7 天，宽限 ≤5 天；被检索不算续命） | 不压缩 |
 | `case` | 1 年未触碰且访问 ≤1 次 | 不压缩（已是最简形态） |
 | `narrative` | 1 年未触碰且访问 ≤1 次 | ✅ 可合并 |
 
 归档 = 置 `archived_at`，正文不动，默认检索不到，`include_archived=true` 可查回。
-物理删除必须 `memory_purge(ids, confirm=true)`，且**只能删已归档的**。
+通用删除入口 `memory_purge(ids, confirm=true)` **只能删已归档的**；唯一例外是
+`memory_review(matched=false)` —— 它只处理 state，语义明确（「这条现状是假的」），删完不留痕。
 
 用 CLI 操作：
+
+```bash
+humanity-memory memory review                      # 列该复核的现状
+humanity-memory memory review --id s_xxx           # 仍成立 → 续命并升档
+humanity-memory memory review --id s_xxx --stale   # 已不符 → 直接删除
+```
 
 ```bash
 humanity-memory lifecycle archive --dry-run   # 预览会归档哪些

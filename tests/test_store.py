@@ -1062,7 +1062,7 @@ def test_state_archive_requires_verify(env) -> None:
 
     report = store.archive_pass(dry_run=True)
     assert [x["id"] for x in report["archived"]] == [item.id]
-    assert "确认" in report["archived"][0]["reason"]
+    assert "宽限" in report["archived"][0]["reason"]
 
     # 显式确认之后重新计时，不再进候选
     store.verify_state(item.id)
@@ -1094,16 +1094,14 @@ def test_case_outranks_narrative(env) -> None:
     assert CASE_WEIGHT > 0.96 * EPISODE_LEVEL_WEIGHT[0]
 
 
-def test_state_supersede_with_invalidates(env) -> None:
+def test_state_write_rejects_invalidates(env) -> None:
+    """现状不许用 invalidates 换代：那会攒出越拉越长的失效链。"""
     _, _, store = env
     old = store.write_memory("项目是 Unity 2021.3", kind="state")
-    new = store.write_memory(
-        "项目已升级到 Unity 2022.3", kind="state", invalidates=old.id
-    )
-    assert store.get_knowledge(old.id).invalidated_by == new.id
-    assert not store.get_knowledge(old.id).live
-    live = store.list_knowledge(kinds=["state"])
-    assert [x.id for x in live] == [new.id]
+    with pytest.raises(ValueError):
+        store.write_memory("项目已升级到 Unity 2022.3", kind="state", invalidates=old.id)
+    # 旧条目没有被偷偷顶掉，仍然在册
+    assert store.get_knowledge(old.id).live
 
 
 def test_write_rejects_verifies_for_knowledge(env) -> None:
@@ -1179,7 +1177,7 @@ def test_state_archive_requires_verify(env) -> None:
 
     report = store.archive_pass(dry_run=True)
     assert [x["id"] for x in report["archived"]] == [item.id]
-    assert "确认" in report["archived"][0]["reason"]
+    assert "宽限" in report["archived"][0]["reason"]
 
     # 显式确认之后重新计时，不再进候选
     store.verify_state(item.id)
@@ -1211,16 +1209,14 @@ def test_case_outranks_narrative(env) -> None:
     assert CASE_WEIGHT > 0.96 * EPISODE_LEVEL_WEIGHT[0]
 
 
-def test_state_supersede_with_invalidates(env) -> None:
+def test_state_write_rejects_invalidates(env) -> None:
+    """现状不许用 invalidates 换代：那会攒出越拉越长的失效链。"""
     _, _, store = env
     old = store.write_memory("项目是 Unity 2021.3", kind="state")
-    new = store.write_memory(
-        "项目已升级到 Unity 2022.3", kind="state", invalidates=old.id
-    )
-    assert store.get_knowledge(old.id).invalidated_by == new.id
-    assert not store.get_knowledge(old.id).live
-    live = store.list_knowledge(kinds=["state"])
-    assert [x.id for x in live] == [new.id]
+    with pytest.raises(ValueError):
+        store.write_memory("项目已升级到 Unity 2022.3", kind="state", invalidates=old.id)
+    # 旧条目没有被偷偷顶掉，仍然在册
+    assert store.get_knowledge(old.id).live
 
 
 def test_write_rejects_verifies_for_knowledge(env) -> None:
@@ -1240,3 +1236,133 @@ def test_legacy_kind_aliases(env) -> None:
     _, _, store = env
     assert store.write_memory("旧词映射", kind="fact").kind == "knowledge"
     assert store.write_memory("旧词映射叙述", kind="episode").kind == "narrative"
+
+def test_state_new_item_starts_at_one_day(env) -> None:
+    """新写下的现状从梯子最低档起算：当天就该复核一次。"""
+    _, _, store = env
+    item = store.write_memory("热更改走 HybridCLR", kind="state")
+    assert item.state_interval_days == 1.0
+
+
+def test_state_ladder_escalates_on_review(env) -> None:
+    """连续复核确认「没变」→ 周期 1→3→5→7，到顶封顶。"""
+    _, _, store = env
+    item = store.write_memory("项目是 Unity 2022.3.62f1", kind="state")
+    steps = []
+    for _ in range(5):
+        store.review_state(item.id, matched=True)
+        steps.append(store.get_knowledge(item.id).state_interval_days)
+    assert steps == [3.0, 5.0, 7.0, 7.0, 7.0]
+
+
+def test_state_grace_period_lists_but_keeps(env) -> None:
+    """到期但还在宽限期内：进待复核清单，但不会被归档。"""
+    from humanity_memory.models import now_ms
+
+    _, _, store = env
+    day = 86_400_000
+    item = store.write_memory("项目是 Unity 2022.3", kind="state")
+    store.workspace_conn.execute(
+        "UPDATE knowledge SET created_at = ? WHERE id = ?",
+        (now_ms() - int(1.5 * day), item.id),
+    )
+
+    report = store.archive_pass(dry_run=True)
+    assert item.id not in {x["id"] for x in report["archived"]}
+
+    due = store.state_due()
+    assert due["due"] >= 1
+    assert item.id in {x["id"] for x in due["items"]}
+    assert due["items"][0]["status"] == "due"
+
+
+def test_state_overdue_is_archived(env) -> None:
+    """宽限也过了 → 归档；正文一个字不动，仍能查回。"""
+    from humanity_memory.models import now_ms
+
+    _, _, store = env
+    day = 86_400_000
+    item = store.write_memory("项目是 Unity 2022.3", kind="state")
+    store.workspace_conn.execute(
+        "UPDATE knowledge SET created_at = ? WHERE id = ?", (now_ms() - 3 * day, item.id)
+    )
+    report = store.archive_pass(dry_run=False)
+    assert item.id in {x["id"] for x in report["archived"]}
+    kept = store.get_knowledge(item.id)
+    assert kept.archived
+    assert kept.content == "项目是 Unity 2022.3"
+
+
+def test_state_review_renews_and_resets_timer(env) -> None:
+    """复核确认仍成立 → 立刻退出待复核清单。"""
+    from humanity_memory.models import now_ms
+
+    _, _, store = env
+    day = 86_400_000
+    item = store.write_memory("项目是 Unity 2022.3", kind="state")
+    store.workspace_conn.execute(
+        "UPDATE knowledge SET created_at = ? WHERE id = ?", (now_ms() - 5 * day, item.id)
+    )
+    assert item.id in {x["id"] for x in store.state_due()["items"]}
+
+    store.review_state(item.id, matched=True)
+    assert item.id not in {x["id"] for x in store.state_due()["items"]}
+
+
+def test_state_review_mismatch_purges_completely(env) -> None:
+    """复核发现不符 → 物理删除：主表、全文索引都不留，连归档历史都没有。"""
+    _, _, store = env
+    item = store.write_memory("项目是 Unity 2021.3", kind="state")
+
+    result = store.review_state(item.id, matched=False)
+    assert result["action"] == "purged"
+    assert result["content"] == "项目是 Unity 2021.3"
+
+    with pytest.raises(NotFound):
+        store.get_knowledge(item.id)
+    assert store.list_knowledge(kinds=["state"], include_archived=True) == []
+    assert store.search("Unity 2021.3", include_archived=True) == []
+
+
+def test_invalidate_rejects_state(env) -> None:
+    """现状不接受「标记失效」这条中间态。"""
+    _, _, store = env
+    item = store.write_memory("项目是 Unity 2022.3", kind="state")
+    with pytest.raises(ValueError):
+        store.invalidate(item.id)
+
+
+def test_state_due_puts_overdue_first(env) -> None:
+    from humanity_memory.models import now_ms
+
+    _, _, store = env
+    day = 86_400_000
+    in_grace = store.write_memory("还在宽限期内的现状", kind="state")
+    late = store.write_memory("宽限也过了的现状", kind="state")
+    ws = store.workspace_conn
+    ws.execute(
+        "UPDATE knowledge SET created_at = ? WHERE id = ?",
+        (now_ms() - int(1.5 * day), in_grace.id),
+    )
+    ws.execute(
+        "UPDATE knowledge SET created_at = ? WHERE id = ?", (now_ms() - 10 * day, late.id)
+    )
+
+    items = store.state_due()["items"]
+    assert [x["id"] for x in items][:2] == [late.id, in_grace.id]
+    assert items[0]["status"] == "overdue"
+
+
+def test_stats_reports_state_review_backlog(env) -> None:
+    """欠复核的现状数要出现在统计里，否则没人会想起来处理。"""
+    from humanity_memory.models import now_ms
+
+    _, _, store = env
+    day = 86_400_000
+    item = store.write_memory("项目是 Unity 2022.3", kind="state")
+    store.workspace_conn.execute(
+        "UPDATE knowledge SET created_at = ? WHERE id = ?", (now_ms() - 10 * day, item.id)
+    )
+    stats = store.stats()
+    assert stats["dbs"]["workspace"]["state_overdue"] == 1
+    assert "现状" in stats["hint"]
