@@ -27,7 +27,7 @@ from typing import Any, Iterable, Sequence
 
 from .config import Config
 from .confidence import ConfidenceCurve
-from .db import get_meta, open_db, transaction
+from .db import get_meta, open_db, set_meta, transaction
 from .embeddings import EmbeddingProvider
 from .lifecycle import (
     DAY_MS,
@@ -98,6 +98,11 @@ LOG = TableSpec("log", "logs", "logs_vec", "logs_fts", "at", 0.90, LogEntry)
 ALL_SPECS: tuple[TableSpec, ...] = (EXPERIENCE, EPISODE, LOG)
 
 SPEC_BY_KIND: dict[str, TableSpec] = {spec.kind: spec for spec in ALL_SPECS}
+
+# 上次遗忘计算的时刻（毫秒），存在 meta 表里。
+# 等级周期是「相对上次计算」的时间账，没有这条基线就判断不出「隔了多久没算」，
+# 静默冻结（max_gap_days）也就无从谈起。
+JUDGE_CLOCK_KEY = "last_judge_at"
 
 # 全局库已关闭（§8.2）。保留这句话是为了让后来的人一眼知道「这里曾有一个
 # 全局库，为什么没了」，而不是靠翻 git log 猜。
@@ -766,28 +771,42 @@ class MemoryStore:
         「维持」也要回写：不清零活跃度、不重置周期的话，这条会一直处于「已到期」，
         每跑一次都被重新扫出来，判定就变成了每轮重算同一个结论。
 
-        `scope="all"` 时两个库各跑一遍。**跨库不是同一个事务**（两个文件，SQLite 给不了），
-        但每个库内部是：先只读扫出到期清单，为空就完全不开事务 —— 空转不该拿写锁。
+        **静默冻结**：两次计算之间若隔了很久（工程停摆、几个月没开会话），
+        真实流逝的时间不按原样折算成记忆寿命 —— 只承认最近 `max_gap_days` 天，
+        超出的部分把周期起点整体往后挪（见 `_freeze_idle_gap`）。
+        否则静默 90 天回来跑一次，所有条目的倒计时都停在 90 天前，
+        一判断全是「已到期」，之后的日子就只剩集体降级。
+
+        `scope="all"` 时两个库各跑一遍。**跨库不是同一个事务**（两个文件，SQLite 给不了）。
         """
         moment = now if now is not None else now_ms()
         per_db: list[dict[str, Any]] = []
         all_items: list[dict[str, Any]] = []
         total_due = 0
         total_settled = 0
+        total_frozen = 0
 
         for db_name, conn in self._all_dbs(scope):
-            pending = self._due_candidates(conn, db_name, moment)
-            if not pending:
-                per_db.append({"db": db_name, "due": 0, "settled": 0, "items": []})
-                continue
-
+            frozen, baseline = self._freeze_idle_gap(conn, moment, dry_run=dry_run)
+            total_frozen = max(total_frozen, frozen)
+            # 实跑时冻结已经落库，判定读到的是平移后的起点；干跑只能在这里补偏移
+            pending = self._due_candidates(
+                conn,
+                db_name,
+                moment,
+                frozen_ms=frozen if dry_run else 0,
+                baseline=baseline,
+            )
             items = [entry[0] for entry in pending]
             all_items.extend(items)
             total_due += len(items)
 
             settled = 0
             if not dry_run:
+                # 这里会写一条 meta（上次计算时刻）。它是「空转不写锁」的唯一例外：
+                # 没有这条基线就无法判断「隔了多久没算」，冻结也就无从谈起。
                 with transaction(conn):
+                    set_meta(conn, JUDGE_CLOCK_KEY, str(moment))
                     for summary, decision, rowid, table in pending:
                         self._settle_period(
                             conn,
@@ -801,7 +820,13 @@ class MemoryStore:
                         settled += 1
             total_settled += settled
             per_db.append(
-                {"db": db_name, "due": len(items), "settled": settled, "items": items}
+                {
+                    "db": db_name,
+                    "due": len(items),
+                    "settled": settled,
+                    "items": items,
+                    "frozen_ms": frozen,
+                }
             )
 
         return {
@@ -813,7 +838,79 @@ class MemoryStore:
             "settled": total_settled,
             "items": all_items,
             "dbs": per_db,
+            "frozen_ms": total_frozen,
+            "frozen_days": round(total_frozen / DAY_MS, 1),
+            "max_gap_days": self.cfg.forget_max_gap_days,
         }
+
+    def _freeze_idle_gap(
+        self, conn: Any, moment: int, *, dry_run: bool
+    ) -> tuple[int, int | None]:
+        """静默冻结：把「超出间隔上限」的那段时间从记忆寿命里扣掉。
+
+        做法是**把周期起点整体往后挪** `frozen` 毫秒 —— 等价于「时钟停在
+        `上次计算 + 上限`」。比在判定里用一个虚拟 now 更稳：虚拟时钟不落库，
+        下次再算时同一段静默会被重复冻结，越滚越偏。
+
+        只平移 `period_start <= 基线` 的行。晚于基线的条目是上次计算之后
+        才重置/写入的，它们的时间账本来就是新的，不需要也不该被挪
+        （否则会把起点推到 now 之后，那条记忆就永远不到期了）。
+
+        没有基线时（首次跑、或老库还没写过这条 meta）拿**最老的周期起点**当基线：
+        等于承认「这台库一直在静默」，于是首跑也只按上限计算，不会一次全判到期。
+
+        返回 `(frozen_ms, baseline_ms)`。`dry_run` 时不写库，调用方拿返回值
+        在内存里补同样的偏移，保证预览与实际一致。
+        """
+        cap = int(self.cfg.forget_max_gap_days * DAY_MS)
+        frozen, baseline = 0, None
+
+        raw = get_meta(conn, JUDGE_CLOCK_KEY)
+        if raw:
+            try:
+                # 走 float 中转：`now - DAY_MS` 这类算式会产出 "1234.0" 这种串，
+                # 直接 int() 会抛错并被当成「没有基线」，静默一次就白冻了。
+                baseline = int(float(raw))
+            except (TypeError, ValueError):
+                baseline = None
+        if baseline is None:
+            baseline = self._earliest_period_start(conn)
+
+        if baseline is None:
+            return 0, None
+
+        gap = int(moment) - int(baseline)
+        if cap <= 0 or gap <= cap:
+            return 0, baseline
+
+        frozen = gap - cap
+        if not dry_run:
+            with transaction(conn):
+                for spec in (EXPERIENCE, EPISODE):
+                    conn.execute(
+                        f"UPDATE {spec.table} SET period_start = period_start + ?"
+                        " WHERE period_start IS NOT NULL AND period_start <= ?",
+                        (frozen, baseline),
+                    )
+                    conn.execute(
+                        f"UPDATE {spec.table} SET level0_since = level0_since + ?"
+                        " WHERE level0_since IS NOT NULL AND level0_since <= ?",
+                        (frozen, baseline),
+                    )
+        return frozen, baseline
+
+    @staticmethod
+    def _earliest_period_start(conn: Any) -> int | None:
+        """全库最早的周期起点，给「首次计算」当基线用。"""
+        stamps: list[int] = []
+        for spec in (EXPERIENCE, EPISODE):
+            row = conn.execute(
+                f"SELECT MIN(period_start) AS m FROM {spec.table}"
+                " WHERE period_start IS NOT NULL AND archived_at IS NULL"
+            ).fetchone()
+            if row is not None and row["m"] is not None:
+                stamps.append(int(row["m"]))
+        return min(stamps) if stamps else None
 
     def relevel_by_importance(
         self,
@@ -906,12 +1003,21 @@ class MemoryStore:
         }
 
     def _due_candidates(
-        self, conn: Any, db_name: str, moment: int
+        self,
+        conn: Any,
+        db_name: str,
+        moment: int,
+        *,
+        frozen_ms: int = 0,
+        baseline: int | None = None,
     ) -> list[tuple[dict[str, Any], Any, int, str]]:
         """只读地扫出「该裁定了」的条目：[(摘要, 判定, rowid, 表名)]。
 
         与落盘分开是为了「没有到期项就一个字节都不写」—— 空事务也会拿写锁，
         定时任务里每天白拿一次锁没有意义。
+
+        `frozen_ms` 只给干跑用：实跑的冻结已经写进 `period_start` 了，
+        干跑没写库，得在这里补同样的偏移，否则预览会比实际「老很多」。
         """
         table = self.level_table
         out: list[tuple[dict[str, Any], Any, int, str]] = []
@@ -928,6 +1034,9 @@ class MemoryStore:
                 if anchor is None:
                     # 老数据没写过这列：拿创建/发生时刻兜底，不因此跳过判定
                     anchor = int(row["anchor"])
+                elif frozen_ms and baseline is not None and int(anchor) <= baseline:
+                    # 干跑专用：实跑的冻结已经写进库了，这里只补预览的偏移
+                    anchor = int(anchor) + frozen_ms
                 if not table.is_due(level, anchor, moment, dimension):
                     continue
                 activity = float(row["activity"])

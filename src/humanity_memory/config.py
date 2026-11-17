@@ -499,6 +499,14 @@ class Config:
         return float(self.forget_settings.get("level0_purge_days", 180.0))
 
     @property
+    def forget_max_gap_days(self) -> float:
+        """两次遗忘计算的间隔上限（天）。超出部分算冻结期，不计入记忆寿命。
+
+        置 0 表示关闭冻结，回到「静默多久就算多久」的旧行为。
+        """
+        return max(0.0, float(self.forget_settings.get("max_gap_days", 7.0)))
+
+    @property
     def level_factor_overrides(self) -> dict[int, float]:
         """可选的逐级手调表；不填就走公式。"""
         raw = _optional(self.settings, "retrieval", "level_factor", default={}) or {}
@@ -683,6 +691,7 @@ class Config:
                 ],
                 "level0_purge_days": _optional(self.settings, "forget", "level0_purge_days"),
                 "archived_purge_days": _optional(self.settings, "forget", "archived_purge_days"),
+                "max_gap_days": _optional(self.settings, "forget", "max_gap_days"),
                 "revive_hits": _optional(self.settings, "forget", "revive_hits"),
                 "revive_to_level": _optional(self.settings, "forget", "revive_to_level"),
             },

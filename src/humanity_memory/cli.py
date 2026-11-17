@@ -546,8 +546,15 @@ def cmd_lifecycle(args: argparse.Namespace) -> int:
             if args.json:
                 _dump(report)
                 return 0
+            frozen = report.get("frozen_days") or 0
+            if frozen > 0:
+                print(
+                    f"静默冻结 {frozen:g} 天：距上次计算太久了，"
+                    f"只按 {report['max_gap_days']:g} 天计入记忆寿命"
+                    f"（超出的部分已从周期起点里扣掉）。"
+                )
             if report["due"] == 0:
-                print("（没有到期的裁定项，一个字节都没写）")
+                print("（没有到期的裁定项）")
                 return 0
             head = "预览" if report["dry_run"] else "已裁定"
             print(f"{head} {report['due']} 条：")
@@ -949,6 +956,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_star.add_argument("--min-score", type=float, default=0.55, help="语义边最低相似度")
     p_star.add_argument("--top-k", type=int, default=6, help="每个节点最多保留几条语义边")
     p_star.add_argument("--max-nodes", type=int, default=400, help="全对相似度计算的节点上限")
+    p_star.add_argument(
+        "--activity-mode",
+        choices=("ratio", "rank"),
+        default="ratio",
+        help=(
+            "辉光颜色 0~1 的算法：ratio = 活跃度 ÷ 本档阈值（默认，1.0 即升档线）；"
+            "rank = 跨节点秩归一（颜色沿节点均匀铺开，只表示排名）"
+        ),
+    )
     p_star.set_defaults(func=cmd_starmap)
 
     p_up = sub.add_parser(

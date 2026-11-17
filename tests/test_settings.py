@@ -95,7 +95,7 @@ def test_defaults_come_from_toml_not_code(tmp_path: Path) -> None:
     """抽查几个值：它们必须能在出厂 TOML 里找到，而不是代码里的字面量。"""
     cfg = Config.load({"HM_HOME": str(tmp_path / "home"), "HM_EMBED_DIM": "8"})
     assert cfg.embed_dim == 8  # 环境变量最高优先级
-    assert cfg.settings["compress"]["required_compression"] == [3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0]
+    assert cfg.settings["compress"]["required_compression"] == [3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     assert cfg.settings["dedup"]["dup_floor"] == 0.90
     assert cfg.default_importance["log"] == 0.30
     assert cfg.w_level == cfg.settings["retrieval"]["w_level"]

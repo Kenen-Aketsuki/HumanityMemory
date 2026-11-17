@@ -47,11 +47,20 @@ def _stage(
     activity: float,
     overdue_days: int = 400,
 ) -> int:
-    """把一条记忆摆成「已到期 + 指定活跃度」，返回判定时刻。"""
+    """把一条记忆摆成「已到期 + 指定活跃度」，返回判定时刻。
+
+    顺手把「上次计算时刻」摆到一天前：间隔在冻结上限（max_gap_days）之内，
+    不会触发静默冻结 —— 这里测的是纯粹的到期裁定。
+    冻结本身由 test_judge_freeze.py 单独守，两边不要互相干扰。
+    """
     now = 3_000_000_000_000
     store.workspace_conn.execute(
         "UPDATE episodes SET forget_level = ?, activity = ?, period_start = ? WHERE id = ?",
         (level, activity, now - overdue_days * DAY_MS, item_id),
+    )
+    store.workspace_conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_judge_at', ?)",
+        (str(int(now - DAY_MS)),),
     )
     return now
 
@@ -193,6 +202,11 @@ def test_scope_all_only_touches_workspace(env) -> None:
     store.workspace_conn.execute(
         "UPDATE episodes SET forget_level = 4, activity = ?, period_start = ? WHERE id = ?",
         (float(band["up_threshold"]) + 5, now - 400 * DAY_MS, local.id),
+    )
+    # 基线摆到一天前：间隔在冻结上限内，这里测的是范围，不是冻结
+    store.workspace_conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_judge_at', ?)",
+        (str(int(now - DAY_MS)),),
     )
 
     report = store.judge_due(scope="all", now=now)

@@ -58,6 +58,19 @@ def _row(store: MemoryStore, *, table: str, item_id: str):
     ).fetchone()
 
 
+def _set_clock(store: MemoryStore, moment: int) -> None:
+    """把「上次计算时刻」摆到指定位置。
+
+    间隔落在冻结上限（max_gap_days）之内就不会触发静默冻结 ——
+    这些用例测的是到期裁定，不该被「静默很久」的语义顺手改写。
+    """
+    with tx(store.workspace_conn):
+        store.workspace_conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_judge_at', ?)",
+            (str(moment),),
+        )
+
+
 # ---------------------------------------------------------------- 纯判定
 
 
@@ -120,11 +133,11 @@ def test_is_due_uses_per_dimension_period(env) -> None:
 def test_initial_level_and_level_factor(env) -> None:
     cfg, _ = env
     bands = cfg.initial_bands
-    assert initial_level(0.9, bands) == 5
-    assert initial_level(0.4, bands) == 4
-    assert initial_level(0.1, bands) == 3
-    # 录入可达的顶档就是 bands 的最高档：6 级以上只能靠活跃度挣
-    assert initial_level(1.0, bands) == 5
+    assert initial_level(0.9, bands) == 4
+    assert initial_level(0.4, bands) == 3
+    assert initial_level(0.1, bands) == 2
+    # 录入可达的顶档就是 bands 的最高档：L5 及以上只能靠活跃度挣
+    assert initial_level(1.0, bands) == 4
     assert initial_level(1.0, bands) < cfg.max_level
 
     top = cfg.max_level
@@ -165,11 +178,11 @@ def test_write_sets_initial_level_and_period(env) -> None:
     mid = store.write_memory("默认落点的知识", importance=0.4)
     low = store.write_memory("顺手改了个 typo", importance=0.1)
 
-    assert (high.forget_level, mid.forget_level, low.forget_level) == (5, 4, 3)
+    assert (high.forget_level, mid.forget_level, low.forget_level) == (4, 3, 2)
     assert high.period_start is not None and high.period_start == high.created_at
 
     ep = store.write_episode("一次普通叙述", importance=0.4)
-    assert ep.forget_level == 4
+    assert ep.forget_level == 3
     assert ep.period_start == ep.at
 
 
@@ -188,6 +201,7 @@ def test_judge_upgrades_and_resets_period(env) -> None:
         activity=16.0,
         period_start=now - int(91 * DAY_MS),
     )
+    _set_clock(store, now - int(DAY_MS))
 
     report = store.judge_due(now=now)
 
@@ -223,6 +237,7 @@ def test_judge_hold_still_resets_period(env) -> None:
         activity=4.0,
         period_start=now - int(4 * DAY_MS),
     )
+    _set_clock(store, now - int(DAY_MS))
 
     report = store.judge_due(now=now)
 
@@ -277,6 +292,7 @@ def test_judge_uses_episode_period_and_dry_run(env) -> None:
         activity=16.0,
         period_start=now - int(31 * DAY_MS),
     )
+    _set_clock(store, now - int(DAY_MS))
 
     preview = store.judge_due(now=now, dry_run=True)
     assert preview["due"] == 1
@@ -301,29 +317,29 @@ def test_relevel_recomputes_by_importance_and_resets_period(env) -> None:
     now = 4_000_000_000_000
     high = store.write_memory("重大架构决策", importance=0.9)
     low = store.write_memory("顺手改了个 typo", importance=0.1)
-    # 摆成旧表的姿势：两条都在旧 L4，带着旧周期攒下的活跃度
+    # 摆成旧表的姿势：两条都停在更高的档，带着旧周期攒下的活跃度
     for item in (high, low):
         _force(
             store,
             table="knowledge",
             item_id=item.id,
-            forget_level=4,
+            forget_level=7,
             activity=9.0,
             period_start=now - int(150 * DAY_MS),
         )
 
     preview = store.relevel_by_importance(now=now, dry_run=True)
     assert preview["touched"] == 2
-    assert {m["to"] for m in preview["moves"]} == {5, 3}
-    assert _row(store, table="knowledge", item_id=high.id)["forget_level"] == 4, "干跑不写库"
+    assert {m["to"] for m in preview["moves"]} == {4, 2}
+    assert _row(store, table="knowledge", item_id=high.id)["forget_level"] == 7, "干跑不写库"
 
     report = store.relevel_by_importance(now=now)
     assert report["changed"] == 2
     row = _row(store, table="knowledge", item_id=high.id)
-    assert row["forget_level"] == 5
+    assert row["forget_level"] == 4
     assert row["activity"] == 0.0, "旧周期的活跃度不该带进新周期"
     assert row["period_start"] == now, "倒计时要按新表重新起算"
-    assert _row(store, table="knowledge", item_id=low.id)["forget_level"] == 3
+    assert _row(store, table="knowledge", item_id=low.id)["forget_level"] == 2
 
 
 def test_relevel_skips_forgotten_and_archived(env) -> None:
@@ -343,62 +359,7 @@ def test_relevel_skips_forgotten_and_archived(env) -> None:
     pulled = store.relevel_by_importance(now=now, include_level0=True)
     assert pulled["touched"] == 1
     row = _row(store, table="knowledge", item_id=gone.id)
-    assert row["forget_level"] == 5, "显式要求时才按 importance 拉回"
+    assert row["forget_level"] == 4, "显式要求时才按 importance 拉回"
     assert row["level0_since"] is None, "离开遗忘层要清掉停留起点"
 
 
-# ---------------------------------------------------------------- 等级表改档后的存量重算
-# 改周期是改「尺子」，不是让老条目变旧。若不重算，旧的 L4 会按新表的 5 天周期
-# 连锁降级，几周内集体掉进遗忘层 —— 这组用例守的就是这条迁移路径。
-
-
-def test_relevel_recomputes_by_importance_and_resets_period(env) -> None:
-    """按 importance 重算落档，并把周期账清空、从头走。"""
-    _, store = env
-    now = 4_000_000_000_000
-    high = store.write_memory("重大架构决策", importance=0.9)
-    low = store.write_memory("顺手改了个 typo", importance=0.1)
-    # 摆成旧表的姿势：两条都在旧 L4，带着旧周期攒下的活跃度
-    for item in (high, low):
-        _force(
-            store,
-            table="knowledge",
-            item_id=item.id,
-            forget_level=4,
-            activity=9.0,
-            period_start=now - int(150 * DAY_MS),
-        )
-
-    preview = store.relevel_by_importance(now=now, dry_run=True)
-    assert preview["touched"] == 2
-    assert {m["to"] for m in preview["moves"]} == {5, 3}
-    assert _row(store, table="knowledge", item_id=high.id)["forget_level"] == 4, "干跑不写库"
-
-    report = store.relevel_by_importance(now=now)
-    assert report["changed"] == 2
-    row = _row(store, table="knowledge", item_id=high.id)
-    assert row["forget_level"] == 5
-    assert row["activity"] == 0.0, "旧周期的活跃度不该带进新周期"
-    assert row["period_start"] == now, "倒计时要按新表重新起算"
-    assert _row(store, table="knowledge", item_id=low.id)["forget_level"] == 3
-
-
-def test_relevel_skips_forgotten_and_archived(env) -> None:
-    """遗忘层走自己的复活通道；已归档是显式选择 —— 都不该被顺手拉回来。"""
-    _, store = env
-    now = 4_000_000_000_000
-    gone = store.write_memory("已经掉进遗忘层的", importance=0.9)
-    kept = store.write_memory("已经归档的", importance=0.9)
-    _force(store, table="knowledge", item_id=gone.id, forget_level=0, level0_since=now)
-    _force(store, table="knowledge", item_id=kept.id, forget_level=3, archived_at=now - 1000)
-
-    report = store.relevel_by_importance(now=now)
-    assert report["touched"] == 0
-    assert _row(store, table="knowledge", item_id=gone.id)["forget_level"] == 0
-    assert _row(store, table="knowledge", item_id=kept.id)["forget_level"] == 3
-
-    pulled = store.relevel_by_importance(now=now, include_level0=True)
-    assert pulled["touched"] == 1
-    row = _row(store, table="knowledge", item_id=gone.id)
-    assert row["forget_level"] == 5, "显式要求时才按 importance 拉回"
-    assert row["level0_since"] is None, "离开遗忘层要清掉停留起点"

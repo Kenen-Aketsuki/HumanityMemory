@@ -58,11 +58,11 @@ def test_queue_derives_target_from_forget_level(env) -> None:
     required = cfg.required_compression
 
     deep = _episode(store, "完整叙述的经历，细节很多。" * 6)
-    mid = _episode(store, "中度压缩就够了的一段经历。" * 5)
+    mid = _episode(store, "掉进遗忘层的那段经历。" * 5)
     keep = _episode(store, "还在高位，不该被压。")
 
     _set_level(store, deep.id, 1)   # required[1] = 2
-    _set_level(store, mid.id, 2)    # required[2] = 1
+    _set_level(store, mid.id, 0)    # required[0] = 3
     _set_level(store, keep.id, 4)   # required[4] = 0，已经是 0
 
     queue = store.compression_queue()
@@ -70,7 +70,7 @@ def test_queue_derives_target_from_forget_level(env) -> None:
 
     assert set(got) == {deep.id, mid.id}, "只有压得不够深的两条该入队"
     assert got[deep.id]["target_level"] == required[1]
-    assert got[mid.id]["target_level"] == required[2]
+    assert got[mid.id]["target_level"] == required[0]
     assert got[deep.id]["current_level"] == 0
     assert queue["total"] == 2
 
