@@ -11,7 +11,7 @@
 
 覆盖优先级
 ----------
-`真实环境变量 > TOML（项目 > 用户 > 出厂）`
+`真实环境变量 > TOML（项目 > 用户 > 安装 > 出厂）`
 
 环境变量是最高优先级，保留给三类用法：令牌注入、mcp.json 的 env、调试时临时覆盖。
 它不该成为常态配置手段——那样就回到「参数散落在机器上、换台机器行为不一样」的老路。
@@ -118,9 +118,29 @@ def peek_workspace_dir(environ: dict[str, str] | None = None, home: Path | None 
     return _find_workspace_dir(Path.cwd())
 
 
+def install_config_file() -> Path:
+    """**安装位置**的配置：与 `.env` 同目录，两态各取一处，都不看 cwd。
+
+    - 源码态：`<仓库根>/memory.toml`
+    - 冻结态：`<发布根>/memory.toml`（与 `current/` 同级，跨版本共享）
+
+    这一层的定位是「这套安装的**全量**基线」：由 `config write-template` 从出厂默认
+    整份生成，人可以在这里一眼看到所有可调项并直接改，不用翻进包目录。
+    与用户级 / 项目级的区别只在定位：那两层是**增量**，只写要改的键。
+    """
+    return env_file().parent / OVERRIDE_CONFIG_NAME
+
+
 def config_layers(home: Path, workspace: Path | None = None) -> list[tuple[str, Path]]:
-    """按优先级从低到高返回配置层。只返回**实际存在**的覆盖文件。"""
+    """按优先级从低到高返回配置层。只返回**实际存在**的覆盖文件。
+
+    合并是 `deep_merge` 逐键递归的，所以任何一层都只写自己关心的键即可 ——
+    缺的键从更底层补。这也让「安装层是全量模板、出厂升级又加了新键」不会报缺项。
+    """
     layers: list[tuple[str, Path]] = [("出厂", resource(DEFAULT_CONFIG_NAME))]
+    install = install_config_file()
+    if install.is_file():
+        layers.append(("安装", install))
     user = home / OVERRIDE_CONFIG_NAME
     if user.is_file():
         layers.append(("用户", user))

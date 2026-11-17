@@ -106,6 +106,10 @@ MCP server 的工作目录不固定，项目级 `.env` 换个目录就失效。
 | `HM_W_IMPORTANCE` | `0.12` | 重要性权重 |
 | `HM_W_LEVEL` | `0.16` | 遗忘等级倍率权重 |
 
+**阈值不走环境变量，走四层 TOML**（后者覆盖前者）：出厂（包内全量）→ 安装（`<安装根>/memory.toml`，`config template` 生成的全量模板）→ 用户（`~/.humanity-memory/memory.toml`，增量）→ 项目（`<项目>/.ai_memory/memory.toml`，增量）。
+只改几项就用后两层，别动安装层那份全量——放着全量等于接管所有默认值。
+改完要重启 MCP 客户端才生效（server 常驻，配置只在启动时读）。
+
 ### 免费 embedding 选项
 
 | 方案 | 花费 | 维度 | 说明 |
@@ -379,10 +383,25 @@ rowid 与主表对齐。全文：三张 `_fts` 表，trigram 分词，触发器�
 ```bash
 humanity-memory lifecycle archive --dry-run   # 预览会归档哪些
 humanity-memory lifecycle archive             # 执行
+humanity-memory lifecycle judge --dry-run     # 预览到期的等级裁定
+humanity-memory lifecycle relevel --dry-run   # 等级表改档后，按 importance 重算存量落档
 humanity-memory lifecycle candidates          # 删除候选（只报告）
 humanity-memory lifecycle compress            # 待压缩队列（按遗忘等级推出）
 humanity-memory lifecycle compress-apply --file items.json   # 定向覆盖提交
 ```
+
+遗忘等级是 **0~10 共 11 档**，周期全在 TOML 里，改档不碰代码：
+
+| 段位 | 周期（经验 / 经历） | 定位 |
+| --- | --- | --- |
+| **1~5** | 1~7 天 | 短时记忆：一天到一周裁一次，被检索就往上爬，没人问就往下掉 |
+| **6~10** | 30~540 天 | 长期记忆：月级起步，只有连续多个周期都活跃的条目才配留在这段 |
+
+**改了等级表的周期就必须跑一次 `relevel`**：等级是「这条记忆在时间轴上的位置」，
+换一张表，同一个数字的含义就变了（旧 L4 是 180 天，新 L4 是 5 天）。
+只改配置不动存量，老条目会按新周期连锁降级、几周内集体掉进遗忘层 ——
+而它们并不是变旧了，只是被换了一把尺子量。`relevel` 按当前 `[[initial.bands]]`
+由 importance 重算落档、重置周期起点，跳过 0 级（它有自己的复活通道）和已归档项。
 
 判据用「多久没碰 + 访问几次」而不是分数阈值 —— 分数里总有加项兜底，
 再冷的条目也跌不到 0，拿绝对阈值归档会永远不触发。
@@ -393,7 +412,7 @@ humanity-memory lifecycle compress-apply --file items.json   # 定向覆盖提�
 final = type_weight × (0.72 × retrieval + 0.12 × importance + 0.16 × level_factor)
 
 retrieval    = (0.70 × vec_sim + 0.30 × lex_sim) / 可用通路权重和
-level_factor = (forget_level / 最高等级) ^ 1.5     （0 级恒为 0）
+level_factor = (forget_level / 最高等级) ^ 0.65    （0 级恒为 0）
 type_weight: experience 1.00 / episode 0.96 / log 0.90
              （episode 再乘压缩级别权重 0.88~0.96）
 ```

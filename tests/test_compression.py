@@ -253,3 +253,67 @@ def test_compress_leaves_audit_trail(env) -> None:
     assert meta["before_len"] == before_len
     assert meta["after_len"] == len("一句话。")
     assert meta["target_level"] == 2
+
+
+# ---------------------------------------------------------------- 压缩区与考察期
+# 1~5 级同时是「录入落点」和「晋升考察期」：记忆在这里证明自己够不够格升到
+# 长期段。压缩是覆盖写 content，一旦压了，升上去也回不来 —— 所以压缩区
+# 必须整个落在考察期之下。这两条守住这个边界，防止调 bands 或调压缩表时
+# 又把考察期埋进压缩区（那等于用销毁证据的方式来做判断）。
+
+
+def test_compression_zone_stays_below_judgement_band(env) -> None:
+    """最低录入档及以上一律不压：正文在考察期必须完整。"""
+    cfg, _ = env
+    required = cfg.required_compression
+    lowest_initial = min(int(b["level"]) for b in cfg.initial_bands)
+
+    for level in range(lowest_initial, cfg.max_level + 1):
+        assert required[level] == 0, (
+            f"L{level} 的目标压缩级别是 {required[level]}，但它是考察期的一部分："
+            "正文一旦被压，这条记忆就再也没法证明自己了"
+        )
+
+
+def test_compression_targets_are_monotonic(env) -> None:
+    """等级越低压得越狠：数组必须随下标单调不增，否则低档反而比高档完整。"""
+    cfg, _ = env
+    required = cfg.required_compression
+    reverse_pairs = [
+        (level, required[level], required[level + 1])
+        for level in range(len(required) - 1)
+        if required[level] < required[level + 1]
+    ]
+    assert not reverse_pairs, f"压缩目标倒挂（低档比高档轻）：{reverse_pairs}"
+
+
+# ---------------------------------------------------------------- 压缩区与考察期
+# 1~5 级同时是「录入落点」和「晋升考察期」：记忆在这里证明自己够不够格升到
+# 长期段。压缩是覆盖写 content，一旦压了，升上去也回不来 —— 所以压缩区
+# 必须整个落在考察期之下。这两条守住这个边界，防止调 bands 或调压缩表时
+# 又把考察期埋进压缩区（那等于用销毁证据的方式来做判断）。
+
+
+def test_compression_zone_stays_below_judgement_band(env) -> None:
+    """最低录入档及以上一律不压：正文在考察期必须完整。"""
+    cfg, _ = env
+    required = cfg.required_compression
+    lowest_initial = min(int(b["level"]) for b in cfg.initial_bands)
+
+    for level in range(lowest_initial, cfg.max_level + 1):
+        assert required[level] == 0, (
+            f"L{level} 的目标压缩级别是 {required[level]}，但它是考察期的一部分："
+            "正文一旦被压，这条记忆就再也没法证明自己了"
+        )
+
+
+def test_compression_targets_are_monotonic(env) -> None:
+    """等级越低压得越狠：数组必须随下标单调不增，否则低档反而比高档完整。"""
+    cfg, _ = env
+    required = cfg.required_compression
+    reverse_pairs = [
+        (level, required[level], required[level + 1])
+        for level in range(len(required) - 1)
+        if required[level] < required[level + 1]
+    ]
+    assert not reverse_pairs, f"压缩目标倒挂（低档比高档轻）：{reverse_pairs}"

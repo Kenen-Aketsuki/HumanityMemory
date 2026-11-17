@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 import struct
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -812,6 +813,96 @@ class MemoryStore:
             "settled": total_settled,
             "items": all_items,
             "dbs": per_db,
+        }
+
+    def relevel_by_importance(
+        self,
+        *,
+        now: int | None = None,
+        dry_run: bool = False,
+        include_level0: bool = False,
+    ) -> dict[str, Any]:
+        """按当前 `[[initial.bands]]` 重算存量落档，并把周期起点重置到 now。
+
+        什么时候需要它：改了等级表的**周期**之后。等级是「这条记忆在时间轴上的
+        位置」，换一张表，同一个数字的含义就变了 —— 旧表 L4 是 180 天，新表 L4
+        是 5 天。只改配置不动存量，老条目会按新周期连锁降级，几周内集体掉进
+        遗忘层；而它们并不是「变旧了」，只是被换了一把尺子量。
+
+        重算的语义是「用新标准重新认识它们」，不是「把等级改高」：
+        - 等级走 `initial_level()`，与录入时完全同一条路径；
+        - `period_start` 重置到 now：旧表的周期账已经结清，新表从头走；
+        - `activity` 清零：理由同上，旧周期攒的分不该带进新周期。
+
+        跳过两类，它们不该被这次迁移拉回来：
+        - **已归档**：归档是显式选择，重新激活要人来做；
+        - **0 级**（除非 `include_level0`）：遗忘层有自己的复活通道（深度命中），
+          用 importance 直接捞回来等于绕过它。
+
+        只改等级相关三列，正文、向量、可信度一概不动 —— 这是「重新量一次」，
+        不是「重写一遍」。
+        """
+        moment = now if now is not None else now_ms()
+        bands = self.cfg.initial_bands
+        moves: list[dict[str, Any]] = []
+        touched = 0
+
+        for _db_name, conn in self._all_dbs("workspace"):
+            with (nullcontext() if dry_run else transaction(conn)):
+                for spec in (EXPERIENCE, EPISODE):
+                    rows = conn.execute(
+                        f"SELECT rowid, id, importance, forget_level"
+                        f" FROM {spec.table} WHERE archived_at IS NULL"
+                    ).fetchall()
+                    for row in rows:
+                        old = int(row["forget_level"] or 0)
+                        if old == 0 and not include_level0:
+                            continue
+                        importance = float(row["importance"] or 0.0)
+                        new = initial_level(importance, bands)
+                        touched += 1
+                        if new != old:
+                            moves.append(
+                                {
+                                    "table": spec.table,
+                                    "id": row["id"],
+                                    "from": old,
+                                    "to": new,
+                                    "importance": round(importance, 2),
+                                }
+                            )
+                        if dry_run:
+                            continue
+                        conn.execute(
+                            f"UPDATE {spec.table} SET forget_level = ?, activity = 0,"
+                            " period_start = ?, level0_since = NULL WHERE rowid = ?",
+                            (new, moment, int(row["rowid"])),
+                        )
+                        if new != old:
+                            _record_event(
+                                conn,
+                                moment=moment,
+                                table=spec.table,
+                                item_id=str(row["id"]),
+                                event="level",
+                                from_value=str(old),
+                                to_value=str(new),
+                                reason="relevel：等级表改档后按 importance 重算",
+                            )
+
+        return {
+            "ok": True,
+            "dry_run": dry_run,
+            "now": moment,
+            "touched": touched,
+            "changed": len(moves),
+            "moves": moves,
+            "bands": [dict(b) for b in bands],
+            "note": (
+                "等级按 importance 重算、周期起点重置；0 级与已归档的未参与"
+                if not include_level0
+                else "等级按 importance 重算、周期起点重置；0 级也被拉回"
+            ),
         }
 
     def _due_candidates(

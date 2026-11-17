@@ -66,6 +66,26 @@ HM_EMBED_DIM=1024          # 必须和模型实际维度一致
 
 完整清单见仓库 `.env.example`。
 
+### 阈值配置在哪（四层，后者覆盖前者）
+
+| 层 | 路径 | 定位 |
+| --- | --- | --- |
+| 出厂 | 包内 `memory.default.toml` | 全量默认值，随版本发布，别改 |
+| 安装 | `<安装根>/memory.toml`（与 `.env` 同目录） | **全量模板**，`humanity-memory config template` 整份生成 |
+| 用户 | `~/.humanity-memory/memory.toml` | **增量**，只写要改的键，跨项目 |
+| 项目 | `<项目>/.ai_memory/memory.toml` | **增量**，只写要改的键，优先级最高 |
+
+```bash
+humanity-memory config template        # 生成安装位置的全量模板（已存在会拒绝）
+humanity-memory config template --force   # 覆盖重来
+```
+
+**只改几项就用用户级 / 项目级**，别动安装层那份全量：全量放着等于接管了所有默认值，
+以后出厂调了某个值，你那份的旧值会赢。
+
+**改完必须重启 MCP 客户端**（server 常驻，配置只在进程启动时读一次）。
+CLI 和星图脚本每次都是新进程，改完立刻生效。
+
 ### 没有 embedding 也能用
 
 退化为关键词检索（FTS5 trigram + bigram 兜底），中文子串匹配依然有效，

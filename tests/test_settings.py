@@ -6,12 +6,23 @@ from pathlib import Path
 
 import pytest
 
+from humanity_memory import config as cfgmod
 from humanity_memory.config import (
     Config,
     ConfigError,
     deep_merge,
     validate_settings,
 )
+
+
+@pytest.fixture(autouse=True)
+def _hide_install_layer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """本文件只测「出厂 / 用户 / 项目」三层。
+
+    仓库根真实存在的 `<安装根>/memory.toml` 会多出一层，让层数断言随机器状态漂移 ——
+    安装层单独由 `test_config_layers.py` 负责，这里把它挡掉才能保证测试可重复。
+    """
+    monkeypatch.setattr(cfgmod, "env_file", lambda: tmp_path / "no-install" / ".env")
 
 
 def _write_levels(path: Path, levels: list[dict], **forget_overrides) -> None:
@@ -74,8 +85,8 @@ def test_deep_merge_replaces_arrays_wholesale() -> None:
 
 def test_default_toml_loads_and_validates(tmp_path: Path) -> None:
     cfg = Config.load({"HM_HOME": str(tmp_path / "home"), "HM_DB_PATH": str(tmp_path / "m.db")})
-    assert [lv["level"] for lv in cfg.forget_levels] == [5, 4, 3, 2, 1, 0]
-    assert cfg.max_level == 5
+    assert [lv["level"] for lv in cfg.forget_levels] == list(range(10, -1, -1))
+    assert cfg.max_level == 10
     assert [scope for scope, _ in cfg.layers] == ["出厂"]
     assert validate_settings(cfg.settings) == []
 
@@ -84,7 +95,7 @@ def test_defaults_come_from_toml_not_code(tmp_path: Path) -> None:
     """抽查几个值：它们必须能在出厂 TOML 里找到，而不是代码里的字面量。"""
     cfg = Config.load({"HM_HOME": str(tmp_path / "home"), "HM_EMBED_DIM": "8"})
     assert cfg.embed_dim == 8  # 环境变量最高优先级
-    assert cfg.settings["compress"]["required_compression"] == [3, 2, 1, 0, 0, 0]
+    assert cfg.settings["compress"]["required_compression"] == [3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0]
     assert cfg.settings["dedup"]["dup_floor"] == 0.90
     assert cfg.default_importance["log"] == 0.30
     assert cfg.w_level == cfg.settings["retrieval"]["w_level"]

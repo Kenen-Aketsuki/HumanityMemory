@@ -514,6 +514,9 @@ let alpha=1,frame=0,hover=null,selected=null,dragging=null,panning=null,fixedHov
 const enabled={semantic:true,invalidates:true,digest:true,tag:false};
 const kinds={experience:true,episode:true,log:true,digest:true};
 let minScore=DATA.meta.min_score;
+// 等级量程由数据决定（后端按库里最大 forget_level 给出，至少到 5）。
+// 不写死档数：等级表是可配置的，5 档和 10 档都得画对。
+const LVMAX=Math.max(1,(DATA.meta&&DATA.meta.max_level)||5);
 let showLabels=document.getElementById('labels').checked;
 
 function rnd(i){const x=Math.sin(i*127.1+311.7)*43758.5453;return x-Math.floor(x);}
@@ -665,11 +668,13 @@ function draw(){
     ctx.globalAlpha=dim?.42:(focus?1:.9);
     // 辉光亮度 = 遗忘等级：越接近遗忘越淡，像逐渐熄灭的灯。
     // 本体大小继续由 importance 决定，两个通道各管一个维度，互不打架。
-    const lvl=Math.max(0,Math.min(5,n.forget_level||0));
-    // 跨度要够大：库里最常见的是 L3↔L4 相邻档，0.05 的 alpha 差在深底上等于没有。
-    // 0.02→0.395 每级 0.075，相邻两档才看得出「这盏灯比那盏亮」。
-    const glow=n.kind==='digest'?.26:(n.has_level?0.02+lvl*0.075:0.17);
-    ctx.beginPath();ctx.arc(n.x,n.y,n.r*(2.05+lvl*0.13),0,6.2832);
+    // 亮度与半径都按量程归一：0.02（近熄灭）→ 0.395（顶档最亮）。
+    // 档数变多后相邻档的差值自然变小，这是「同样亮度跨度分更多份」的必然代价；
+    // 半径同步归一，两个通道一起表达跨度，低档之间仍能靠「灯大不大」区分。
+    const lvl=Math.max(0,Math.min(LVMAX,n.forget_level||0));
+    const ratio=lvl/LVMAX;
+    const glow=n.kind==='digest'?.26:(n.has_level?0.02+ratio*0.375:0.17);
+    ctx.beginPath();ctx.arc(n.x,n.y,n.r*(2.05+ratio*0.65),0,6.2832);
     // 辉光用统一的白偏蓝，不跟本体色走 —— 否则紫色（#b9a5ff）本身比蓝色亮，
     // L3 的紫点光晕会盖过 L4 的蓝点，亮度就不再是可靠的等级信号了。
     ctx.fillStyle=n.kind==='digest'?'#ffe08a':'#dbe8ff';
@@ -796,9 +801,9 @@ function buildUI(){
   });
   const lvEl=document.getElementById('levels');
   let lvHtml='';
-  for(let l=5;l>=0;l--){
+  for(let l=LVMAX;l>=0;l--){
     const c=lvCount[l]||0;
-    const a=(0.02+l*0.075).toFixed(3);
+    const a=(0.02+(l/LVMAX)*0.375).toFixed(3);
     lvHtml+='<div class="kv"><span><span class="dot" style="background:#dbe8ff;opacity:'+a+'"></span> L'+l+
       (l===0?'（遗忘层）':'')+'</span><span style="color:var(--muted)">'+c+'</span></div>';
   }
@@ -806,7 +811,7 @@ function buildUI(){
   lvEl.innerHTML=lvHtml;
   document.getElementById('legend').innerHTML=
     '<span style="color:#cfe0ff">点大小 = 重要度 · 辉光亮度 = 遗忘等级</span><br>'+
-    '<span style="color:#8fa8c8">　（辉光越淡越接近遗忘，L5 最亮 · L0 近乎熄灭）</span><br>'+
+    '<span style="color:#8fa8c8">　（辉光越淡越接近遗忘，L'+LVMAX+' 最亮 · L0 近乎熄灭）</span><br>'+
     '<span style="color:#6fb6ff">虚线粗细 = 语义相似度</span><br>'+
     '<span style="color:#ffc46b">琥珀箭头 = 失效 / 换代</span><br>'+
     '<span style="color:#ffe08a">黄色恒星 = 复盘批次</span><br>'+
@@ -885,6 +890,12 @@ def run(args: argparse.Namespace) -> int:
         warnings.append(f"{real_nodes - covered} 条条目没有向量，不参与语义连线")
     all_notes = list(dict.fromkeys(notes + dir_notes + stats["notes"]))
 
+    # 等级量程：按库里实际出现过的最大 forget_level 给，至少到 5。
+    # 下限 5 是为了让老库（最高才 4 级）看起来仍有完整的量程，而不是
+    # 「顶档只有 4」；上限不封顶，等级表扩到 10 档时新库自动画到 L10。
+    leveled = [int(n["forget_level"]) for n in nodes if n.get("has_level")]
+    level_max = max(max(leveled), 5) if leveled else 5
+
     graph = {
         "nodes": nodes,
         "edges": edges,
@@ -901,6 +912,7 @@ def run(args: argparse.Namespace) -> int:
             "kind_counts": dict(Counter(n["kind"] for n in nodes)),
             "edge_counts": stats["edge_counts"],
             "min_score": args.min_score,
+            "max_level": level_max,
             "generated_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "dir_files": files,
             "notes": all_notes,

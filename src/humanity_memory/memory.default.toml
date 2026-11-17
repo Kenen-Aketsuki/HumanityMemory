@@ -35,49 +35,96 @@ revive_hits = 2
 revive_to_level = 1
 
 # ----------------------------------------------------------------------------
-# 遗忘等级表
+# 遗忘等级表（0~10 共 11 档）
 # 顺序任意，程序按 level 字段排序；加一档只需新增一段 [[forget.levels]]。
 # 顶档不写 up_threshold（不能再升）；0 级不写周期（不参与周期裁定）。
 # up_threshold / down_threshold 是周期末的「活跃度」判据，不是分数本身。
+#
+# 分两段看，这是本表的设计意图：
+#   1~5 级 —— 短时记忆。两种周期都在 1 周以内，一天到一周就裁定一次，
+#             新条目在这里快速试错：被检索到就往上爬，没人再问就往下掉。
+#   6~10 级 —— 长期记忆。从月级起步逐级拉长到一年半，只有连续多个周期
+#             都保持活跃的条目才配待在这一段。
+# 因此「升到 6 级」是一条真正的分水岭：那之前是工作记忆，那之后是沉淀。
 # ----------------------------------------------------------------------------
 
 [[forget.levels]]
-level = 5
+level = 10
+period_experience_days = 540
+period_episode_days = 365
+down_threshold = 27.2
+compress = "full"
+
+[[forget.levels]]
+level = 9
 period_experience_days = 365
-period_episode_days = 180
+period_episode_days = 240
+up_threshold = 34.0
 down_threshold = 20.0
 compress = "full"
 
 [[forget.levels]]
-level = 4
-period_experience_days = 180
-period_episode_days = 90
+level = 8
+period_experience_days = 240
+period_episode_days = 120
 up_threshold = 25.0
-down_threshold = 12.0
+down_threshold = 14.4
+compress = "full"
+
+[[forget.levels]]
+level = 7
+period_experience_days = 120
+period_episode_days = 60
+up_threshold = 18.0
+down_threshold = 10.4
+compress = "full"
+
+[[forget.levels]]
+level = 6
+period_experience_days = 30
+period_episode_days = 21
+up_threshold = 13.0
+down_threshold = 7.6
+compress = "full"
+
+[[forget.levels]]
+level = 5
+period_experience_days = 7
+period_episode_days = 7
+up_threshold = 9.5
+down_threshold = 5.6
+compress = "full"
+
+[[forget.levels]]
+level = 4
+period_experience_days = 5
+period_episode_days = 5
+up_threshold = 7.0
+down_threshold = 4.0
 compress = "full"
 
 [[forget.levels]]
 level = 3
-period_experience_days = 90
-period_episode_days = 30
-up_threshold = 15.0
-down_threshold = 6.0
+period_experience_days = 3
+period_episode_days = 3
+up_threshold = 5.0
+down_threshold = 2.8
 compress = "full"
 
 [[forget.levels]]
 level = 2
-period_experience_days = 30
-period_episode_days = 14
-up_threshold = 8.0
-down_threshold = 3.0
+period_experience_days = 2
+period_episode_days = 2
+up_threshold = 3.5
+down_threshold = 1.6
 compress = "moderate"
 
 [[forget.levels]]
 level = 1
-period_experience_days = 7
-period_episode_days = 7
-up_threshold = 4.0
-down_threshold = 1.0
+period_experience_days = 1
+period_episode_days = 1
+up_threshold = 2.0
+down_threshold = 0.5
 compress = "sentence"
 
 [[forget.levels]]
@@ -92,18 +139,22 @@ compress = "title"
 # 每条记忆录入时模型给一个 importance（0~1），按 min_importance 降序匹配第一个满足的档。
 # 上限固定为「最高等级 - 1」：顶档只能靠活跃度挣，不能录入即设。
 # 下限受校验约束（不得低于 2），避免新记忆一进来就在遗忘边缘。
+#
+# 三档全部落在短时记忆段（3~5 级，周期 3~7 天）：
+# 新条目先当工作记忆对待，够不够格沉淀由「之后有没有被检索到」说话，
+# 而不是由录入那一刻的 importance 一次性定终身。6 级以上的长期位置只能升上去。
 
 [[initial.bands]]
 min_importance = 0.55
-level = 4
+level = 5
 
 [[initial.bands]]
 min_importance = 0.30
-level = 3
+level = 4
 
 [[initial.bands]]
 min_importance = 0.00
-level = 2
+level = 3
 
 
 # ============================================================================
@@ -144,8 +195,11 @@ w_retrieval = 0.72
 w_importance = 0.12
 # 等级权重。第三项是遗忘等级的倍率：`(level / 最高等级) ^ level_factor_power`，
 # 0 级恒为 0（它本来就不进常规检索）。想逐级手调就在下面填映射表覆盖公式。
+# power 与档数是一对：5 档时 1.5 让中间档落在 0.7 左右；扩到 10 档后分母翻倍，
+# 同样的 1.5 会把 4 级压到 0.25。0.65 让 (6/10)^0.65 ≈ 0.717，与旧的 (4/5)^1.5 等值，
+# 即「长期记忆的起点」在排序里仍占原来的分量。改档数时记得回来重算这个值。
 w_level = 0.16
-level_factor_power = 1.5
+level_factor_power = 0.65
 # 常规检索最高分低于此值才触发深度回忆（扫 0 级遗忘层）
 deep_recall_floor = 0.35
 
@@ -168,8 +222,15 @@ topk = 3
 # ============================================================================
 [compress]
 # 下标 = forget_level，值 = 目标 compression_level。
-# 长度必须等于等级档数（现在 6 档 → 6 个元素），短了会越界、长了会静默错位。
-required_compression = [3, 2, 1, 0, 0, 0]
+# 长度必须等于等级档数（现在 11 档 → 11 个元素），短了会越界、长了会静默错位。
+# 0 = 不压 / 1 = 中度 / 2 = 一句话 / 3 = 标题级，随等级升高而变轻。
+#
+# 只有 3 级往下才压。为什么不是 4 级：3 级是录入落点之一，而 1~5 级同时是
+# 「考察期」——记忆在这里证明自己够不够格升到长期段。考察期把正文压成一句话，
+# 等于把判断依据销毁了（压缩是覆盖写，升上去也回不来）。所以压缩区必须整个
+# 落在考察期之下：L3 及以上一律不动，L2 中度、L1 一句话、L0 标题。
+# 前四位的曲线与旧 5 档表完全一致，只是把 L3 明确排除在压缩区外。
+required_compression = [3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0]
 
 
 # ============================================================================

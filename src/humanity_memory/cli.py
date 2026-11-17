@@ -313,6 +313,46 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_config(args: argparse.Namespace) -> int:
+    """生成**安装位置**的全量配置模板（`<安装根>/memory.toml`）。
+
+    这一层与 `.env` 同目录、跨版本共享，定位是「这套安装的完整基线」：
+    整份生成，让人不用翻进包目录就能看到所有可调项。
+    用户级 / 项目级那两层是增量，只写要改的键。
+    """
+    from .config import DEFAULT_CONFIG_NAME, install_config_file
+    from .resources import resource
+
+    target = install_config_file()
+    source = resource(DEFAULT_CONFIG_NAME)
+    if not source.is_file():
+        print(f"错误：找不到出厂配置 {source}", file=sys.stderr)
+        return 2
+
+    if target.exists() and not args.force:
+        print(
+            f"已存在：{target}\n"
+            "这份是全量基线，覆盖会丢掉你改过的值。确认要重来就加 --force。",
+            file=sys.stderr,
+        )
+        return 2
+
+    text = source.read_text(encoding="utf-8")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    print(f"已生成全量配置模板：{target}")
+    print(f"  {len(text.splitlines())} 行，含全部可调项与注释")
+    print()
+    print("配置层（低 → 高，后者覆盖前者）：")
+    print("  出厂    包内 memory.default.toml（全量，随版本更新）")
+    print("  安装    上一行那个路径（全量，你现在这份）")
+    print("  用户    ~/.humanity-memory/memory.toml（增量：只写要改的键）")
+    print("  项目    <项目>/.ai_memory/memory.toml（增量，优先级最高）")
+    print()
+    print("改完要重启 MCP 客户端才生效（server 是常驻进程，配置只在启动时读一次）。")
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     layout = _layout(args)
     # 配置校验已通过 —— Config.load 不通过会直接抛错，走不到这里
@@ -516,6 +556,28 @@ def cmd_lifecycle(args: argparse.Namespace) -> int:
                 print(f"  {arrow} [{it['id']}] {it['kind']} {it['from']}→{it['to']}  {it['reason']}")
             if not report["dry_run"]:
                 print(f"\n落盘 {report['settled']} 条，活跃度已清零、周期起点推到现在。")
+            return 0
+
+        if args.action == "relevel":
+            report = store.relevel_by_importance(
+                now=args.now, dry_run=args.dry_run, include_level0=args.include_level0
+            )
+            if args.json:
+                _dump(report)
+                return 0
+            head = "预览" if report["dry_run"] else "已重算"
+            print(
+                f"{head} {report['touched']} 条，其中 {report['changed']} 条等级变化"
+                f"（按 bands {[(b['min_importance'], b['level']) for b in report['bands']]}）"
+            )
+            for mv in report["moves"]:
+                print(
+                    f"  [{mv['id']}] {mv['table']} L{mv['from']}→L{mv['to']}"
+                    f"  importance={mv['importance']}"
+                )
+            print(f"\n{report['note']}")
+            if report["dry_run"]:
+                print("落地请去掉 --dry-run。")
             return 0
 
         if args.action == "candidates":
@@ -821,6 +883,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_stats.add_argument("--json", action="store_true")
     p_stats.set_defaults(func=cmd_stats)
 
+    p_cfg = sub.add_parser("config", help="生成安装位置的全量配置模板")
+    p_cfg.add_argument(
+        "action", choices=["template"], nargs="?", default="template",
+        help="template：把出厂默认整份写到 <安装根>/memory.toml",
+    )
+    p_cfg.add_argument("--force", action="store_true", help="已存在也覆盖（会丢掉你的修改）")
+    p_cfg.set_defaults(func=cmd_config)
+
     sub.add_parser("doctor", help="环境自检").set_defaults(func=cmd_doctor)
 
     p_ws = sub.add_parser("workspace", help="令牌：绑定工作区与凭据")
@@ -837,12 +907,19 @@ def build_parser() -> argparse.ArgumentParser:
         "action",
         choices=[
             "judge", "archive", "unarchive", "candidates", "purge",
-            "compress", "compress-apply",
+            "compress", "compress-apply", "relevel",
         ],
     )
     p_life.add_argument("ids", nargs="*", default=None, help="purge 时的 id 列表")
     p_life.add_argument("--id", default=None, help="unarchive 的目标 id")
-    p_life.add_argument("--dry-run", action="store_true", help="archive 时只预览")
+    p_life.add_argument(
+        "--dry-run", action="store_true", help="archive / judge / relevel 时只预览"
+    )
+    p_life.add_argument(
+        "--include-level0",
+        action="store_true",
+        help="relevel 时把 0 级遗忘层也按 importance 拉回（默认跳过它的复活通道）",
+    )
     p_life.add_argument("--days", type=float, default=None, help="candidates 的静默天数")
     p_life.add_argument(
         "--now", type=int, default=None, help="judge 的判定时刻（毫秒），补算或复现用"
