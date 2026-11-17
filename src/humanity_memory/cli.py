@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import __version__, rules
-from .config import Config
-from .db import detect_fts_tokenizer, get_meta
+from .config import Config, ConfigError
+from .db import SchemaVersionError, detect_fts_tokenizer, get_meta
 from .models import parse_day
 from .paths import ensure_rules, resolve_layout
 from .store import MemoryStore, NotFound, ScopeError
@@ -59,14 +59,16 @@ def _layout(args: argparse.Namespace | None = None):
 
 
 def _open(args: argparse.Namespace | None = None) -> MemoryStore:
-    return MemoryStore(Config.load(), _layout(args))
+    layout = _layout(args)
+    return MemoryStore(Config.load(workspace=layout.workspace_dir), layout)
 
 
 # ---------------------------------------------------------------- 命令
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    cfg, layout = Config.load(), _layout(args)
+    layout = _layout(args)
+    cfg = Config.load(workspace=layout.workspace_dir)
     ensure_rules(layout.global_rules)
     if layout.workspace_rules:
         ensure_rules(layout.workspace_rules)
@@ -113,10 +115,8 @@ def cmd_rules(args: argparse.Namespace) -> int:
 
 
 _KIND_LABEL = {
-    "knowledge": "知识",
-    "state": "现状",
-    "case": "案例",
-    "narrative": "经历",
+    "experience": "经验",
+    "episode": "经历",
     "log": "日志",
 }
 
@@ -128,16 +128,18 @@ def cmd_memory(args: argparse.Namespace) -> int:
             if not content and not sys.stdin.isatty():
                 content = sys.stdin.read().strip()
             if not content:
-                print("错误：需要提供内容（state 续命请用 review 子命令）", file=sys.stderr)
+                print("错误：需要提供内容", file=sys.stderr)
                 return 2
             item = store.write_memory(
                 content,
-                kind=args.kind or "knowledge",
+                kind=args.kind or "experience",
                 tags=args.tags,
                 importance=args.importance,
+                confidence=args.confidence,
                 scope=args.scope,
                 source=args.source,
                 invalidates=args.invalidates,
+                allow_duplicate=getattr(args, "allow_duplicate", False),
             )
             out: dict[str, Any] = {
                 "ok": True,
@@ -145,49 +147,38 @@ def cmd_memory(args: argparse.Namespace) -> int:
                 "item": item.to_dict(),
                 "embedded": item.embedded,
             }
+            if getattr(item, "deduped", False):
+                out["deduped"] = True
+                out["note"] = "与既有条目重复，未新建；已给它加活跃度。要覆盖请带 --invalidates"
             if args.invalidates:
                 out["invalidated"] = args.invalidates
             _dump(out)
             return 0
 
         if args.action == "list":
-            kinds = args.kind
-            if kinds in (None, "all"):
-                pick = None
-            else:
-                pick = [kinds]
-            if pick is None or set(pick) & {"knowledge", "state"}:
-                for item in store.list_knowledge(
-                    kinds=pick,
+            pick = None if args.kind in (None, "all") else args.kind
+            if pick in (None, "experience"):
+                for item in store.list_experience(
                     scope=args.scope,
                     include_invalid=args.include_invalid,
                     limit=args.limit,
                 ):
                     scope = "全局" if item.scope == "global" else "项目"
                     mark = "" if item.live else " [已失效]"
-                    label = "知识" if item.kind == "knowledge" else "现状"
                     tag = f" #{' #'.join(item.tags)}" if item.tags else ""
                     print(
-                        f"[{item.id}] ({scope}{label}){mark}"
+                        f"[{item.id}] ({scope}经验){mark}"
                         f" {_short(item.content, 66)}{tag}"
                     )
-            if pick is None or set(pick) & {"case", "narrative"}:
-                for ep in store.list_episodes(kinds=pick, limit=args.limit):
-                    label = "案例" if ep.is_case else "叙述"
-                    print(f"[{ep.id}] ({ep.day}·{label}) {_short(ep.content, 66)}")
+            if pick in (None, "episode"):
+                for ep in store.list_episodes(limit=args.limit):
+                    print(f"[{ep.id}] ({ep.day}·经历) {_short(ep.content, 66)}")
             return 0
 
         if args.action == "verify":
-            item = store.verify_state(args.id)
-            _dump({"ok": True, "item": item.to_dict()})
-            return 0
-
-        if args.action == "review":
-            # 不带 id 就是「列出该复核的现状」，带了 id 才是逐条处理
-            if not args.id:
-                _dump({"ok": True, "report": store.state_due()})
-                return 0
-            result = store.review_state(args.id, matched=not args.stale)
+            result = store.verify(
+                args.id, ok=not args.stale, level=args.level or "L1"
+            )
             _dump({"ok": True, "result": result})
             return 0
 
@@ -197,8 +188,11 @@ def cmd_memory(args: argparse.Namespace) -> int:
             return 0
 
         if args.action == "promote":
-            old, new_item = store.promote(args.id)
-            _dump({"ok": True, "promoted": new_item.to_dict(), "invalidated": old.to_dict()})
+            try:
+                store.promote(args.id)
+            except ValueError as exc:
+                print(f"错误：{exc}", file=sys.stderr)
+                return 2
             return 0
 
     return 2
@@ -232,6 +226,22 @@ def cmd_log(args: argparse.Namespace) -> int:
 
 def cmd_search(args: argparse.Namespace) -> int:
     with _open(args) as store:
+        if args.deep:
+            result = store.deep_recall(args.query, limit=args.limit)
+            hits = result["hits"]
+            if args.json:
+                _dump({"hits": [h.to_dict() for h in hits], "revived": result["revived"]})
+                return 0
+            if not hits:
+                print("（遗忘层里也没有相关记忆）")
+                return 0
+            print(f"遗忘层命中 {result['count']} 条：")
+            for rank, hit in enumerate(hits, 1):
+                kind = _KIND_LABEL.get(hit.item.kind, hit.item.kind)
+                rev = " ← 已复活" if hit.revived else ""
+                print(f"{rank:2d}. [{hit.item.id}] ({kind}·已遗忘) {_short(hit.item.content)}{rev}")
+            return 0
+
         if args.recall:
             hits = store.recall(args.query, limit=args.limit)
         else:
@@ -257,9 +267,6 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
                 print(f"日期 {preview['day']}：待复盘日志 {preview['log_count']} 条")
                 for log in preview["logs"]:
                     print(f"  [{log['id']}] {log['at_iso']} {_short(log['content'], 60)}")
-                existing = preview.get("existing_knowledge") or []
-                if existing:
-                    print(f"\n现有有效陈述 {len(existing)} 条（避免重复提取）")
                 print()
                 print(preview["instructions"])
                 return 0
@@ -277,7 +284,7 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
 
         result = store.consolidate_apply(
             day=args.day,
-            knowledge=payload.get("knowledge") or payload.get("facts"),
+            experience=payload.get("experience"),
             episodes=payload.get("episodes"),
             summary=payload.get("summary"),
             purge=not args.keep_raw,
@@ -307,14 +314,25 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    cfg = Config.load()
     layout = _layout(args)
-    checks: list[dict[str, Any]] = []
+    # 配置校验已通过 —— Config.load 不通过会直接抛错，走不到这里
+    cfg = Config.load(workspace=layout.workspace_dir)
+    checks: list[dict[str, Any]] = [
+        {
+            "check": "config",
+            "ok": True,
+            "detail": (
+                f"{len(cfg.layers)} 层生效（{' > '.join(n for n, _ in reversed(cfg.layers))}）"
+                f"，等级 {len(cfg.forget_levels)} 档（顶档 {cfg.max_level}）"
+            ),
+        }
+    ]
     report: dict[str, Any] = {
         "version": __version__,
         "python": sys.version.split()[0],
         "sqlite_lib": sqlite3.sqlite_version,
         "config": cfg.describe(),
+        "settings": cfg.describe_settings(),
         "layout": layout.describe(),
     }
 
@@ -324,7 +342,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         _dump({"error": str(exc), "all_ok": False})
         return 1
 
-    conn = store.global_conn
+    # 自检全部落在项目库上：全局库已关闭（§8.2），不再有第二个库可查
+    conn = store.workspace_conn
+    if conn is None:
+        _dump({"error": "当前目录没有 .ai_memory 工作区，doctor 需要项目库", "all_ok": False})
+        return 1
     try:
         vec_version = conn.execute("SELECT vec_version()").fetchone()[0]
         checks.append(
@@ -477,6 +499,25 @@ def cmd_lifecycle(args: argparse.Namespace) -> int:
             _dump(store.unarchive(args.id))
             return 0
 
+        if args.action == "judge":
+            report = store.judge_due(
+                scope=args.scope, dry_run=args.dry_run, now=args.now
+            )
+            if args.json:
+                _dump(report)
+                return 0
+            if report["due"] == 0:
+                print("（没有到期的裁定项，一个字节都没写）")
+                return 0
+            head = "预览" if report["dry_run"] else "已裁定"
+            print(f"{head} {report['due']} 条：")
+            for it in report["items"]:
+                arrow = {"up": "↑", "down": "↓", "hold": "="}.get(it["action"], "?")
+                print(f"  {arrow} [{it['id']}] {it['kind']} {it['from']}→{it['to']}  {it['reason']}")
+            if not report["dry_run"]:
+                print(f"\n落盘 {report['settled']} 条，活跃度已清零、周期起点推到现在。")
+            return 0
+
         if args.action == "candidates":
             items = store.purge_candidates(after_days=args.days)
             if args.json:
@@ -487,7 +528,16 @@ def cmd_lifecycle(args: argparse.Namespace) -> int:
                 return 0
             print(f"删除候选 {len(items)} 条（仅报告，未删除）：")
             for it in items:
-                print(f"  [{it['type']}] {it['id']} 已归档 {it['idle_days']} 天 · 访问 {it['access_count']} 次")
+                if it["reason"] == "archived":
+                    print(
+                        f"  [{it['type']}] {it['id']} 归档 {it['idle_days']} 天"
+                        f" · 访问 {it['access_count']} 次"
+                    )
+                else:
+                    print(
+                        f"  [{it['type']}] {it['id']} 遗忘层 {it['idle_days']} 天"
+                        f" · 深度命中 {it['revive_hits']} 次"
+                    )
                 print(f"       {it['content']}")
             return 0
 
@@ -499,49 +549,29 @@ def cmd_lifecycle(args: argparse.Namespace) -> int:
             return 0
 
         if args.action == "compress":
-            preview = store.compress_candidates()
+            queue = store.compression_queue()
             if args.json:
-                _dump(preview)
+                _dump(queue)
                 return 0
-            if not preview["groups"]:
-                print("（没有可压缩的经历）")
+            if not queue["items"]:
+                print("（队列为空：没有压得不够深的经历）")
                 return 0
-            print(f"可压缩 {preview['total']} 组：")
-            for g in preview["groups"]:
-                print(f"  {g['day']}  {g['count']} 条（已归档 {g['archived']}）")
-                for p in g["preview"]:
-                    print(f"     - {p}")
-            print(f"\n{preview['note']}")
-            return 0
-
-        if args.action == "recompress":
-            preview = store.recompress_preview()
-            if args.json:
-                _dump(preview)
-                return 0
-            if not preview["groups"]:
-                print("（没有需要进一步压缩的经历）")
-                return 0
-            print(f"需要压缩 {preview['total']} 条：")
-            for g in preview["groups"]:
-                print(f"  → level {g['target_level']}（基准 {g['base_days']:.0f} 天）共 {g['count']} 条")
-                for it in g["items"][:5]:
-                    print(f"     [{it['id']}] level={it['current_level']} {it['age_days']}天  {it['content'][:40]}")
-            print(f"\n{preview['note']}")
-            return 0
-
-        if args.action == "recompress-apply":
-            payload = {}
-            if args.file:
-                payload = json.loads(Path(args.file).read_text(encoding="utf-8"))
-            _dump(store.recompress_apply(payload.get("items", []), level=int(payload.get("level", 1))))
+            print(f"待压缩 {queue['total']} 条（按目标级别：{queue['by_target']}）：")
+            for it in queue["items"]:
+                print(
+                    f"  [{it['id']}] L{it['forget_level']} "
+                    f"压缩 {it['current_level']}→{it['target_level']}  "
+                    f"{it['length']} 字  {it['content'][:34]}"
+                )
+            print(f"\n{queue['note']}")
             return 0
 
         if args.action == "compress-apply":
             payload = {}
             if args.file:
                 payload = json.loads(Path(args.file).read_text(encoding="utf-8"))
-            _dump(store.compress_apply(payload.get("ids", []), payload.get("summary", "")))
+            items = payload.get("items", []) if isinstance(payload, dict) else payload
+            _dump(store.compression_apply(items))
             return 0
 
     return 2
@@ -580,6 +610,119 @@ def cmd_starmap(args: argparse.Namespace) -> int:
     return run(args)
 
 
+def cmd_upgrade(args: argparse.Namespace) -> int:
+    """离线升级历史库。CLI 专用，不注册 MCP tool（§8.4 边界 1）。"""
+    from .upgrade import UpgradeError, run
+
+    try:
+        if getattr(args, "in_place", False):
+            # 就地升级是叠加在转换器之上的一层：转换仍只读，只有校验全过才换文件
+            from .upgrade.inplace import run_inplace
+
+            report = run_inplace(args.path)
+        else:
+            report = run(args.path, args.out)
+    except UpgradeError as exc:
+        print(f"升级失败：{exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        _dump(report)
+    else:
+        _print_upgrade(report)
+    return 0 if report.get("ok") else 1
+
+
+def _print_upgrade(report: dict[str, Any]) -> None:
+    print(f"源库：{report['source']}")
+    print(f"版本：v{report.get('source_version')} → v{report.get('target_version', '?')}")
+
+    if report.get("noop"):
+        print(f"\n· {report.get('reason')}")
+        return
+
+    chain = report.get("chain") or []
+    if chain:
+        print(f"路径：{' → '.join(chain)}")
+
+    plans = report.get("plans") or ([{"plan": report.get("plan")}] if report.get("plan") else [])
+    for step in plans:
+        plan = step.get("plan") or {}
+        if step.get("from") is not None:
+            print(f"\n· v{step['from']} → v{step['to']} 计划迁移：")
+        counts = plan.get("counts") or {}
+        for table, n in counts.items():
+            print(f"  {table:<12} {n:>5} 条")
+        if plan.get("target_counts"):
+            print(
+                "  目标条数："
+                + ", ".join(f"{k}={v}" for k, v in plan["target_counts"].items())
+            )
+        if plan.get("by_kind"):
+            print("  按旧 kind：" + ", ".join(f"{k}={v}" for k, v in plan["by_kind"].items()))
+        if plan.get("level_plan"):
+            print("  遗忘等级：" + ", ".join(f"{k}={v}" for k, v in plan["level_plan"].items()))
+        if plan.get("confidence_plan"):
+            print(
+                "  可信度："
+                + ", ".join(f"{k}={v}" for k, v in plan["confidence_plan"].items())
+            )
+        if plan.get("vectors"):
+            print(
+                "  向量："
+                + ", ".join(
+                    f"{k}={v}"
+                    + (f"(dim {plan['vec_dims'].get(k)})" if plan.get("vec_dims", {}).get(k) else "")
+                    for k, v in plan["vectors"].items()
+                )
+            )
+
+    if report.get("dry_run"):
+        print(f"\n{report.get('next')}")
+        return
+
+    if not report.get("ok"):
+        print(f"\n✗ {report.get('reason', '未完成')}")
+        return
+
+    written = report.get("written") or {}
+    if not report.get("in_place"):
+        # 就地模式下产物就是源库本身，单列一行"产物"会让人以为写出了第二个文件
+        print(f"\n产物：{report['out']}")
+    else:
+        print()
+    for table in ("knowledge", "episodes", "logs", "digests", "memory_events"):
+        info = written.get(table) or {}
+        if not info:
+            continue
+        extra = f"，跳过 {len(info['skipped'])}" if info.get("skipped") else ""
+        if info.get("moved_to_experience"):
+            extra += f"，其中 {info['moved_to_experience']} 条 case 搬入经验"
+        print(
+            f"  {table:<13} 写入 {info.get('written', 0)}/{info.get('read', 0)}{extra}"
+        )
+    if written.get("vectors"):
+        print("  向量写入：" + ", ".join(f"{k}={v}" for k, v in written["vectors"].items()))
+
+    checks = report.get("checks") or {}
+    print("\n校验：")
+    per_step = checks.get("per_step")
+    if per_step and len(per_step) > 1:
+        print(f"  逐段通过     {per_step}")
+    print(f"  条数对齐     {'✓' if checks.get('counts_ok') else '✗'}")
+    print(f"  时间戳未漂移 {'✓' if checks.get('timestamps_ok') else '✗'}")
+    print(f"  向量可搜     {'✓' if (checks.get('vectors') or {}).get('ok') else '✗'}")
+    for note in checks.get("notes") or []:
+        print(f"  · {note}")
+    if report.get("ok") and report.get("swapped"):
+        print(f"\n全部通过，已就地升级：{report['source']}")
+        print(f"原件留档：{report['archived']}（要回退就把它改回原名）")
+    elif report.get("ok"):
+        print("\n全部通过。源库原样保留，确认无误后自行替换：")
+        print(f'  mcp 指向的文件 → "{report["out"]}"')
+
+
+
 # ---------------------------------------------------------------- 入口
 
 
@@ -602,29 +745,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_rules.add_argument("--show", action="store_true", help="打印渲染后的完整信条")
     p_rules.set_defaults(func=cmd_rules)
 
-    p_mem = sub.add_parser("memory", help="知识 / 现状 / 案例 / 叙述 操作")
+    p_mem = sub.add_parser("memory", help="经验 / 经历 操作")
     p_mem.add_argument(
-        "action", choices=["add", "list", "verify", "review", "invalidate", "promote"]
+        "action", choices=["add", "list", "verify", "invalidate", "promote"],
+        # promote 已下线（§8.2），保留这个动作只为给出明确报错而不是「未知命令」
     )
     p_mem.add_argument("text", nargs="?", default=None, help="add 时的内容")
     p_mem.add_argument(
         "--kind",
         default=None,
-        choices=["knowledge", "state", "case", "narrative", "all"],
-        help="add 时的类型（默认 knowledge）；list 时不传即全部",
+        choices=["experience", "episode", "all"],
+        help="add 时的类型（默认 experience）；list 时不传即两类都列",
     )
     p_mem.add_argument("--tags", nargs="*", default=None)
     p_mem.add_argument("--importance", type=float, default=None)
+    p_mem.add_argument(
+        "--confidence", type=float, default=None,
+        help="add 写经验时的初始可信度（0~1）；易变的结论给低值",
+    )
     p_mem.add_argument("--scope", default="workspace", choices=["all", "workspace", "global"])
-    p_mem.add_argument("--source", default=None, help="来源；写 state 时建议给")
+    p_mem.add_argument("--source", default=None, help="来源，写经验时建议给")
     p_mem.add_argument("--invalidates", default=None, help="add 时指定被取代的旧 id")
+    p_mem.add_argument(
+        "--allow-duplicate",
+        action="store_true",
+        help="add 写经验时跳过查重：措辞相似但确实是另一条结论才用",
+    )
     p_mem.add_argument("--include-invalid", action="store_true")
     p_mem.add_argument("--limit", type=int, default=30)
-    p_mem.add_argument("--id", default=None, help="verify/review/invalidate/promote 的目标 id")
+    p_mem.add_argument("--id", default=None, help="verify/invalidate/promote 的目标 id")
     p_mem.add_argument(
         "--stale",
         action="store_true",
-        help="review 时表示「现状已不符」：直接删除该条目；不传表示仍成立，续命并升档",
+        help="verify 时表示「这条已经不成立了」：按同一条幂律扣分；不传表示证实，按间隔加分",
+    )
+    p_mem.add_argument(
+        "--level", default="L1", choices=["L1", "L2", "L3"],
+        help="verify 的证据级别：L1 可观测动作 / L2 复盘判定 / L3 听说（恒 0 分）",
     )
     p_mem.add_argument("--by", default=None)
     p_mem.set_defaults(func=cmd_memory)
@@ -644,6 +801,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--limit", type=int, default=8)
     p_search.add_argument("--recall", action="store_true", help="召回并强化命中项")
     p_search.add_argument("--history", action="store_true", help="包含已失效条目")
+    p_search.add_argument(
+        "--deep", action="store_true",
+        help="深度回忆：只翻遗忘层（0 级），命中的经历会累计复活次数",
+    )
     p_search.add_argument("--json", action="store_true")
     p_search.set_defaults(func=cmd_search)
 
@@ -675,15 +836,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_life.add_argument(
         "action",
         choices=[
-            "archive", "unarchive", "candidates", "purge",
-            "compress", "compress-apply", "recompress", "recompress-apply",
+            "judge", "archive", "unarchive", "candidates", "purge",
+            "compress", "compress-apply",
         ],
     )
     p_life.add_argument("ids", nargs="*", default=None, help="purge 时的 id 列表")
     p_life.add_argument("--id", default=None, help="unarchive 的目标 id")
     p_life.add_argument("--dry-run", action="store_true", help="archive 时只预览")
     p_life.add_argument("--days", type=float, default=None, help="candidates 的静默天数")
-    p_life.add_argument("--file", default=None, help="compress-apply 读取的 JSON")
+    p_life.add_argument(
+        "--now", type=int, default=None, help="judge 的判定时刻（毫秒），补算或复现用"
+    )
+    p_life.add_argument(
+        "--scope", default="all", choices=["all", "workspace", "global"],
+        help="judge 的作用范围（默认两个库都跑）",
+    )
+    p_life.add_argument("--file", default=None, help="compress-apply 读取的 JSON：[{id,content,level?}]")
     p_life.add_argument("--json", action="store_true")
     p_life.set_defaults(func=cmd_lifecycle)
 
@@ -706,6 +874,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_star.add_argument("--max-nodes", type=int, default=400, help="全对相似度计算的节点上限")
     p_star.set_defaults(func=cmd_starmap)
 
+    p_up = sub.add_parser(
+        "upgrade",
+        help="升级历史记忆库（离线；--out 只产出、--in-place 就地换库；不对 AI 开放）",
+    )
+    p_up.add_argument("path", help="旧库路径，或 .ai_memory / 项目根目录")
+    mode = p_up.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--out",
+        default=None,
+        help="新库输出路径（不提供默认值：不给就只预览，不产出任何文件）",
+    )
+    mode.add_argument(
+        "--in-place",
+        dest="in_place",
+        action="store_true",
+        help="就地升级：产出 → 校验 → 原件留档 → 替换，一步完成（拖拽 bat 用这条）",
+    )
+    p_up.add_argument("--json", action="store_true", help="输出完整 JSON 报告")
+    p_up.set_defaults(func=cmd_upgrade)
+
     sub.add_parser("serve", help="以 stdio 启动 MCP server").set_defaults(func=cmd_serve)
 
     return parser
@@ -716,6 +904,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return int(args.func(args) or 0)
+    except ConfigError as exc:
+        # 配置写错要早失败：退出码 2 与「运行期错误 1」分开，脚本能区分
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return 2
+    except SchemaVersionError as exc:
+        # 库版本不符是「需要人拿扳手」的状态，用独立退出码，避免被当成普通崩溃
+        print(f"库版本不符，已拒绝服务（未修改任何文件）：\n{exc}", file=sys.stderr)
+        return 3
     except (NotFound, ScopeError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1

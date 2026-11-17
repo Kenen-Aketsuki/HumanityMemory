@@ -3,23 +3,24 @@
 对外提供两种形态：
 - MCP server：`python -m humanity_memory.mcp_server`
 - CLI：`humanity-memory <command>`
+
+记忆只有两类：经验（Experience）与经历（Episode）。
 """
 
 from __future__ import annotations
 
 from .config import Config
-from .models import Episode, Fact, Hit, Knowledge, LogEntry
+from .models import Episode, Experience, Hit, LogEntry
 from .paths import Layout, resolve_layout
 from .store import MemoryStore, NotFound, ScopeError
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "Config",
     "Episode",
-    "Fact",
+    "Experience",
     "Hit",
-    "Knowledge",
     "Layout",
     "LogEntry",
     "MemoryStore",

@@ -35,7 +35,7 @@ VEC_TABLES = {
     "episodes": "episodes_vec",
     "logs": "logs_vec",
 }
-KIND_ORDER = ("knowledge", "state", "case", "narrative", "log", "digest")
+KIND_ORDER = ("experience", "episode", "log", "digest")
 
 
 class StarmapError(RuntimeError):
@@ -79,7 +79,7 @@ def _describe_dir(parent: Path, db_path: Path) -> tuple[list[dict[str, Any]], li
 
 
 def resolve_db(target: str | Path) -> tuple[Path, list[str]]:
-    """把拖进来的路径解析成一个 v3 库文件。
+    """把拖进来的路径解析成一个 v5 库文件。
 
     接受三种：``.ai_memory`` 目录 / 项目根目录 / 直接的 ``.db`` 文件。
     绝不新建目录或文件。
@@ -91,7 +91,7 @@ def resolve_db(target: str | Path) -> tuple[Path, list[str]]:
 
     if raw.is_file():
         if ".v2-" in raw.name:
-            raise StarmapError("这是 v2 留档库（facts 表），星图只支持 v3 的 workspace.db")
+            raise StarmapError("这是 v2 留档库（facts 表），星图只支持 v5 的 workspace.db")
         if raw.suffix.lower() != ".db":
             raise StarmapError(f"拖入的是文件但不是 .db：{raw.name}")
         db = raw
@@ -122,24 +122,21 @@ def resolve_db(target: str | Path) -> tuple[Path, list[str]]:
 
 
 def _load_vec(conn: sqlite3.Connection) -> str:
-    """加载 sqlite-vec，只读连接上注册函数，不写库。"""
+    """加载 sqlite-vec，只读连接上注册函数，不写库。
+
+    扩展从 `sqlite_vec` 包内取 —— 源码态与冻结态同一条路，不必猜项目目录。
+    """
     conn.enable_load_extension(True)
     errors: list[str] = []
     try:
         try:
             import sqlite_vec
 
-            sqlite_vec.load(conn)
-            return "pip:sqlite-vec"
+            path = sqlite_vec.loadable_path()
+            conn.load_extension(path)
+            return f"pip:sqlite-vec ({path})"
         except Exception as exc:  # noqa: BLE001
             errors.append(f"pip: {exc}")
-        here = Path(__file__).resolve().parents[2] / "tools" / "bin" / "vec0.dll"
-        if here.is_file():
-            try:
-                conn.load_extension(str(here))
-                return "file:vec0.dll"
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"dll: {exc}")
         raise StarmapError("无法加载 sqlite-vec 扩展：" + " | ".join(errors))
     finally:
         try:
@@ -160,8 +157,8 @@ def inspect_schema(conn: sqlite3.Connection) -> dict[str, Any]:
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if "knowledge" not in tables:
         if "facts" in tables:
-            raise StarmapError("这是 v2 schema（facts 表）。星图只支持 v3（knowledge / episodes / logs）")
-        raise StarmapError("库里没有 knowledge 表，不是有效的 v3 记忆库")
+            raise StarmapError("这是 v2 schema（facts 表）。星图只支持 v4（knowledge / episodes / logs）")
+        raise StarmapError("库里没有 knowledge 表，不是有效的 v4 记忆库")
     meta: dict[str, str] = {}
     if "meta" in tables:
         meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
@@ -182,6 +179,9 @@ def _day_of(ms: int | None) -> str:
     if not ms:
         return ""
     return _dt.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d")
+
+
+_TABLE_KIND = {"knowledge": "experience", "episodes": "episode", "logs": "log"}
 
 
 def read_nodes(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -207,7 +207,7 @@ def read_nodes(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                 {
                     "id": r["id"],
                     "table": table,
-                    "kind": g("kind", "log") if table != "logs" else "log",
+                    "kind": _TABLE_KIND[table],
                     "rowid": r["rowid"],
                     "content": (r["content"] or "")[:800],
                     "tags": [str(t) for t in tags][:12],
@@ -417,7 +417,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
 <style>
 :root{
   --bg:#070b14; --panel:#0d1422; --line:#243044; --text:#d8e2f2; --muted:#8292ab;
-  --knowledge:#6fb6ff; --state:#ffc46b; --case:#ff8f8f; --narrative:#b9a5ff;
+  --experience:#6fb6ff; --episode:#b9a5ff;
   --log:#8898ad; --digest:#ffe08a;
 }
 *{box-sizing:border-box}
@@ -434,12 +434,12 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
 .kv span:first-child{color:var(--muted);flex:0 0 auto}
 .kv span:last-child{text-align:right;word-break:break-all}
 label.row{display:flex;align-items:center;gap:8px;margin:5px 0;cursor:pointer;font-size:12px}
-input[type=range]{width:100%;accent-color:var(--knowledge)}
+input[type=range]{width:100%;accent-color:var(--experience)}
 input[type=text]{width:100%;background:#0a101c;color:var(--text);border:1px solid var(--line);
   border-radius:6px;padding:6px 8px;font:inherit;font-size:12px}
 button{background:#16223a;color:var(--text);border:1px solid var(--line);border-radius:6px;
   padding:6px 10px;cursor:pointer;font:inherit;font-size:12px;margin:4px 4px 0 0}
-button:hover{border-color:var(--knowledge)}
+button:hover{border-color:var(--experience)}
 .dot{width:9px;height:9px;border-radius:50%;display:inline-block;flex:0 0 9px}
 #main{flex:1;position:relative;min-width:0}
 canvas{display:block;width:100%;height:100%;cursor:grab}
@@ -494,20 +494,20 @@ canvas.drag{cursor:grabbing}
 <script>
 /*__DATA__*/
 (function(){
-const C={knowledge:'#6fb6ff',state:'#ffc46b',case:'#ff8f8f',narrative:'#b9a5ff',log:'#8898ad',digest:'#ffe08a'};
-const L={knowledge:'知识',state:'现状',case:'案例',narrative:'叙述',log:'日志',digest:'复盘'};
+const C={experience:'#6fb6ff',episode:'#b9a5ff',log:'#8898ad',digest:'#ffe08a'};
+const L={experience:'经验',episode:'经历',log:'日志',digest:'复盘'};
 const ET={semantic:'语义近邻',invalidates:'失效链',digest:'复盘溯源',tag:'标签共现'};
 const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
 const tip=document.getElementById('tip');
 let W=0,H=0,DPR=1,view={x:0,y:0,k:1};
 let alpha=1,frame=0,hover=null,selected=null,dragging=null,panning=null,fixedHover=true,downX=0,downY=0;
 const enabled={semantic:true,invalidates:true,digest:true,tag:false};
-const kinds={knowledge:true,state:true,case:true,narrative:true,log:true,digest:true};
+const kinds={experience:true,episode:true,log:true,digest:true};
 let minScore=DATA.meta.min_score;
 let showLabels=document.getElementById('labels').checked;
 
 function rnd(i){const x=Math.sin(i*127.1+311.7)*43758.5453;return x-Math.floor(x);}
-const centers={knowledge:[-.42,-.30],state:[.42,-.30],case:[-.38,.28],narrative:[.38,.28],log:[0,.02],digest:[0,0]};
+const centers={experience:[-.42,-.18],episode:[.42,-.18],log:[0,.22],digest:[0,0]};
 const nodes=DATA.nodes.map((n,i)=>{
   const c=centers[n.kind]||[0,0];
   return Object.assign({},n,{

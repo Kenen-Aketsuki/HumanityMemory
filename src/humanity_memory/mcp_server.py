@@ -31,18 +31,16 @@ from .token import Token, TokenError, resolve_token_path
 
 INSTRUCTIONS_TAIL = """\
 记忆使用纪律：
-存放纪律（先想 kind，再落笔）：
-- knowledge 知识：换个单号/任务 ID 仍然成立的机制与约定，能指出代码落点。
-- state 现状：当前为真但会变的东西（版本、依赖、路径、资源配置），200 字内，给 source。
-  写进来只是「登记」，之后靠复核续命：用 memory_review 看一眼，仍成立就 matched=true
-  升档续命，不成立就 matched=false 当场删掉。**不要用 invalidates 换代**。
-- case 案例：一次具体事件的「现象 → 根因 → 落点」，≤300 字，一个问题一条。
-  带单号的排查结论放这里 —— 它换个单号就不成立，不是知识。
-- narrative 叙述：当天过程、试错与判断转折。
-- 日志（log）是当天的原始记录，只追加、不改写。白天先写日志，复盘时再压缩。
-- state 不会因为被检索到就续命：复核周期是 1→3→5→7 天渐进，到期后再给一个
-  不超过 5 天的宽限，宽限过了归档扫描才把它收走。memory_stats 里的 state_review
-  就是「有几条欠复核」，一直涨说明该用 memory_review_list 处理了。
+存放纪律（只有一个判据：**它是否需要回答「什么时候发生的」**）：
+- 经验（experience）：可复用的判定与结论 —— 机制、约定、坑、根因，换个单号仍然成立。
+  上限 500 字。易变的结论（版本、依赖、路径、当前方案）给低 confidence（0.3），
+  稳定的机制给高一点；之后能否被信任，由 memory_verify 的证据说话，不由你决定分。
+- 经历（episode）：发生过的事，一条一个单一事务。「今天吃饭」「今天洗澡」是两条，
+  不是「今天做了一些事」一条。需要时间戳，可以写长 —— 它会随遗忘等级自己压缩。
+  带单号的排查过程写这里；其中**可复用的结论**另写一条经验。
+- 日志（log）是当天的原始记录，只追加、不改写。白天先写日志，复盘时再总结。
+- 没有第三种类型。旧词 knowledge / state / case / narrative 已废弃：
+  「现状」不再单独成类 —— 它只是「一条容易变、初始可信度低的经验」。
 - 复盘时先用 consolidate_preview 取素材，总结后用 consolidate_apply 提交。
 - 一个 server 可以服务多个项目：如果在某个具体项目里工作，而 memory_stats 显示的工作区
   不是你预期的那个，先调用 memory_use_workspace 传入项目根目录再继续。
@@ -56,7 +54,7 @@ def _ok(**payload: Any) -> dict[str, Any]:
 
 
 def _as_list(kinds: list[str] | str | None) -> list[str]:
-    """kinds 允许 None / "all" / "knowledge" / ["knowledge","case"] 混着传。"""
+    """kinds 允许 None / "all" / "experience" / ["experience","episode"] 混着传。"""
     if kinds is None:
         return []
     if isinstance(kinds, str):
@@ -69,8 +67,10 @@ def _err(message: str) -> dict[str, Any]:
 
 
 def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> MCPServer:
-    cfg = cfg or Config.load()
+    # 先定布局再装配置：项目级 memory.toml 挂在 .ai_memory/ 下，
+    # 反过来就永远读不到项目覆盖。
     layout = layout or resolve_layout()
+    cfg = cfg or Config.load(workspace=layout.workspace_dir)
 
     ensure_rules(layout.global_rules)
     if layout.workspace_rules is not None:
@@ -162,8 +162,8 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
     @app.tool(
         name="memory_write",
         description=(
-            "唯一的写入口，按 kind 分派：knowledge（知识）/ state（现状）/ case（案例）"
-            "/ narrative（叙述）。名字不精确就是灾难——先看 kind 怎么选。"
+            "唯一的写入口，按 kind 分派：experience（经验）/ episode（经历）。"
+            "判据只有一条 —— 它是否需要回答「什么时候发生的」。"
         ),
     )
     def memory_write(
@@ -171,32 +171,35 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         content: str = "",
         tags: list[str] | None = None,
         importance: float | None = None,
+        confidence: float | None = None,
         scope: str = "workspace",
         invalidates: str | None = None,
-        verifies: str | None = None,
         source: str | None = None,
         day: str | None = None,
+        allow_duplicate: bool = False,
     ) -> dict[str, Any]:
         """
         Args:
             kind:
-                knowledge — 知识。**换个单号/任务 ID/资源名仍然成立**，能指出代码落点。
-                    机制、约定、坑。上限 500 字。
-                state — 现状。当前为真但会随版本变化（版本号、依赖、路径、资源配置）。
-                    上限 200 字，给 source。写进来只是「登记」，之后靠 memory_review
-                    定期复核：仍成立就续命，不成立就当场删掉。**不要用 invalidates 换代**。
-                case — 案例。一次具体事件压成「现象 → 根因 → 落点」，上限 300 字，
-                    一个问题一条。带单号的排查结论放这里，不要放 knowledge。
-                narrative — 叙述。当天过程、试错、判断转折，可长。
-            content: 正文。**空 content 只允许 kind=state 且带 verifies**（纯确认）。
+                experience — 经验。可复用的判定与结论（机制、约定、坑、根因），
+                    **换个单号/任务 ID/资源名仍然成立**，能指出代码落点。上限 500 字。
+                    易变的结论给低 confidence，稳定的机制给高一点。
+                episode — 经历。发生过的事，一条一个单一事务，带发生时间，可长。
+                    带单号的排查过程放这里；其中可复用的结论另写一条经验。
+            content: 正文。
             tags: 标签，用于过滤。
-            importance: 0~1。默认 knowledge 0.8 / state 0.85 / case 0.75 / narrative 0.4。
-            scope: workspace（项目）| global（跨项目，仅陈述类支持且数量要很少）。
-            invalidates: 被这条取代的旧条目 id，**仅 knowledge 可用**。
-                state 不接受它 —— 现状更替一律走 memory_review(matched=false) 删旧再另写。
-            verifies: 确认某条 state 仍然成立并续命（等同 memory_review(matched=true)）。
-            source: 来源标识；写 state 时写清「凭什么认为它是这样」。
-            day: 仅 case / narrative 用，默认今天。
+            importance: 0~1。决定初始遗忘等级（默认经验 0.8 / 经历 0.4）。
+            confidence: 0~1，仅经验有效：**初次写下时你有多确信**。
+                易变的现状 0.3、一般结论 0.5~0.6、机制性结论 0.8。之后一律由
+                memory_verify 按证据调整 —— 这里给的是起点，不是评价。
+            scope: workspace（默认）。global 已关闭（§8.2），传了会明确报错。
+            invalidates: 被这条取代的旧条目 id（仅经验）。旧条置失效、正文保留。
+                带了这个参数就不查重 —— 取代品本来就该和被取代者相似。
+            source: 来源标识；写经验时写清「凭什么认为它是这样」。
+            day: 仅经历用，默认今天。
+            allow_duplicate: 强制写入，跳过查重。只在「我确认这是一条独立的结论，
+                虽然措辞相似但说的是另一件事」时才用；被查重拦下后想覆盖，
+                请改用 invalidates。
         """
         try:
             item = _st().write_memory(
@@ -204,66 +207,77 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
                 kind=kind,
                 tags=tags,
                 importance=importance,
+                confidence=confidence,
                 scope=scope,
                 invalidates=invalidates,
-                verifies=verifies,
                 source=source,
                 day=day,
+                allow_duplicate=allow_duplicate,
             )
         except (ScopeError, ValueError, NotFound) as exc:
             return _err(str(exc))
         except Exception as exc:  # noqa: BLE001
             return _err(f"写入失败：{type(exc).__name__}: {exc}")
-        return _ok(item=item.to_dict(), kind=item.kind, embedded=item.embedded)
+        payload: dict[str, Any] = {
+            "item": item.to_dict(),
+            "kind": item.kind,
+            "embedded": item.embedded,
+        }
+        if getattr(item, "deduped", False):
+            # 这一条没新建：返回的就是库里已有的那条，活跃度已加过
+            payload["deduped"] = True
+            payload["note"] = (
+                f"与 {item.id} 高度重复，未新建；已给该条加活跃度、原样返回。"
+                " 若确实是新结论要取代它，请带 invalidates 重写。"
+            )
+        return _ok(**payload)
 
     @app.tool(
-        name="memory_review",
-        description="复核一条现状：仍成立就续命并升档，已经不成立就当场物理删除。",
+        name="memory_verify",
+        description="给一条经验落一条证据：ok=true 按间隔加分，ok=false 按同一条幂律扣分。"
+        "level 决定证据权重：L1/L2 计分，L3 只留痕。",
     )
-    def memory_review(item_id: str, matched: bool = True) -> dict[str, Any]:
-        """现状（state）唯一的生命周期入口 —— 它取代了「写新条目覆盖旧条目」。
+    def memory_verify(
+        item_id: str,
+        ok: bool = True,
+        level: str = "L1",
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """唯一的逐条核验入口。
 
-        现状不是靠被读到续命的，也不该靠访问次数留人：它只有一条命，到点了有人来看一眼。
-        看一眼还在，续一段；发现不对，当场删掉。
+        可信度不是「AI 觉得它对不对」，而是「有没有证据」。加多少分由**间隔**决定 ——
+        隔了半年再看一眼它还是对的，比昨天刚验过今天又验一次，信息量大得多。
 
         Args:
-            item_id: 要复核的现状 id（s_ 开头）。
-            matched:
-                true  — 描述仍然成立：刷新确认时间，复核周期升一档（1→3→5→7 天）。
-                false — 描述已经不成立：**直接物理删除**，不留历史、不留失效链。
-                        要记录新的现状，请另写一条，不要试图覆盖。
+            item_id: 要核验的经验 id。经历不行 —— 经历的可信度是遗忘等级的派生值。
+            ok:
+                true  — 核对过现实，结论为真：按间隔加分，封顶 1.0。
+                false — 现实或上下文已经与之矛盾：按同一条幂律扣分，封底 0。
+                        **不删除条目**：被推翻本身是知识，它会带着低分留下来，
+                        被后续检索标上 needs_verify，提醒读的人先核一眼。
+            level: 证据级别。
+                L1 可观测动作 / 工具调用记录 / 明确执行痕迹 → 全权计分
+                L2 复盘模型判定当日确实执行了该流程 → 半权
+                L3 仅文本共现（「忘了跑 memory_stats」这类提到）→ 0 分，只记一行事件
+            reason: 这次证据是什么，一句话。写进审计事件，三个月后靠它回答
+                「这条凭什么 0.9」。不填也放行，但那条事件的 reason 会是空的。
 
-        不确定时，先把条目正文和实际现状（版本文件、依赖清单、配置）比对一遍再决定。
+        返回新可信度 `to`、本次变化 `delta`、以及是否需要在被读到时提示核验。
         """
         try:
             with state_lock:
-                return _ok(result=_st().review_state(item_id, matched=matched))
+                return _ok(result=_st().verify(item_id, ok=ok, level=level, reason=reason))
         except (NotFound, ValueError, ScopeError) as exc:
             return _err(str(exc))
         except Exception as exc:  # noqa: BLE001
-            return _err(f"复核失败：{type(exc).__name__}: {exc}")
-
-    @app.tool(
-        name="memory_review_list",
-        description="列出到了复核时间的现状：due 还在宽限期内，overdue 即将被归档扫描收走。",
-    )
-    def memory_review_list() -> dict[str, Any]:
-        """到期清单 —— 让「7 天」从一个数字变成真的会发生的事。
-
-        返回按 overdue 优先排序。每条给出 id、正文、当前周期、到期与失效时刻、来源，
-        照着逐条 memory_review 即可。开会话时、复盘前都值得扫一眼。
-        """
-        try:
-            return _ok(report=_st().state_due())
-        except Exception as exc:  # noqa: BLE001
-            return _err(f"查询失败：{type(exc).__name__}: {exc}")
+            return _err(f"核验失败：{type(exc).__name__}: {exc}")
 
     @app.tool(
         name="memory_invalidate",
-        description="让一条 knowledge 失效（不删除，保留历史）。现状不接受这个操作。",
+        description="让一条经验失效（不删除，保留历史）。被更好的结论取代时用它。",
     )
     def memory_invalidate(item_id: str, invalidated_by: str | None = None) -> dict[str, Any]:
-        """知识过时但暂无替代时用它。**state 会被拒绝** —— 现状要么真、要么删。"""
+        """经验过时但暂无替代时用它：置 invalid_at，正文不动，默认检索跳过。"""
         try:
             item = _st().invalidate(item_id, invalidated_by=invalidated_by)
         except (NotFound, ValueError) as exc:
@@ -272,20 +286,19 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
 
     @app.tool(
         name="memory_promote",
-        description="把项目条目提升为全局条目（跨项目可用）。旧条目标记失效并指向新条目。",
+        description="已下线（§8.2）：全局库已关闭，没有可提升的去处。调用会明确报错。",
     )
     def memory_promote(item_id: str) -> dict[str, Any]:
+        """保留这个工具壳子只为给出清楚的答复，不做任何写入。
+
+        直接删掉会让调用方看到一个「工具不存在」的模糊错误，而这条约束
+        （跨项目共享怎么走）恰恰需要被说清楚。
+        """
         try:
-            old, new = _st().promote(item_id)
+            _st().promote(item_id)
         except (NotFound, ValueError, ScopeError) as exc:
             return _err(str(exc))
-        stats = _st().stats()
-        return _ok(
-            promoted=new.to_dict(),
-            invalidated=old.to_dict(),
-            global_knowledge=stats.get("global_knowledge"),
-            warning=stats.get("hint"),
-        )
+        return _err("memory_promote 已下线（§8.2）")
 
     @app.tool(name="memory_list", description="列出条目，默认只列有效的。kinds 不传即全部。")
     def memory_list(
@@ -296,30 +309,27 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
     ) -> dict[str, Any]:
         """
         Args:
-            kinds: all | knowledge | state | case | narrative | log 的子集。
-            scope: all | workspace | global
+            kinds: all | experience | episode | log 的子集。
+            scope: 只有项目库了，这个参数保留是为了兼容调用方；传 global 会报错。
         """
         try:
-            picked = {_norm_kind(k) for k in _as_list(kinds)}
-            want_all = not picked or "all" in picked
+            raw = [k.strip().lower() for k in _as_list(kinds) if k.strip()]
+            want_all = not raw or "all" in raw
+            picked = set() if want_all else {_norm_kind(k, writable=False) for k in raw}
             items: list[dict[str, Any]] = []
-            if want_all or picked & {"knowledge", "state"}:
+            if want_all or "experience" in picked:
                 items += [
                     k.to_dict()
-                    for k in _st().list_knowledge(
-                        kinds=None if want_all else sorted(picked & {"knowledge", "state"}),
+                    for k in _st().list_experience(
                         scope=scope,
                         include_invalid=include_invalid,
                         limit=max(1, min(limit, 200)),
                     )
                 ]
-            if want_all or picked & {"case", "narrative"}:
+            if want_all or "episode" in picked:
                 items += [
                     e.to_dict()
-                    for e in _st().list_episodes(
-                        kinds=None if want_all else sorted(picked & {"case", "narrative"}),
-                        limit=max(1, min(limit, 200)),
-                    )
+                    for e in _st().list_episodes(limit=max(1, min(limit, 200)))
                 ]
             if want_all or "log" in picked:
                 items += [
@@ -328,7 +338,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
                         include_consolidated=include_invalid, limit=max(1, min(limit, 500))
                     )
                 ]
-        except ScopeError as exc:
+        except (ScopeError, ValueError) as exc:
             return _err(str(exc))
         return _ok(count=len(items), items=items)
 
@@ -383,8 +393,8 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
     @app.tool(
         name="memory_search",
         description=(
-            "跨层混合检索（知识 + 现状 + 案例 + 叙述 + 日志，自动含全局库）。"
-            "不改访问强度；要续命 state 请用 memory_write(verifies=)。"
+            "混合检索（经验 + 经历 + 日志，自动含全局库）。"
+            "不改访问强度；要落证据请用 memory_verify。"
         ),
     )
     def memory_search(
@@ -398,8 +408,8 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         """
         Args:
             query: 自然语言查询。
-            kinds: all / knowledge / state / case / narrative / log 的子集，默认全部。
-            scope: all | workspace | global
+            kinds: all / experience / episode / log 的子集，默认全部。
+            scope: 只有项目库了，参数保留兼容；传 global 会报错。
             include_invalid: 是否包含已失效条目（查历史用）。
             format: lines（默认，一行一条，省 token）| full（带分数与元数据）。
         """
@@ -437,7 +447,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         """
         Args:
             context: 当前在做什么。写具体情境，别只写关键词。
-            kinds: all / knowledge / state / case / narrative / log 的子集。
+            kinds: all / experience / episode / log 的子集。
             format: lines（默认）| full。
         """
         try:
@@ -449,6 +459,59 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         payload: dict[str, Any] = {
             "count": len(hits),
             "lines": [h.to_line() for h in hits],
+        }
+        # 兜底捞上来的遗忘层条目要单独说清楚，不然读的人以为它们还在常规视野里
+        forgotten = [h for h in hits if h.forgotten]
+        if forgotten:
+            payload["from_forget_layer"] = [h.item.id for h in forgotten]
+            payload["note"] = (
+                "带「已遗忘」标记的条目来自 0 级遗忘层：常规检索本来已经看不到它们，"
+                "是这次召回没捞到东西才去翻出来的。经历被深度回忆命中多次会自动复活。"
+            )
+        revived = [h.item.id for h in hits if h.revived]
+        if revived:
+            payload["revived"] = revived
+        if format == "full":
+            payload["results"] = [h.to_dict() for h in hits]
+        return _ok(**payload)
+
+    @app.tool(
+        name="memory_deep_recall",
+        description=(
+            "深度回忆：只翻遗忘层（0 级）。命中的经历记一次 revive_hits，"
+            "攒够次数就自动复活到 1 级。"
+        ),
+    )
+    def memory_deep_recall(
+        query: str,
+        kinds: list[str] | str | None = None,
+        limit: int = 5,
+        format: str = "lines",
+    ) -> dict[str, Any]:
+        """想起一件「以为自己已经忘了」的事。
+
+        只在 0 级里找 —— 正文完整但已退出常规视野的条目。相关性门槛与常规检索
+        同一条线（`deep_recall_floor`），不够相关不算「想起」。
+
+        Args:
+            query: 想找什么。
+            kinds: all / experience / episode 的子集。
+            format: lines（默认）| full。
+        """
+        try:
+            result = _st().deep_recall(
+                query, kinds=kinds, limit=max(1, min(limit, 20))
+            )
+        except ScopeError as exc:
+            return _err(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"深度回忆失败：{type(exc).__name__}: {exc}")
+        hits = result["hits"]
+        payload: dict[str, Any] = {
+            "count": result["count"],
+            "lines": [h.to_line() for h in hits],
+            "revived": result["revived"],
+            "note": result.get("note"),
         }
         if format == "full":
             payload["results"] = [h.to_dict() for h in hits]
@@ -475,13 +538,13 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
 
     @app.tool(
         name="consolidate_apply",
-        description="提交复盘结果：写入提炼的知识/现状与案例/叙述，标记日志已处理，可选清空原始日志。"
+        description="提交复盘结果：写入提炼的经验与经历，标记日志已处理，可选清空原始日志。"
         "整批前置校验，任一项不合法（放错数组、超长、空内容）就整批拒绝、零写入且原始日志保留；"
         "校验通过后所有写入原子提交，中途失败整体回滚、不删日志。",
     )
     def consolidate_apply(
         day: str | None = None,
-        knowledge: list[dict[str, Any]] | None = None,
+        experience: list[dict[str, Any]] | None = None,
         episodes: list[dict[str, Any] | str] | None = None,
         summary: str | None = None,
         purge: bool = True,
@@ -490,30 +553,24 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         Args:
             day: 复盘哪一天。不传时与 consolidate_preview 对齐，取最近一个仍有
                  待复盘日志的日期；**补历史时务必显式传回 preview 返回的 day**。
-            knowledge: 陈述数组，每项 {"content": str, "kind": "knowledge"|"state",
-                   "tags": [str], "importance": float, "invalidates": "旧id", "source": str}。
-                   只接受 knowledge / state，knowledge 上限 500 字、state 200 字；
-                   kind 不传按 knowledge。**带单号的排查结论不要放这里**，
-                   它换个单号就不成立了 —— 那是 case。state 属于本数组，
-                   放进 episodes 会被整批拒绝。
-            episodes: 经历数组。每项 {"content": str, "kind": "case"|"narrative",
-                   "importance": float, "tags": [str]}，也可直接传字符串（按 narrative）。
-                   只接受 case / narrative，case 上限 300 字；
-                   case 只写「现象 → 根因 → 落点」，一个问题一条；
-                   narrative 写当天过程与判断转折，importance 决定初始详细程度
+            experience: 经验数组，每项 {"content": str, "tags": [str],
+                   "importance": float, "confidence": float, "invalidates": "旧id",
+                   "source": str}。上限 500 字。可复用的判定与结论放这里；
+                   带单号的过程不要放这里 —— 那是 episode。
+            episodes: 经历数组。每项 {"content": str, "importance": float, "tags": [str]}，
+                   也可直接传字符串。一条一个单一事务；importance 决定初始详细程度
                    （≥0.75 完整叙述 / 0.45~0.75 要点 / <0.45 一句话）。
-            summary: 当天一句话总结（可选）。**episodes 为空时不要传** ——
-                   兼容行为会把它记成一条 narrative；只想写 digest 就别传。
+            summary: 当天一句话总结，只写进 digest 留档，不生成任何记忆条目。
             purge: 是否物理清空已复盘的原始日志，默认 true。只有整批提交成功才会删。
 
-        返回回执含 requested_knowledge / requested_episodes / created_* /
-        skipped_knowledge / warnings：提交后请核对 created_* 条数是否与请求一致，
+        返回回执含 requested_experience / requested_episodes / created_* /
+        skipped_experience / warnings：提交后请核对 created_* 条数是否与请求一致，
         不要只看 ok=true。
         """
         try:
             result = _st().consolidate_apply(
                 day=day,
-                knowledge=knowledge,
+                experience=experience,
                 episodes=episodes,
                 summary=summary,
                 purge=purge,
@@ -575,16 +632,45 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
     # ------------------------------------------------------------- 生命维持
 
     @app.tool(
+        name="memory_judge",
+        description=(
+            "跑一遍到期裁定：按周期活跃度升降遗忘等级。纯机器计算，"
+            "不调模型、不动正文。没到期就什么都不写。"
+        ),
+    )
+    def memory_judge(
+        scope: str = "all",
+        dry_run: bool = False,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """把「该升降了」的记忆一次处理完（§5.1）。
+
+        只改三列：`forget_level` / `activity` / `period_start`。
+        维持原级也要回写 —— 不清零活跃度它就永远处于「已到期」，每轮重算同一个结论。
+        压缩与删除都不在这里：前者是生成任务（`memory_compress_*`），后者只出候选。
+
+        Args:
+            scope: 默认 all。全局库已关闭（§8.2），这里只有项目库会跑；传 global 会报错。
+            dry_run: true 只列判定结果，不动数据。
+            now: 毫秒时间戳，仅测试或补算用；不传取当前时刻。
+        """
+        try:
+            with state_lock:
+                return _ok(result=_st().judge_due(scope=scope, dry_run=dry_run, now=now))
+        except (ValueError, ScopeError) as exc:
+            return _err(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"裁定失败：{type(exc).__name__}: {exc}")
+
+    @app.tool(
         name="memory_archive",
         description="按「久未触碰 + 访问少」归档低价值记忆。默认只预览，dry_run=false 才执行。",
     )
     def memory_archive(dry_run: bool = True) -> dict[str, Any]:
         """
         归档 = 默认检索不到，但内容一字未改，`include_archived=true` 仍能查回。
-        信条不参与；陈述与经历按**行级 kind** 各自判据：
-          knowledge 3 年 / case 1 年 / narrative 1 年 —— 「久未触碰 + 访问少」。
-          state 则走复核梯子：1→3→5→7 天，到期后再宽限 min(周期, 5) 天，
-          宽限都过了才归档。被检索到不算续命，只有 verified_at 算。
+        信条不参与；经验与经历各按自己的 TTL 判据（默认 3 年 / 1 年）：
+        「久未触碰 + 访问少」。
 
         Args:
             dry_run: true（默认）只列候选不动数据；false 才真正归档。
@@ -607,12 +693,16 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
 
     @app.tool(
         name="memory_purge_candidates",
-        description="列出「已归档且长期未再访问」的删除候选。只报告，不删除。",
+        description=(
+            "删除候选：已归档超期的 + 落在遗忘层（0 级）超期且没复活够的。"
+            "只报告，不删除。"
+        ),
     )
     def memory_purge_candidates(after_days: float | None = None) -> dict[str, Any]:
         """
         Args:
             after_days: 归档后静默多少天算候选；不传用配置默认（180 天）。
+                遗忘层那一类固定按 `[forget] level0_purge_days` 判，不受此参数影响。
         """
         try:
             items = _st().purge_candidates(after_days=after_days)
@@ -626,7 +716,10 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
 
     @app.tool(
         name="memory_purge",
-        description="物理删除指定记忆（含向量）。不可恢复，只能删已归档的条目。",
+        description=(
+            "物理删除指定记忆（含向量）。不可恢复；只接受已归档的、"
+            "或落在遗忘层（0 级）且停留超期的。"
+        ),
     )
     def memory_purge(ids: list[str], confirm: bool = False) -> dict[str, Any]:
         """
@@ -646,59 +739,45 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
 
     @app.tool(
         name="memory_compress_preview",
-        description="列出可压缩的经历（同一天多条）。只读，实际压缩要你总结后调 compress_apply。",
+        description=(
+            "取待压缩队列：按遗忘等级推出「当前压得不够深」的经历（只读）。"
+            "队列为空时这一步直接跳过。"
+        ),
     )
-    def memory_compress_preview() -> dict[str, Any]:
+    def memory_compress_preview(limit: int = 50) -> dict[str, Any]:
+        """
+        判据只有一条：`compression_level < required[forget_level]`。
+        没有「已处理」标记 —— 压完把 compression_level 写到目标值，自然出队。
+
+        Args:
+            limit: 最多返回多少条（默认 50）。
+        """
         try:
-            return _ok(preview=_st().compress_candidates())
+            return _ok(preview=_st().compression_queue(limit=limit))
         except Exception as exc:  # noqa: BLE001
             return _err(f"查询失败：{type(exc).__name__}: {exc}")
 
     @app.tool(
         name="memory_compress_apply",
-        description="把多条经历合并成一条摘要，原条目转为归档（不删除）。",
+        description=(
+            "把压好的内容**定向覆盖**回原经历（id、at、条目数都不变）。"
+            "不要新建压缩版再归档旧条。"
+        ),
     )
-    def memory_compress_apply(ids: list[str], summary: str, day: str | None = None) -> dict[str, Any]:
+    def memory_compress_apply(items: list[dict[str, Any]]) -> dict[str, Any]:
         """
+        压缩是内容压缩，不是条目合并：改的是 content 与 compression_level。
+
+        三条硬校验：必须是未归档的经历；新内容不能比原文长；level 只能落在
+        (当前, 目标] 区间 —— 写超目标会假装压得更深，写回当前值等于没压。
+
         Args:
-            ids: 要合并的经历 id 列表。
-            summary: 合并后的叙述，保留因果与结论，不要流水账。
-            day: 合并后归属的日期，默认取第一条的日期。
+            items: [{"id": "e_xxx", "content": "压好的更短版本", "level": 1}]
+                `level` 可省略，缺省写入该条 forget_level 对应的目标值。
         """
         try:
             with state_lock:
-                return _ok(result=_st().compress_apply(ids, summary, day=day))
-        except (NotFound, ValueError, ScopeError) as exc:
-            return _err(str(exc))
-        except Exception as exc:  # noqa: BLE001
-            return _err(f"压缩失败：{type(exc).__name__}: {exc}")
-
-    @app.tool(
-        name="memory_recompress_preview",
-        description="列出该被进一步压缩的经历（按年龄分档：30 天→level1，180 天→level2）。",
-    )
-    def memory_recompress_preview() -> dict[str, Any]:
-        try:
-            return _ok(preview=_st().recompress_preview())
-        except Exception as exc:  # noqa: BLE001
-            return _err(f"查询失败：{type(exc).__name__}: {exc}")
-
-    @app.tool(
-        name="memory_recompress_apply",
-        description="把经历改写成更短的版本并提升压缩级别（1=去冗余，2=只留结论）。",
-    )
-    def memory_recompress_apply(items: list[dict[str, Any]], level: int) -> dict[str, Any]:
-        """
-        经历的压缩是**渐进**的：刚复盘时是完整叙述（level 0），
-        随时间逐级变短。比起步就压缩到位，这样刚发生的细节还能查得到。
-
-        Args:
-            items: [{"id": "e_xxx", "content": "改写后的更短版本"}]
-            level: 目标级别，1（去冗余保关键步骤）或 2（只留结论与根因）。
-        """
-        try:
-            with state_lock:
-                return _ok(result=_st().recompress_apply(items, level=level))
+                return _ok(result=_st().compression_apply(items))
         except (NotFound, ValueError, ScopeError) as exc:
             return _err(str(exc))
         except Exception as exc:  # noqa: BLE001
@@ -706,7 +785,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
 
     @app.tool(
         name="memory_stats",
-        description="查看两库统计：知识/现状/案例/经历/日志数量、待复盘、待嵌入、全局库是否膨胀。",
+        description="查看两库统计：经验/经历/日志数量、待复盘、待嵌入、全局库是否膨胀。",
     )
     def memory_stats() -> dict[str, Any]:
         try:
@@ -866,10 +945,10 @@ def main() -> None:
                     source = "last"
                     print(f"[humanity-memory] 沿用上次工作区：{last}", file=sys.stderr)
 
-    cfg = Config.load()
     layout = resolve_layout(
         workspace_arg, rules_path=rules_arg, create=workspace_arg is not None
     )
+    cfg = Config.load(workspace=layout.workspace_dir)
 
     if not cfg.embedding_configured:
         print(

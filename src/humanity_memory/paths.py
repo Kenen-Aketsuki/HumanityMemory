@@ -153,6 +153,9 @@ class Layout:
     workspace_dir: Path | None
     workspace_db: Path | None
     global_dir: Path
+    # 全局库已于 2026-11-17 关闭（§8.2）。这个字段留着只为了两件事：
+    # 一是 `describe()` 能把"它本该在哪"告诉人，二是留给退役文件的路径计算。
+    # **任何代码都不该再 `open_db(global_db)`** —— 打开就等于建一个空库回来。
     global_db: Path
     workspace_rules: Path | None
     global_rules: Path

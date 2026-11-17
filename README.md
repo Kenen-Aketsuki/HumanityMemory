@@ -1,6 +1,6 @@
 # HumanityMemory
 
-基于 **SQLite + sqlite-vec** 的本地三层仿生记忆库，以 **MCP server + Skill 集合**的形式提供给智能体使用。
+基于 **SQLite + sqlite-vec** 的本地两类仿生记忆库，以 **MCP server + Skill 集合**的形式提供给智能体使用。
 
 零服务依赖：整个记忆就是几个 `.db` 文件，向量索引、全文索引、元数据全在里面，不上云。
 
@@ -12,44 +12,50 @@
                             │ 不参与检索
                             ▼
 ┌──────────────────────────────────────────────────────────────┐
-│  陈述层  knowledge   kind=knowledge 知识 · 遗忘极慢 · 不失效    │
-│                      kind=state     现状 · 1→3→5→7 天复核      │
-│  经历层  episodes    kind=case      案例 · 三句话定论 · 高权重 │
-│                      kind=narrative 叙述 · 保留过程 · 可压缩   │
-│  日志层  logs        当天原始记录 · append-only · 复盘后清空    │
+│  经验  knowledge  可复用的判定与结论 · 不压缩 · 可被推翻      │
+│                   可信度靠证据涨落，不靠日历复核               │
+│  经历  episodes   发生过的事 · 带时间 · 随遗忘等级逐级压缩      │
+│  日志  logs       当天原始记录 · append-only · 复盘后清空      │
 └──────────────────────────────────────────────────────────────┘
-        │                                    │
-        ▼                                    ▼
-  workspace.db（项目）              global.db（跨项目事实）
-  物理隔离，换项目就看不到           永远参与检索
+        │
+        ▼
+  workspace.db（项目）
+  物理隔离，换项目就看不到
+  （global.db 已于 2026-11-17 关闭，跨项目走 CORE_RULES）
 ```
 
 ## 为什么这么分层
 
 人类不会把每件事都记成永久结论。当天发生的事先粗略记下（日志），
-过一晚沉淀出可复用的经验（知识），细节自然淡出。
+过一晚沉淀出可复用的经验，细节自然淡出。
 
-**为什么陈述层要分「知识」和「现状」**：知识离开具体实例仍成立，只会过时、不会变假；
-现状（版本号、依赖、路径、资源配置）当前为真但随时会变。两者的遗忘曲线差一个数量级 ——
-混在一张表里时，失效机制永远等不到触发条件（实践里 47 条事实 0 条失效）。
-分 kind 之后 `invalid_at` 有了明确的适用对象：**现状**。
+**判据只有一条：它是否需要回答「什么时候发生的」。**
+需要 → 经历（带时间、会压缩）；不需要 → 经验（可复用的结论、不压缩、可被推翻）。
 
-这套结构把这个过程显式化了，而且用**数据库触发器**保证纪律：
+**为什么不给「易变的结论」单列一类**：版本号、依赖、路径这类东西确实变得快，
+但那不是**类型**差异，而是**可信度**差异。给它一个低初始可信度（0.3），
+之后靠证据（`memory_verify`）涨落，就够了——
+早先那套「单独一类 + 1→3→5→7 天复核梯子」多出一个分类、一张日历、一套状态机，
+换来的只是"记得去复核"这件本来就没人做得到的事。
+
+这套结构把过程显式化了，而且用**数据库触发器**保证纪律：
 
 - `logs` 表改正文 → `RAISE(ABORT)`，不靠应用层自觉
 - 未复盘的日志删不掉
-- `facts` 正文不可改，只能追加新事实并让旧的失效
-- 已失效的事实不能"复活"
+- 经验正文不可改，只能追加新条目并让旧的失效
+- 已失效的经验不能"复活"
 
 ## 特性
 
 - **信条不进检索**：硬约束靠静态注入 100% 命中，不赌召回率
-- **kind 分离**：知识/现状/案例/叙述/日志各有半衰期与 TTL（3650 / 3650 / 180 / 180 / 14 天）
-- **现状必须显式续命**：被检索到不算，只有 `verifies` 才算 —— 反复被查往往是它已不准的信号
+- **一类一个物理表**：经验 / 经历 / 日志各有自己的归档 TTL（3 年 / 1 年 / 复盘即清）
+- **可信度靠证据**：`memory_verify` 按**间隔**加分（隔半年再验一次，比昨天验过信息量大），
+  证伪扣分但**不删行**——「它曾经是个结论」本身就是知识
+- **读到低分条目会提醒**：低于 `verify_on_read` 的命中带 `·待验证` 标记
 - **物理隔离**：项目记忆在项目目录，删项目即删记忆，零残留
-- **跨库检索**：全局事实无论当前在哪个项目都参与召回
+- **只有项目库**：全局库已关闭，跨项目硬约束走 `CORE_RULES.md` 静态注入
 - **混合检索**：余弦向量 KNN + FTS5 trigram + bigram 兜底
-- **复盘由当前会话的模型执行**：不额外配 LLM，两步工具完成
+- **复盘由当前会话的模型执行**：不额外配 LLM；模型只写条目、给初值、报证据，分值等级全归工具
 - **优雅降级**：没配 embedding 也能用，退化为关键词检索
 
 ## 快速开始
@@ -75,9 +81,9 @@ cp .env.example ~/.humanity-memory/.env
 cd D:/proj/YourProject
 Your/Path/To/HumanityMemory/.venv/Scripts/humanity-memory.exe init
 humanity-memory log add "今天排查了 XXX，根因是 YYY"
-humanity-memory memory add "ResolveTask 末尾的兜底会被短路" --kind knowledge
-humanity-memory memory add "项目是 Unity 2022.3.62f1" --kind state --source ProjectVersion.txt
-humanity-memory memory add "Bug #10805 引导不指餐厅：三条静默出口" --kind case
+humanity-memory memory add "ResolveTask 末尾的兜底会被短路" --kind experience --confidence 0.8
+humanity-memory memory add "项目是 Unity 2022.3.62f1" --confidence 0.3 --source ProjectVersion.txt
+humanity-memory memory add "Bug #10805 引导不指餐厅：三条静默出口" --kind episode
 humanity-memory search "引导为什么不触发"
 ```
 
@@ -88,24 +94,17 @@ MCP server 的工作目录不固定，项目级 `.env` 换个目录就失效。
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `HM_HOME` | `~/.humanity-memory` | 全局库目录 |
+| `HM_HOME` | `~/.humanity-memory` | 全局信条与诊断目录（库已退役） |
 | `HM_WORKSPACE` | — | 显式指定工作区，跳过 cwd 查找 |
 | `HM_EMBED_BASE_URL` | — | OpenAI 兼容端点 |
 | `HM_EMBED_MODEL` | — | 例如 `BAAI/bge-m3` |
 | `HM_EMBED_API_KEY` | — | 本地 Ollama 可留空 |
 | `HM_EMBED_DIM` | `1024` | **必须与模型实际维度一致** |
-| `HM_HALFLIFE_KNOWLEDGE` | `3650` | 知识半衰期（天） |
-| `HM_HALFLIFE_STATE` | `3650` | 现状半衰期（衰减靠 TTL，不靠这个） |
-| `HM_HALFLIFE_CASE` | `180` | 案例半衰期 |
-| `HM_HALFLIFE_EPISODE` | `180` | 叙述半衰期 |
-| `HM_HALFLIFE_LOG` | `14` | 日志半衰期 |
-| `HM_ARCHIVE_TTL_STATE` | `30` | 现状多久未确认就归档 |
-| `HM_ARCHIVE_TTL_KNOWLEDGE` | `1095` | 知识多久未用就归档 |
-| `HM_ARCHIVE_TTL_CASE` / `_EPISODE` | `365` | 案例 / 叙述归档周期 |
-| `HM_GLOBAL_KNOWLEDGE_WARN` | `50` | 全局条目膨胀阈值（兼容旧名 `HM_GLOBAL_FACTS_WARN`） |
+| `HM_ARCHIVE_TTL_EXPERIENCE` | `1095` | 经验多久未用就归档 |
+| `HM_ARCHIVE_TTL_EPISODE` | `365` | 经历多久未用就归档 |
 | `HM_W_RETRIEVAL` | `0.72` | 检索相似度权重 |
 | `HM_W_IMPORTANCE` | `0.12` | 重要性权重 |
-| `HM_W_STRENGTH` | `0.16` | 新鲜度/使用频次权重 |
+| `HM_W_LEVEL` | `0.16` | 遗忘等级倍率权重 |
 
 ### 免费 embedding 选项
 
@@ -155,7 +154,7 @@ MCP server 的工作目录不固定，项目级 `.env` 换个目录就失效。
 ```
 
 `--workspace` 指向**项目根**，不是 `.ai_memory` 目录。不传则退化为「从 cwd 向上查找」，
-这在客户端 cwd 不固定时会落到「只有全局库」模式。
+这在客户端 cwd 不固定时会直接报错（没有全局库兜底）。
 
 ### 用令牌文件（把凭据从 mcp.json 里拿出来）
 
@@ -222,13 +221,13 @@ memory_use_workspace(path="D:/proj/YourProject")
 | 3 | `HM_WORKSPACE` | 环境变量 |
 | 4 | cwd 向上查找 | 只有**已存在** `.ai_memory` 才命中，不会新建 |
 | 5 | 上次用过的工作区 | `~/.humanity-memory/last-workspace.txt` |
-| 6 | 无 | 只能读写全局库，写日志会报错提示先切换 |
+| 6 | 无 | 报错：没有工作区就写不进去（全局库已关闭） |
 
 如果客户端启动时 cwd 就是项目目录，第 4 条能直接命中——那就是真正的零配置。
 客户端 cwd 不可靠时，靠第 5 条 + agent 调一次 `memory_use_workspace` 兜底。
 
 启动上下文（cwd、解析来源、命中的工作区）会写进
-`~/.humanity-memory/diagnostics/startup.json`，排查「为什么落到全局库」时先看它。
+`~/.humanity-memory/diagnostics/startup.json`，排查「为什么落到这个工作区」时先看它。
 
 ### 复用项目已有的信条文件
 
@@ -282,11 +281,12 @@ cp -r skills/humanity-memory ~/.workbuddy/skills/
 
 ```
 skills/humanity-memory/
-├── SKILL.md                        # 三层分工、写事实还是写日志、工具速查
+├── SKILL.md                        # 两类分工、写经验还是写日志、工具速查
 └── references/
     ├── writing-guide.md            # 写入粒度、事实与日志的判断标准
     ├── recall-guide.md             # 召回时机、query 写法、结果解读
     ├── consolidate-guide.md        # 复盘流程、提炼标准、purge 取舍
+    ├── consolidate-task.md         # 定时复盘的任务模板（两处占位，各仓库微调）
     └── operations.md               # 配置、排障、备份、换模型
 ```
 
@@ -295,104 +295,113 @@ skills/humanity-memory/
 | 工具 | 说明 |
 | --- | --- |
 | `rules_get` / `rules_append` | 读/追加信条（只追加，不改既有内容） |
-| `memory_write` | **唯一写入口**，`kind` = knowledge / state / case / narrative |
-| `memory_review` | 复核现状：`matched=true` 续命升档，`matched=false` 当场物理删除 |
-| `memory_review_list` | 列到了复核时间的现状（due / overdue） |
-| `memory_invalidate` | 让 **knowledge** 失效（不删除）；对 state 会拒绝 |
-| `memory_promote` | 项目条目 → 全局条目 |
+| `memory_write` | **唯一写入口**，`kind` = `experience` / `episode` |
+| `memory_verify` | 给经验落一条证据：`ok=true` 按间隔加分，`ok=false` 扣分（都不删行） |
+| `memory_invalidate` | 让经验失效（不删除，保留历史）；对经历会拒绝 |
+| `memory_promote` | **已下线**：全局库关闭，调用会明确报错 |
 | `memory_list` | 列条目，`kinds` 支持 `all` |
 | `log_append` | 追加日志（唯一允许的日志写操作） |
 | `log_list` | 按日期列日志 |
-| `memory_search` | 跨层跨库检索，不改访问强度 |
-| `memory_recall` | 检索 + 强化命中项 |
-| `consolidate_preview` | 取待复盘日志 |
+| `memory_search` | 混合检索，不改访问强度 |
+| `memory_recall` | 检索 + 强化命中项；常规捞不到时自动兜一层深度回忆 |
+| `memory_deep_recall` | 只翻遗忘层（0 级）；命中的经历累计复活次数 |
+| `memory_judge` | 跑到期裁定：按周期活跃度升降等级，没到期什么都不写 |
+| `consolidate_preview` | 取待复盘日志（不返回存量经验，查重交给写入） |
 | `consolidate_apply` | 提交复盘结果 |
 | `memory_stats` | 统计与健康提示 |
 | `memory_maintenance` | 补 embedding |
+
+生命周期与运维工具另有一组：`memory_archive` / `memory_unarchive` / `memory_purge_candidates` /
+`memory_purge` / `memory_compress_preview` / `memory_compress_apply` / `memory_use_workspace`。
+
+**已下线**：`memory_review` / `memory_review_list`（复核梯子随 `state` 一起删除）、
+`memory_recompress_preview` / `memory_recompress_apply`（按年龄判压缩，已被等级驱动取代）、
+`fact_write`。`memory_write` 也没有 `verifies` 参数了 —— 「我看了，还成立」要表达就走 `memory_verify`。
 
 ## 复盘
 
 由**当前会话的模型**执行，不额外调 LLM：
 
 ```
-consolidate_preview(day="today")          → 拿到原始日志 + 现有陈述
+consolidate_preview(day="today")          → 拿到原始日志 + 现有经验
         ↓  你自己读、提炼
-consolidate_apply(knowledge=[...], episodes=[...], purge=true)
+consolidate_apply(experience=[...], episodes=[...], purge=true)
 ```
 
-复盘产出三块，**先想 kind 再落笔**：
+复盘产出两块：
 
-- `knowledge` — 换掉单号、任务 ID 仍然成立的机制与约定
-- `state` — 当前为真但会变的（版本、依赖、路径），带 `source`。写进来只是登记，
-  之后靠 `memory_review` 复核：仍成立就续命升档，不符就当场删掉，**不用 `invalidates`**
-- `episodes` — `case`（现象→根因→落点，≤300 字，一单一条）与 `narrative`（当天过程）
+- `experience` — 换掉单号、任务 ID 仍然成立的机制与约定。
+  `confidence` 是起点：易变 0.3 / 一般 0.5~0.6 / 机制 0.8
+- `episodes` — 当天发生了什么，一条一个单一事务，`importance` 决定初始详细程度
 
-配成定时任务时，**每个工作区各建一个**（只复盘自己那个库，不要跨项目扫），
-prompt 直接引用 `skills/humanity-memory/references/consolidate-task.md`。
+`summary` 只写进 digest 留档，**不会变成一条记忆** —— 总结和「发生过的事」是两类东西。
+
+配成定时任务时，**每个工作区各建一个**（只复盘自己那个库，不要跨项目扫）。
+直接抄 `skills/humanity-memory/references/consolidate-task.md` 的模板，
+把两处 `{{占位}}` 换成这个项目的情况，其余别改 —— 每项目全篇改一遍会漂成七八个版本。
 不想清空原始日志就传 `purge=false`。
 
 ## 数据模型
 
 | 表 | 关键字段 |
 | --- | --- |
-| `knowledge` | `kind`（knowledge/state）、`invalid_at`、`invalidated_by`、`verified_at`（现状确认时间）、`scope` |
-| `episodes` | `kind`（case/narrative）、`at`、`day`、`digest_id`（哪次复盘产出）、`compression_level` |
+| `knowledge` | **经验**。`confidence`、`forget_level`、`activity`、`period_start`、`invalid_at`、`invalidated_by`、`verified_at`、`scope` |
+| `episodes` | **经历**。`at`、`day`、`compression_level`、`forget_level`、`revive_hits`、`digest_id` |
 | `logs` | `at`、`day`、`consolidated`、`digest_id` |
-| `digests` | 每次复盘的审计：处理了几条日志、产出了几条事实/经历 |
+| `digests` | 每次复盘的审计：处理了几条日志、产出了几条经验/经历 |
 
 向量：`knowledge_vec` / `episodes_vec` / `logs_vec`（vec0，cosine 度量，`chunk_size=64`），
 rowid 与主表对齐。全文：三张 `_fts` 表，trigram 分词，触发器同步。
 
-数据库层还钉了三条绕不过的约束：正文不可改、`invalid_at` 不可逆、
-**`kind` 不可改**（知识变现状只能新写一条 —— 两类生命周期不同，改 kind 等于换了个东西）。
+**表名沿用 v3 的 `knowledge`，但它的含义已经是「经验」**——v4 起一类一张表，
+不再靠 `kind` 列分流。老库里那列 `kind` 留着当历史线索（`state` / `case` 读出来即经验 / 经历），
+新库直接不建它，代码里一个 `kind` 列都不碰。
+
+数据库层还钉了三条绕不过的约束：经验正文不可改、`invalid_at` 不可逆、已失效的不能复活。
 
 ### 记忆的生命周期
 
-三层都有淘汰机制，**常规路径只归档、不自动删**。唯一的例外是现状复核发现不符：
-那会直接物理删除（`memory_review(matched=false)`），因为它继续留着只会冒充真话。
+两层都有淘汰机制，**常规路径只归档、不自动删**。
 
-| kind | 归档条件 | 压缩 |
+| 表 | 归档条件 | 压缩 |
 | --- | --- | --- |
 | 信条 | 不参与（它不在库里） | 不参与 |
-| `knowledge` | 3 年未触碰且访问 ≤1 次 | 不压缩 |
-| `state` | **复核梯子到期 + 宽限已过**（1→3→5→7 天，宽限 ≤5 天；被检索不算续命） | 不压缩 |
-| `case` | 1 年未触碰且访问 ≤1 次 | 不压缩（已是最简形态） |
-| `narrative` | 1 年未触碰且访问 ≤1 次 | ✅ 可合并 |
+| `knowledge`（经验） | 3 年未触碰且访问 ≤1 次 | 不压缩（压缩会丢精确性） |
+| `episodes`（经历） | 1 年未触碰且访问 ≤1 次 | ✅ 随遗忘等级压缩 |
+| `logs` | 复盘后清空（按复盘，不按访问） | 已有 |
 
 归档 = 置 `archived_at`，正文不动，默认检索不到，`include_archived=true` 可查回。
-通用删除入口 `memory_purge(ids, confirm=true)` **只能删已归档的**；唯一例外是
-`memory_review(matched=false)` —— 它只处理 state，语义明确（「这条现状是假的」），删完不留痕。
+通用删除入口 `memory_purge(ids, confirm=true)` **只能删已归档的**；
+落进 0 级遗忘层满 180 天、或归档满 180 天的，才会出现在删除候选里。
 
 用 CLI 操作：
-
-```bash
-humanity-memory memory review                      # 列该复核的现状
-humanity-memory memory review --id s_xxx           # 仍成立 → 续命并升档
-humanity-memory memory review --id s_xxx --stale   # 已不符 → 直接删除
-```
 
 ```bash
 humanity-memory lifecycle archive --dry-run   # 预览会归档哪些
 humanity-memory lifecycle archive             # 执行
 humanity-memory lifecycle candidates          # 删除候选（只报告）
-humanity-memory lifecycle compress            # 可压缩的经历分组
+humanity-memory lifecycle compress            # 待压缩队列（按遗忘等级推出）
+humanity-memory lifecycle compress-apply --file items.json   # 定向覆盖提交
 ```
 
-判据用「多久没碰 + 访问几次」而不是强度阈值 —— 因为 `usage_factor` 有 0.5 底分，
-强度永远跌不到 0，拿绝对阈值归档会永远不触发。
+判据用「多久没碰 + 访问几次」而不是分数阈值 —— 分数里总有加项兜底，
+再冷的条目也跌不到 0，拿绝对阈值归档会永远不触发。
 
 ### 检索打分
 
 ```
-final = type_weight × (0.72 × retrieval + 0.12 × importance + 0.16 × strength)
+final = type_weight × (0.72 × retrieval + 0.12 × importance + 0.16 × level_factor)
 
-retrieval = (0.70 × vec_sim + 0.30 × lex_sim) / 可用通路权重和
-strength  = 0.55 × 新鲜度(按层半衰期) + 0.45 × 使用频次(对数，20 次饱和，底分 0.5)
-type_weight: knowledge 1.00 / state 1.00 / case 0.90 / narrative 0.96 / log 0.90
-             （narrative 再乘压缩级别权重 0.88~0.96）
+retrieval    = (0.70 × vec_sim + 0.30 × lex_sim) / 可用通路权重和
+level_factor = (forget_level / 最高等级) ^ 1.5     （0 级恒为 0）
+type_weight: experience 1.00 / episode 0.96 / log 0.90
+             （episode 再乘压缩级别权重 0.88~0.96）
 ```
 
-`usage_factor` 给从未被召回的内容 0.5 底分——新写入的不该因为"还没被用过"而吃亏。
+第三项为什么是等级而不是「强度」：旧方案把「多久没碰」和「碰过几次」揉成一个数，
+再乘半衰期衰减，结果是分值的形成过程无法解释。等级一个周期裁定一次、一次只动一级，
+三个月后还能回答「它为什么在这一级」。日志没有等级，恒按 1.0——
+它靠 `type_weight` 与复盘清空体现「原始素材」的定位，不该被等级再罚一次。
 
 ## 为什么是两段式检索
 
@@ -406,7 +415,7 @@ type_weight: knowledge 1.00 / state 1.00 / case 0.90 / narrative 0.96 / log 0.90
 ## 开发
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q                    # 85 项单元测试
+./.venv/Scripts/python.exe -m pytest -q                    # 170 项单元测试
 ./.venv/Scripts/python.exe tools/verify_mcp_config.py      # MCP 端到端（隔离环境）
 ```
 
