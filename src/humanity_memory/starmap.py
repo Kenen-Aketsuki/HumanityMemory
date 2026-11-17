@@ -203,6 +203,10 @@ def read_nodes(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             created = g("created_at") or g("at") or 0
             invalid_at = g("invalid_at")
             archived_at = g("archived_at")
+            # 星图点大小由遗忘等级决定。日志表没有这一列（不参与等级机制），
+            # 给中性值 3 —— 既不被画成最小点消失，也不抢经验/经历的视觉重量。
+            level_raw = g("forget_level")
+            forget_level = int(level_raw) if level_raw is not None else 3
             nodes.append(
                 {
                     "id": r["id"],
@@ -223,6 +227,8 @@ def read_nodes(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                     "live": invalid_at is None,
                     "archived": archived_at is not None,
                     "compression_level": int(g("compression_level") or 0),
+                    "forget_level": forget_level,
+                    "has_level": level_raw is not None,
                     "embedded": bool(g("embedded")),
                 }
             )
@@ -477,6 +483,10 @@ canvas.drag{cursor:grabbing}
       <div id="kinds"></div>
     </div>
     <div class="sec">
+      <h2>遗忘等级</h2>
+      <div id="levels"></div>
+    </div>
+    <div class="sec">
       <h2>查找</h2>
       <input type="text" id="search" placeholder="输入关键词或节点 ID，高亮命中条目">
       <label class="row"><input type="checkbox" id="labels"> 显示更多星名</label>
@@ -653,8 +663,17 @@ function draw(){
     const hit=matchesQuery(n,q);
     const focus=n===hover||n===selected||hit;
     ctx.globalAlpha=dim?.42:(focus?1:.9);
-    ctx.beginPath();ctx.arc(n.x,n.y,n.r*2.4,0,6.2832);
-    ctx.fillStyle=col;ctx.globalAlpha*=.10;ctx.fill();
+    // 辉光亮度 = 遗忘等级：越接近遗忘越淡，像逐渐熄灭的灯。
+    // 本体大小继续由 importance 决定，两个通道各管一个维度，互不打架。
+    const lvl=Math.max(0,Math.min(5,n.forget_level||0));
+    // 跨度要够大：库里最常见的是 L3↔L4 相邻档，0.05 的 alpha 差在深底上等于没有。
+    // 0.02→0.395 每级 0.075，相邻两档才看得出「这盏灯比那盏亮」。
+    const glow=n.kind==='digest'?.26:(n.has_level?0.02+lvl*0.075:0.17);
+    ctx.beginPath();ctx.arc(n.x,n.y,n.r*(2.05+lvl*0.13),0,6.2832);
+    // 辉光用统一的白偏蓝，不跟本体色走 —— 否则紫色（#b9a5ff）本身比蓝色亮，
+    // L3 的紫点光晕会盖过 L4 的蓝点，亮度就不再是可靠的等级信号了。
+    ctx.fillStyle=n.kind==='digest'?'#ffe08a':'#dbe8ff';
+    ctx.globalAlpha*=glow;ctx.fill();
     ctx.globalAlpha=dim?.42:(focus?1:.9);
     ctx.beginPath();ctx.arc(n.x,n.y,n.r,0,6.2832);
     ctx.fillStyle=col;ctx.fill();
@@ -699,7 +718,11 @@ function showTip(n){
   tip.innerHTML='<div class="kind" style="color:'+(C[n.kind]||'#8898ad')+'">'+
     esc(L[n.kind]||n.kind)+' · '+esc(n.id)+'</div>'+
     '<div class="body">'+esc(n.content)+'</div>'+
-    '<div class="meta">重要度 '+n.importance.toFixed(2)+' · 访问 '+n.access_count+
+    '<div class="meta">'+
+    (n.has_level
+      ? '遗忘等级 <b>L'+n.forget_level+'</b>'+(n.forget_level===0?'（遗忘层）':'')+' · '
+      : '原始日志（不参与等级） · ')+
+    '重要度 '+n.importance.toFixed(2)+' · 访问 '+n.access_count+
     ' · 邻居 '+n.deg+'<br>'+(n.day?('日期 '+esc(n.day)+' · '):'')+
     '作用域 '+esc(n.scope)+(n.archived?' · 已归档':'')+(n.live===false?' · 已失效':'')+
     (n.tags.length?('<br>标签 '+esc(n.tags.join(' / '))):'')+
@@ -764,7 +787,26 @@ function buildUI(){
     '<span class="dot" style="background:'+C[k]+'"></span>'+L[k]+' <span style="color:var(--muted);margin-left:auto">'+
     (m.kind_counts[k]||0)+'</span></label>').join('');
   kd.querySelectorAll('input').forEach(el=>el.onchange=()=>{kinds[el.dataset.k]=el.checked;refresh();});
+  // 等级分布：顺手把每个等级的辉光亮度画成一个小圆点 —— 既是统计也是图例，
+  // 一眼就能看出「库里有没有跨度」。全挤在 L3/L4 时，这里会诚实地显示 0。
+  const lvCount={};let logN=0;
+  DATA.nodes.forEach(n=>{
+    if(n.kind==='digest')return;
+    if(n.has_level){lvCount[n.forget_level]=(lvCount[n.forget_level]||0)+1;}else{logN++;}
+  });
+  const lvEl=document.getElementById('levels');
+  let lvHtml='';
+  for(let l=5;l>=0;l--){
+    const c=lvCount[l]||0;
+    const a=(0.02+l*0.075).toFixed(3);
+    lvHtml+='<div class="kv"><span><span class="dot" style="background:#dbe8ff;opacity:'+a+'"></span> L'+l+
+      (l===0?'（遗忘层）':'')+'</span><span style="color:var(--muted)">'+c+'</span></div>';
+  }
+  if(logN)lvHtml+='<div class="kv"><span>日志（无等级）</span><span style="color:var(--muted)">'+logN+'</span></div>';
+  lvEl.innerHTML=lvHtml;
   document.getElementById('legend').innerHTML=
+    '<span style="color:#cfe0ff">点大小 = 重要度 · 辉光亮度 = 遗忘等级</span><br>'+
+    '<span style="color:#8fa8c8">　（辉光越淡越接近遗忘，L5 最亮 · L0 近乎熄灭）</span><br>'+
     '<span style="color:#6fb6ff">虚线粗细 = 语义相似度</span><br>'+
     '<span style="color:#ffc46b">琥珀箭头 = 失效 / 换代</span><br>'+
     '<span style="color:#ffe08a">黄色恒星 = 复盘批次</span><br>'+
