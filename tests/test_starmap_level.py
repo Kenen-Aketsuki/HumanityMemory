@@ -83,10 +83,13 @@ def test_logs_get_neutral_level_but_are_marked(store: MemoryStore) -> None:
 
 
 def test_body_size_is_importance_glow_is_level() -> None:
-    """两个视觉通道各管一个维度，别互相顶替。
+    """三个视觉通道各管一个维度，别互相顶替。
 
     这是硬编码在 HTML 模板里的，只能对着模板源码断言 —— 星图没有回归用例，
     改错了只有肉眼能发现，而肉眼恰好会被「所有样本都在同一档」骗过去。
+
+    2026-11-17 二次修改后通道划分：大小 = importance、辉光颜色 = 活跃度、
+    辉光透明度 = 遗忘等级。颜色换成了三锚点渐变，透明度那套数值刻意没动。
     """
     src = Path(starmap.__file__).read_text(encoding="utf-8")
 
@@ -94,15 +97,23 @@ def test_body_size_is_importance_glow_is_level() -> None:
     assert "r:3+Math.min(9,Math.max(0,n.importance)*8)" in src, "本体半径由 importance 算"
     assert "n.forget_level||0))*2.3" not in src, "等级不该再决定本体大小"
 
-    # 辉光亮度由遗忘等级算，且按量程归一（档数可变，不能写死 5）
+    # 辉光透明度由遗忘等级算，且按量程归一（档数可变，不能写死 5）
     assert "0.02+ratio*0.375" in src, "辉光 alpha 必须随等级线性张开"
     assert "const LVMAX=" in src, "等级量程必须取自数据，不能写死档数"
     assert "Math.min(5,n.forget_level" not in src, "档数不能写死成 5"
-    assert "#dbe8ff" in src, "辉光必须用统一色，不能跟本体类型色走"
+    assert "ctx.fillStyle=n.gcol" in src, "辉光颜色必须走活跃度色标"
+    assert "ctx.fillStyle=n.kind==='digest'?'#ffe08a':'#dbe8ff'" not in src, "辉光不该再是统一白蓝"
 
-    # 图例要分别说清两个通道，且顶档名不能写死
-    assert "点大小 = 重要度 · 辉光亮度 = 遗忘等级" in src
-    assert "L'+LVMAX+' 最亮" in src, "图例里的顶档要跟量程走"
+    # 三锚点必须是用户指定的那三个色，且颜色由 act01 决定
+    assert "[0,[15,224,229]]" in src, "0 → #0FE0E5"
+    assert "[.5,[246,222,20]]" in src, "0.5 → #F6DE14"
+    assert "[1,[241,0,0]]" in src, "1 → #F10000"
+    assert "gcol:n.kind==='digest'?'#ffe08a':(n.kind==='log'?LOG_GLOW:glowColor(n.act01||0))" in src
+    assert "const LOG_GLOW='#8898ad'" in src, "原始日志的辉光固定灰，不去蹭色标通道"
+
+    # 图例要分别说清三个通道，且顶档名不能写死
+    assert "点大小 = 重要度 · 辉光颜色 = 活跃度 · 辉光透明度 = 遗忘等级" in src
+    assert "L'+LVMAX+' 最实" in src, "图例里的顶档要跟量程走"
     assert "原始日志（不参与等级）" in src
 
 
