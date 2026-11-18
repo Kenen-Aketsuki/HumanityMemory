@@ -67,9 +67,8 @@ python -m venv .venv
 ./.venv/Scripts/python.exe -m pip install -e .        # Windows
 # source .venv/bin/activate && pip install -e .       # macOS / Linux
 
-# 配置必须放用户级目录，否则换项目目录就读不到
-mkdir -p ~/.humanity-memory
-cp .env.example ~/.humanity-memory/.env
+# 配置只认仓库根这一份，换目录启动也读得到
+cp .env.example .env
 # 编辑里面的 embedding 配置
 
 ./.venv/Scripts/humanity-memory.exe doctor
@@ -89,8 +88,9 @@ humanity-memory search "引导为什么不触发"
 
 ## 配置
 
-配置全走环境变量或 `.env`。**务必放在 `~/.humanity-memory/.env`**，
-MCP server 的工作目录不固定，项目级 `.env` 换个目录就失效。
+配置全走环境变量或 `.env`。**只认仓库根这一份 `<仓库根>/.env`**：`config.py` 相对源码
+自身位置定位，不再读 `~/.humanity-memory/.env` 或 cwd 下的 `.env`；无论 MCP server / CLI
+从哪个目录启动，读到的都是同一份配置。真实环境变量仍是最高优先级。
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |

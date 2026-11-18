@@ -20,10 +20,11 @@ from __future__ import annotations
 import json
 import re
 import struct
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from .config import Config
 from .confidence import ConfidenceCurve
@@ -829,7 +830,7 @@ class MemoryStore:
                 }
             )
 
-        return {
+        result: dict[str, Any] = {
             "ok": True,
             "db": per_db[0]["db"] if len(per_db) == 1 else "all",
             "now": moment,
@@ -842,6 +843,22 @@ class MemoryStore:
             "frozen_days": round(total_frozen / DAY_MS, 1),
             "max_gap_days": self.cfg.forget_max_gap_days,
         }
+
+        # 裁定报告是旁路产物：写不出来只影响「看」，不影响裁定本身
+        if self.layout.workspace_dir is not None:
+            from .reports import write_judge_report
+
+            report_path = write_judge_report(
+                self.workspace_conn,
+                self.cfg,
+                self.layout.workspace_dir,
+                level_table=self.level_table,
+                report=result,
+                moment=moment,
+            )
+            if report_path is not None:
+                result["report_path"] = str(report_path)
+        return result
 
     def _freeze_idle_gap(
         self, conn: Any, moment: int, *, dry_run: bool
@@ -1349,13 +1366,88 @@ class MemoryStore:
         判定用相似度而不是最终分数 —— 分数里有 importance 与强度加成，
         一条重要的老记忆分数可能很高，但其实什么也没匹配上。
         """
+        started = time.perf_counter()
         hits = self.search(context, kinds=kinds, limit=limit)
+        # 强化前的活跃度要抓一份：`_reinforce` 会原地改 `hit.item.activity`，
+        # 事后就分不出「这次加了多少」和「以前攒了多少」。
+        before = {
+            str(hit.item.id): float(getattr(hit.item, "activity", 0.0) or 0.0)
+            for hit in hits
+        }
         self._reinforce(hits)
 
+        deep_used = False
         if deep and self._is_miss(hits):
             forgotten = self.deep_recall(context, kinds=kinds, limit=max(1, limit // 2))
             hits = hits + forgotten["hits"]
+            deep_used = True
+        self._log_retrieval(
+            context,
+            hits,
+            before,
+            deep_used=deep_used,
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+        )
         return hits
+
+    def _log_retrieval(
+        self,
+        query: str,
+        hits: Sequence[Hit],
+        before: Mapping[str, float],
+        *,
+        deep_used: bool,
+        elapsed_ms: float,
+    ) -> None:
+        """把这一次检索的「问了什么、翻出谁、各加了多少活跃度」写进当天 JSONL。
+
+        只记 `recall`（唯一会给活跃度加分的地方）；`search` 是只读检索，
+        记进去 delta 全是 0，只会把日志冲淡。
+
+        旁路：写失败不影响检索结果 —— 活跃度已经落库了，统计丢了只是少一份证据。
+        """
+        if self.layout.workspace_dir is None:
+            return
+        from .reports import append_retrieval
+
+        moment = now_ms()
+        rows: list[dict[str, Any]] = []
+        for rank, hit in enumerate(hits, 1):
+            item = hit.item
+            after = float(getattr(item, "activity", 0.0) or 0.0)
+            prior = before.get(str(item.id))
+            rows.append(
+                {
+                    "id": item.id,
+                    "kind": getattr(item, "kind", "unknown"),
+                    "rank": rank,
+                    "score": round(float(hit.score), 4),
+                    "vec_sim": None
+                    if hit.vector_similarity is None
+                    else round(float(hit.vector_similarity), 4),
+                    "lex": None
+                    if hit.lexical_score is None
+                    else round(float(hit.lexical_score), 4),
+                    "level": getattr(item, "forget_level", None),
+                    "activity_before": None if prior is None else round(prior, 4),
+                    "delta": None if prior is None else round(after - prior, 4),
+                    "activity_after": round(after, 4),
+                    "forgotten": bool(getattr(hit, "forgotten", False)),
+                }
+            )
+        append_retrieval(
+            self.layout.workspace_dir,
+            self.cfg,
+            {
+                "at": moment,
+                "query": query,
+                "deep": deep_used,
+                "elapsed_ms": round(elapsed_ms, 1),
+                "hit_count": len(rows),
+                "hits": rows,
+            },
+            moment=moment,
+        )
 
     def _is_miss(self, hits: Sequence[Hit]) -> bool:
         """常规检索是不是「什么也没捞到」：最高相似度低于 deep_recall_floor。"""

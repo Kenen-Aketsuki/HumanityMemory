@@ -4,7 +4,7 @@
 
 ```
 <项目>/.ai_memory/
-├── workspace.db        # 项目库：facts + episodes + logs
+├── workspace.db        # 项目库：experience + episodes + logs
 └── CORE_RULES.md       # 项目信条
 
 ~/.humanity-memory/

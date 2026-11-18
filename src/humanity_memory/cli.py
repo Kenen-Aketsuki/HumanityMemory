@@ -665,6 +665,58 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_retrieval_report(args: argparse.Namespace) -> int:
+    """把检索记录渲染成单文件 HTML（只读，不碰库）。
+
+    除了检索明细，还把「当前等级表阈值」和「最新一份裁定快照」一起塞进去 ——
+    页面才能自己算出「维持/升级需要几次命中」「多少节点在降级线下」。
+    """
+    from .reports import latest_judge_snapshot, level_thresholds, read_retrievals
+    from .retrieval_view import render_retrieval_html
+
+    with _open(args) as store:
+        workspace = store.layout.workspace_dir
+        if workspace is None:
+            print("错误：当前目录没有 .ai_memory 工作区", file=sys.stderr)
+            return 2
+
+        records = read_retrievals(workspace, store.cfg, days=args.days)
+        snapshot = latest_judge_snapshot(workspace, store.cfg)
+        nodes = [
+            {
+                "level": n.get("level"),
+                "activity": n.get("activity"),
+                "up": n.get("up_threshold"),
+                "down": n.get("down_threshold"),
+            }
+            for n in (snapshot or {}).get("nodes", [])
+        ]
+
+        html = render_retrieval_html(
+            records,
+            meta={
+                "db": str(store.layout.workspace_db),
+                "days": args.days,
+                "levels": level_thresholds(store.cfg),
+                "nodes": nodes,
+                "generated": (snapshot or {}).get("generated_at"),
+            },
+        )
+        out = (
+            Path(args.out).expanduser().resolve()
+            if args.out
+            else workspace / "reports" / "retrieval.html"
+        )
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(html, encoding="utf-8")
+
+    print(f"检索分析已生成：{out}")
+    print(f"  记录 {len(records)} 次检索 · 节点快照 {len(nodes)} 条")
+    if not records:
+        print("  提示：还没有检索记录 —— 先跑几次 memory_recall，再回来生成。")
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     from . import mcp_server
 
@@ -943,6 +995,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--out", default=None, help="输出目录（必填；不提供默认落点，避免自动写入项目记忆目录）")
     p_export.add_argument("--include-invalid", action="store_true")
     p_export.set_defaults(func=cmd_export)
+
+    p_rr = sub.add_parser(
+        "retrieval-report",
+        help="把检索记录渲染成单文件 HTML（只读；含阈值诊断，调参看这个）",
+    )
+    p_rr.add_argument(
+        "--out",
+        default=None,
+        help="HTML 输出路径（默认 <工作区>/reports/retrieval.html）",
+    )
+    p_rr.add_argument(
+        "--days", type=int, default=0, help="只读最近 N 天的记录（0 = 全部）"
+    )
+    p_rr.set_defaults(func=cmd_retrieval_report)
 
     p_re = sub.add_parser("reindex", help="重建向量")
     p_re.add_argument("--reset-vectors", action="store_true")

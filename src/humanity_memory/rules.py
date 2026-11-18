@@ -119,8 +119,8 @@ def render_instructions(
 
     parts.append("")
     parts.append(
-        "记忆使用规则：知识（knowledge）与现状（state）是长期结论，日志只追加不改；"
-        "现状换代时追加新条目并用 invalidates 顶掉旧的，禁止改写或删除历史。"
+        "记忆使用规则：经验（experience）与经历（episode）是两类长期记忆，日志只追加不改；"
+        "经验被推翻时追加新条并用 invalidates 让旧的失效，禁止改写或删除历史。"
     )
     return "\n".join(parts)
 

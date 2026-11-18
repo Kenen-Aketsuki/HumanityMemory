@@ -1,8 +1,8 @@
 ---
 title: 两类记忆方案 · 经历 / 经验 + 遗忘等级阶梯
-status: 设计定稿 / 两类化改造已落地（代码 + 测试 + 文档）/ 未发布
+status: 设计定稿 / 两类化改造已落地（代码 + 测试 + 文档）/ 已发布
 created: 2026-11-16
-updated: 2026-11-16
+updated: 2026-11-18
 supersedes: skills/humanity-memory/references/consolidate-stability.md
 purpose: 取代「四类记忆 + 复核梯子」，把主观判断压缩到极少数点，其余交给纯机器计算
 ---
@@ -15,15 +15,16 @@ purpose: 取代「四类记忆 + 复核梯子」，把主观判断压缩到极�
 > 「读 `docs/two-tier-memory.md`，这是 HumanityMemory 两类记忆方案的定稿。  
 > 先复述 §0 与 §11，再看 §10 的 TODO List，等我指示，别直接改代码。」
 >
-> **当前状态**：设计与 0a/0b 已落地（发布链路 + 回退链路跑通，生产入口在
-> `%LOCALAPPDATA%\HumanityMemory\release\current\humanity-memory.exe`，发布根**不在项目树内**）。
+> **当前状态**：设计与 0a/0b 已落地并**已发布**（发布链路 + 回退链路跑通，生产入口在
+> `%LOCALAPPDATA%\HumanityMemory\release\current\humanity-memory.exe`，发布根**不在项目树内**；
+> 2026-11-16 依次发布 v0.2.0 / v0.3.0 / v0.3.1，`current` 现指向 v0.3.1）。
 >
 > **两类化改造已全部落地（2026-11-16）**：`memory_write` 只认 `experience` / `episode`；
 > `state` 类与复核梯子整体删除（`memory_review` / `memory_review_list` / `state_interval_days` 全部下线）；
 > 新增 `needs_verify` 读时标记；测试 132 条全绿；`docs/` 与 `skills/` 口径已同步。
 > **schema 仍是 v4，8 个真实库一个字节都没动**（§7 / §8.1 已说明为什么不用动）。
 >
-> **下一步**：按用户指示再发布。
+> **下一步**：无发布待办。后续改动仍走「重新打包 → `--publish` → smoke → 切 `current`」链路，改源码本身不影响生产 exe。
 >
 > **回退安全性已实测**：新代码写旧库时 `kind` 走列默认值，落成 `'knowledge'` / `'narrative'`——
 > 正好是旧四类代码期望的值，所以**只换 exe 就能退**，不需要连库一起退。
