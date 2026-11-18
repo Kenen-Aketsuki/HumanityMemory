@@ -316,6 +316,15 @@ def _prepare_apply_items(
 
 class MemoryStore:
     def __init__(self, cfg: Config, layout: Layout) -> None:
+        # 前置断言：没有库就没有 store。放在最前面，是为了让"绕过准入层直接
+        # 拿 CLI 打开一个不存在的库"当场失败 —— 否则 open_db 会顺手把空库建出来，
+        # 未接入的工作区就又多了一个 `.ai_memory/workspace.db`（A1 的破口）。
+        if layout.library_dir is None or layout.workspace_db is None:
+            raise ScopeError(
+                "memory_unavailable：当前会话没有接入记忆库。\n"
+                "先在项目里签发令牌（bind new / bind existing / bind adopt），"
+                "或本次不接入（bind decline）。"
+            )
         self.cfg = cfg
         self.layout = layout
         self.embedder = EmbeddingProvider(cfg)

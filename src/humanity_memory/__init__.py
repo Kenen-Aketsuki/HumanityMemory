@@ -9,12 +9,12 @@
 
 from __future__ import annotations
 
-from .config import Config
+from .config import NO_LIBRARY, Config
 from .models import Episode, Experience, Hit, LogEntry
 from .paths import Layout, resolve_layout
 from .store import MemoryStore, NotFound, ScopeError
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 __all__ = [
     "Config",
@@ -24,6 +24,7 @@ __all__ = [
     "Layout",
     "LogEntry",
     "MemoryStore",
+    "NO_LIBRARY",
     "NotFound",
     "ScopeError",
     "resolve_layout",

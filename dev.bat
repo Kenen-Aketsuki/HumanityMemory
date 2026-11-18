@@ -30,10 +30,10 @@ set "HM_WORKSPACE=%DEV_WS%"
 set "CLI=%~dp0.venv\Scripts\humanity-memory.exe"
 rem NOTE: keep this file ASCII-only. cmd.exe reads .bat as the OEM codepage
 rem (GBK on zh-CN), so UTF-8 Chinese text here breaks parsing.
-rem For MCP startup the token's workspace outranks --workspace and
-rem HM_WORKSPACE, so the production active.token.json would drag a dev server
-rem back onto the production database. Hence a separate dev token.
-set "DEV_TOKEN=%USERPROFILE%\.humanity-memory\dev.token.json"
+rem Since token v2 (2026-11-18) the token is NOT an identity source any more:
+rem it is a per-project proof found under <root>\.ai_memory\token.json, and
+rem --workspace / HM_WORKSPACE is what pins a session. So the dev entry pins
+rem with --workspace only; dev.token.json is retired and must not be passed.
 
 if not exist "%CLI%" (
   echo [ERROR] source CLI not found: %CLI%
@@ -51,14 +51,8 @@ set "RC=%ERRORLEVEL%"
 endlocal & exit /b %RC%
 
 :serve
-if not exist "%DEV_TOKEN%" (
-  echo [ERROR] dev token missing: %DEV_TOKEN%
-  echo         copy active.token.json there and set "workspace" to %DEV_WS%
-  pause
-  exit /b 1
-)
-echo [dev] workspace = %DEV_WS%  (token-pinned)
-"%CLI%" --token "%DEV_TOKEN%" --workspace "%DEV_WS%" serve
+echo [dev] workspace = %DEV_WS%  (workspace-pinned)
+"%CLI%" --workspace "%DEV_WS%" serve
 set "RC=%ERRORLEVEL%"
 endlocal & exit /b %RC%
 

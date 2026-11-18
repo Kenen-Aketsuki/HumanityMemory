@@ -11,23 +11,22 @@ import os
 import sys
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from . import __version__, rules
-from .config import Config
+from . import __version__, bindings, keys, rules
+from .config import NO_LIBRARY, Config
 from .paths import (
+    WORKSPACE_DIR,
     Layout,
+    empty_layout,
     ensure_rules,
-    find_project_root,
-    find_workspace_dir,
-    read_last_workspace,
     resolve_layout,
-    write_last_workspace,
 )
 from .store import ConsolidationRejected, MemoryStore, NotFound, ScopeError, _norm_kind
-from .token import Token, TokenError, resolve_token_path
+from .token import Token, TokenError, build_token, resolve_token_path, same_path, token_path
 
 INSTRUCTIONS_TAIL = """\
 记忆使用纪律：
@@ -44,6 +43,12 @@ INSTRUCTIONS_TAIL = """\
 - 复盘时先用 consolidate_preview 取素材，总结后用 consolidate_apply 提交。
 - 一个 server 可以服务多个项目：如果在某个具体项目里工作，而 memory_stats 显示的工作区
   不是你预期的那个，先调用 memory_use_workspace 传入项目根目录再继续。
+
+绑定纪律（未接入时）：
+- 先调用 memory_bind_status 看 code。code 不为 null 时**先向用户提问**：
+  新建独立库 / 并入已有库 / 沿用本目录已有的库 / 本次不接入。
+- 拿到答复再调对应的 memory_bind_new / memory_bind_existing / memory_bind_adopt /
+  memory_bind_decline。**不要自己选**，不要在拒绝态下反复尝试写入。
 - 记忆有生命周期：长期不用会被归档（默认检索不到但内容还在）。想清理时先
   memory_archive 预览、memory_purge_candidates 看候选，**永远不要自动删**。
 """
@@ -66,35 +71,176 @@ def _err(message: str) -> dict[str, Any]:
     return {"ok": False, "error": message}
 
 
-def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> MCPServer:
-    # 先定布局再装配置：项目级 memory.toml 挂在 .ai_memory/ 下，
-    # 反过来就永远读不到项目覆盖。
-    layout = layout or resolve_layout()
-    cfg = cfg or Config.load(workspace=layout.workspace_dir)
+def build_server(
+    cfg: Config | None = None,
+    *,
+    layout: Layout | None = None,
+    session: "bindings.Session | None" = None,
+) -> MCPServer:
+    """装配 MCP server。
 
-    ensure_rules(layout.global_rules)
-    if layout.workspace_rules is not None:
-        ensure_rules(layout.workspace_rules)
+    `session` 决定工具面：接进去了就全量注册；没接进去（拒绝态）**只注册
+    `bind_*` 与 `memory_use_workspace`**，其余 24 个工具一个都不注册。
 
-    store = MemoryStore(cfg, layout)
+    为什么是"不注册"而不是"注册后报错"：模型看不到工具就不会调，
+    也就不会出现"agent 以为写入成功"这类事故（§6.4）。
+    """
+    # 先定布局再装配置：库级 memory.toml 挂在库目录（自有库 = .ai_memory/）下，
+    # 反过来就永远读不到库级覆盖。
+    if session is None:
+        layout = layout or resolve_layout()
+        cfg = cfg or Config.load(library_dir=layout.library_dir)
+        session = bindings.Session(
+            ok=layout.library_dir is not None,
+            workspace_root=layout.workspace_root,
+            library_dir=layout.library_dir,
+            layout=layout,
+        )
+    layout = layout or session.layout or empty_layout(root=session.workspace_root)
+    cfg = cfg or Config.load(
+        library_dir=layout.library_dir if layout.library_dir else NO_LIBRARY
+    )
+
+    bound = bool(session.ok and layout.library_dir is not None)
+
+    if bound:
+        ensure_rules(layout.global_rules)
+        if layout.workspace_rules is not None:
+            ensure_rules(layout.workspace_rules)
+        store: MemoryStore | None = MemoryStore(cfg, layout)
+    else:
+        # 拒绝态不碰任何项目文件：连信条都不建（那也是一次写盘）
+        ensure_rules(layout.global_rules)
+        store = None
 
     # 工具闭包通过这里取当前 store —— 一条配置服务多个空间的前提：
     # 允许运行中切换到另一个工作区，而不是重建整个进程。
-    state: dict[str, Any] = {"store": store, "layout": layout}
+    state: dict[str, Any] = {"store": store, "layout": layout, "session": session}
     state_lock = threading.Lock()
 
     def _st() -> MemoryStore:
-        return state["store"]
+        current = state["store"]
+        if current is None:  # 拒绝态不会走到这里：那 24 个工具没注册
+            raise RuntimeError("未接入记忆库：当前会话没有可用的 store")
+        return current
 
     def _lay() -> Layout:
         return state["layout"]
+
+    # ---- 切库 / 绑定的公共动作 ----
+
+    def _rebind(new_session: "bindings.Session") -> str | None:
+        """按新会话重建 store + 重载配置（F2：配置跟着库走，必须换 cfg）。
+
+        返回错误文本，`None` 表示成功。
+        """
+        new_layout = new_session.layout
+        if new_layout is None or new_layout.library_dir is None:
+            return "解析到的布局里没有库目录"
+        try:
+            if new_layout.workspace_rules is not None:
+                ensure_rules(new_layout.workspace_rules)
+            new_cfg = Config.load(library_dir=new_layout.library_dir)
+            new_store = MemoryStore(new_cfg, new_layout)
+        except Exception as exc:  # noqa: BLE001
+            return f"切换失败：{type(exc).__name__}: {exc}"
+        with state_lock:
+            old = state["store"]
+            state.update(store=new_store, layout=new_layout, session=new_session)
+        if old is not None:
+            old.close()
+        return None
+
+    def _unbind(root: Path | None = None) -> None:
+        """回到拒绝态：关库、清 store，并把 session 换成新的拒绝结论。
+
+        只清 store 不清 session 的话，`memory_bind_status` 会继续报告上一次
+        的状态 —— 刚做完 decline 却显示 no_token，等于把用户刚做的决定当没发生。
+        """
+        refusal = bindings.resolve_session(root) if root is not None else None
+        with state_lock:
+            old = state["store"]
+            state["store"] = None
+            if refusal is not None:
+                state["session"] = refusal
+                state["layout"] = empty_layout(root=refusal.workspace_root)
+        if old is not None:
+            old.close()
+
+    def _bind_root(workspace: str | None) -> Path | dict[str, Any]:
+        """bind_* 的公共入口：确定要动的项目根，拿不到就返回拒绝载荷。"""
+        hint = workspace or (
+            state["session"].workspace_root if state["session"] else None
+        )
+        if hint is None:
+            return bindings.resolve_session(workspace).to_json()
+        root = Path(str(hint)).expanduser()
+        if root.name == WORKSPACE_DIR:
+            root = root.parent
+        if not root.is_dir():
+            return {
+                "ok": False,
+                "error": "memory_unavailable",
+                "code": "no_workspace",
+                "reason": f"目录不存在：{root}",
+            }
+        return root
+
+    def _apply_binding(result: Any, note: str) -> dict[str, Any]:
+        """把 `bindings.bind_*` 的返回值落到当前会话上。"""
+        if isinstance(result, dict):  # 已经是拒绝载荷
+            return result
+        if not result.ok:  # decline：合法的"不接入"，不挂工具
+            _unbind(result.workspace_root)
+            payload = result.to_json()
+            payload["note"] = note
+            return payload
+        error = _rebind(result)
+        if error is not None:
+            return _err(error)
+        payload = _ok(
+            note=note,
+            workspace_root=str(result.workspace_root),
+            library=result.record.library if result.record else None,
+            library_dir=str(result.library_dir),
+        )
+        payload["tools_registered"] = activate()
+        return payload
+
+    def _candidate_libraries() -> list[dict[str, Any]] | dict[str, str]:
+        try:
+            registry = keys.read()
+        except keys.RegistryError as exc:
+            return {"error": str(exc)}
+        return [
+            {
+                "library": label,
+                "path": str(lib.path),
+                "exists": lib.path.is_dir(),
+            }
+            for label, lib in sorted(registry.libraries.items())
+        ]
+
+    def _legacy_hint(root: Path | None) -> dict[str, str] | None:
+        """有库没令牌 = 最需要 adopt 的那种现场，单独指出来。"""
+        if root is None:
+            return None
+        db = root / WORKSPACE_DIR / bindings.DB_NAME
+        if db.is_file() and not token_path(root).is_file():
+            return {
+                "workspace_db": str(db),
+                "hint": "本目录已有库但没有令牌 → memory_bind_adopt 可沿用它",
+            }
+        return None
 
     instructions = (
         rules.render_instructions(
             global_rules=_lay().global_rules,
             workspace_rules=_lay().workspace_rules,
             workspace_label=(
-                _lay().workspace_dir.parent.name if _lay().workspace_dir else None
+                _lay().workspace_root.name
+                if _lay().workspace_root
+                else (_lay().library_dir.parent.name if _lay().library_dir else None)
             ),
         )
         + INSTRUCTIONS_TAIL
@@ -107,9 +253,41 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         instructions=instructions,
     )
 
+    bound_flag = {"on": bound}
+    deferred: list[tuple[Any, dict[str, Any]]] = []
+
+    def tool(**kwargs: Any):
+        """条件注册：未接入时把装饰器换成「先记账、晚点注册」。
+
+        记账而不是丢弃，是为了 R-11：boot 实例的 cwd 可能落在
+        `~/.humanity-memory`，那时整个会话是拒绝态；等 agent 用
+        `memory_bind_*` / `memory_use_workspace` 接进去之后，这些工具要
+        **当场出现**，而不是让用户重启客户端。工具名单只有这一份 ——
+        写在别处迟早会和实现漂移。
+        """
+        if bound_flag["on"]:
+            return app.tool(**kwargs)
+
+        def _defer(fn: Any) -> Any:
+            deferred.append((fn, kwargs))
+            return fn
+
+        return _defer
+
+    def activate() -> int:
+        """把延迟注册的工具一次性挂上（切库 / 绑定成功后调用）。"""
+        if bound_flag["on"]:
+            return 0
+        for fn, kwargs in deferred:
+            app.add_tool(fn, **kwargs)
+        count = len(deferred)
+        deferred.clear()
+        bound_flag["on"] = True
+        return count
+
     # ------------------------------------------------------------- 信条
 
-    @app.tool(
+    @tool(
         name="rules_get",
         description="读取绝对信条（全局 + 工作区）。信条不进向量库、不参与检索、不会被遗忘。",
     )
@@ -131,7 +309,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         except Exception as exc:  # noqa: BLE001
             return _err(f"读取失败：{type(exc).__name__}: {exc}")
 
-    @app.tool(
+    @tool(
         name="rules_append",
         description="向信条文件追加一条硬规则（只追加，不改既有内容）。scope=global 影响所有项目。",
     )
@@ -159,7 +337,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
 
     # ------------------------------------------------------------- 陈述
 
-    @app.tool(
+    @tool(
         name="memory_write",
         description=(
             "唯一的写入口，按 kind 分派：experience（经验）/ episode（经历）。"
@@ -232,7 +410,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
             )
         return _ok(**payload)
 
-    @app.tool(
+    @tool(
         name="memory_verify",
         description="给一条经验落一条证据：ok=true 按间隔加分，ok=false 按同一条幂律扣分。"
         "level 决定证据权重：L1/L2 计分，L3 只留痕。",
@@ -272,7 +450,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         except Exception as exc:  # noqa: BLE001
             return _err(f"核验失败：{type(exc).__name__}: {exc}")
 
-    @app.tool(
+    @tool(
         name="memory_invalidate",
         description="让一条经验失效（不删除，保留历史）。被更好的结论取代时用它。",
     )
@@ -284,7 +462,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
             return _err(str(exc))
         return _ok(item=item.to_dict())
 
-    @app.tool(
+    @tool(
         name="memory_promote",
         description="已下线（§8.2）：全局库已关闭，没有可提升的去处。调用会明确报错。",
     )
@@ -300,7 +478,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
             return _err(str(exc))
         return _err("memory_promote 已下线（§8.2）")
 
-    @app.tool(name="memory_list", description="列出条目，默认只列有效的。kinds 不传即全部。")
+    @tool(name="memory_list", description="列出条目，默认只列有效的。kinds 不传即全部。")
     def memory_list(
         kinds: list[str] | str | None = None,
         scope: str = "all",
@@ -344,7 +522,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
 
     # ------------------------------------------------------------- 日志
 
-    @app.tool(
+    @tool(
         name="log_append",
         description="追加一条当天日志（只追加、不可改）。白天记录事件与排查过程用它。",
     )
@@ -370,7 +548,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
             return _err(f"写入失败：{type(exc).__name__}: {exc}")
         return _ok(log=entry.to_dict())
 
-    @app.tool(name="log_list", description="按日期列出日志，默认今天且含已复盘的。")
+    @tool(name="log_list", description="按日期列出日志，默认今天且含已复盘的。")
     def log_list(
         day: str | None = None, include_consolidated: bool = True, limit: int = 100
     ) -> dict[str, Any]:
@@ -390,7 +568,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
 
     # ------------------------------------------------------------- 检索
 
-    @app.tool(
+    @tool(
         name="memory_search",
         description=(
             "混合检索（经验 + 经历 + 日志，自动含全局库）。"
@@ -437,7 +615,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
             payload["results"] = [h.to_dict() for h in hits]
         return _ok(**payload)
 
-    @app.tool(
+    @tool(
         name="memory_recall",
         description="按当前话题召回并强化命中项。只回 lines（省 token），需要元数据用 memory_search。",
     )
@@ -478,7 +656,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
             payload["results"] = [h.to_dict() for h in hits]
         return _ok(**payload)
 
-    @app.tool(
+    @tool(
         name="memory_deep_recall",
         description=(
             "深度回忆：只翻遗忘层（0 级）。命中的经历记一次 revive_hits，"
@@ -522,7 +700,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
 
     # ------------------------------------------------------------- 复盘
 
-    @app.tool(
+    @tool(
         name="consolidate_preview",
         description="取出某天待复盘的原始日志供你总结。只读，不改任何数据。",
     )
@@ -539,7 +717,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         except (ValueError, ScopeError) as exc:
             return _err(str(exc))
 
-    @app.tool(
+    @tool(
         name="consolidate_apply",
         description="提交复盘结果：写入提炼的经验与经历，标记日志已处理，可选清空原始日志。"
         "整批前置校验，任一项不合法（放错数组、超长、空内容）就整批拒绝、零写入且原始日志保留；"
@@ -591,50 +769,133 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
 
     @app.tool(
         name="memory_use_workspace",
-        description="切换当前记忆工作区到指定项目目录。一条 server 配置即可服务多个项目。",
+        description="切换当前记忆工作区到指定项目目录。先校验令牌；未接入就返回清单，不建库。",
     )
     def memory_use_workspace(
-        path: str, rules: str | None = None, persist: bool = True
+        path: str, rules: str | None = None, persist: bool = False
     ) -> dict[str, Any]:
         """
         Args:
             path: 项目根目录（不是 .ai_memory 目录）。
             rules: 信条文件路径；不传则自动探测 <项目>/.workbuddy/memory/信条.md。
-            persist: 记为「上次工作区」，下次 server 启动自动接上。
+            persist: 已失效（A3 删了 last-workspace.txt），恒为进程内生效。
         """
-        try:
-            new_layout = resolve_layout(path, rules_path=rules)
-        except Exception as exc:  # noqa: BLE001
-            return _err(f"解析工作区失败：{type(exc).__name__}: {exc}")
-        if new_layout.workspace_dir is None:
-            return _err(f"无法在该路径建立工作区：{path}")
-
-        with state_lock:
-            try:
-                if new_layout.workspace_rules is not None:
-                    ensure_rules(new_layout.workspace_rules)
-                new_store = MemoryStore(cfg, new_layout)
-            except Exception as exc:  # noqa: BLE001
-                return _err(f"切换失败：{type(exc).__name__}: {exc}")
-            old_store = state["store"]
-            state["store"] = new_store
-            state["layout"] = new_layout
-            if persist:
-                try:
-                    write_last_workspace(new_layout.workspace_dir.parent)
-                except OSError:
-                    pass
-            old_store.close()
-
+        new_session = bindings.resolve_session(path, rules_path=rules)
+        if not new_session.ok:
+            # 拒绝也是正常返回：带上 code 与清单，agent 直接复述给用户（§6.1）
+            return new_session.to_json()
+        error = _rebind(new_session)
+        if error is not None:
+            return _err(error)
         return _ok(
-            switched_to=new_layout.describe(),
-            rules=str(new_layout.workspace_rules) if new_layout.workspace_rules else None,
-            persisted=persist,
+            switched_to=(new_session.layout or _lay()).describe(),
+            library=new_session.record.library if new_session.record else None,
+            rules=(
+                str(new_session.layout.workspace_rules)
+                if new_session.layout and new_session.layout.workspace_rules
+                else None
+            ),
+            persisted=False,
+            tools_registered=activate(),
         )
+
+    # ------------------------------------------------------------- 绑定（§6.4）
+
+    @app.tool(
+        name="memory_bind_status",
+        description="报告本工作区的接入状态（四态 + 错误码 + 出路清单），可预检任意路径。",
+    )
+    def memory_bind_status(workspace: str | None = None) -> dict[str, Any]:
+        """
+        Args:
+            workspace: 可选，任意项目根目录；不传就看当前会话。
+        """
+        session = (
+            bindings.resolve_session(workspace) if workspace else state["session"]
+        )
+        payload = session.to_json()
+        payload["current"] = _lay().describe()
+        payload["candidates"] = _candidate_libraries()
+        payload["legacy"] = _legacy_hint(session.workspace_root)
+        return payload
+
+    @app.tool(
+        name="memory_bind_new",
+        description="给本工作区新建一个独立库并签发令牌（未接入时才需要）。",
+    )
+    def memory_bind_new(label: str | None = None, workspace: str | None = None) -> dict[str, Any]:
+        """
+        Args:
+            label: 库名（小写字母/数字/下划线）；不传就用目录名。
+            workspace: 可选，项目根目录；不传用当前会话的 root。
+        """
+        root = _bind_root(workspace)
+        if isinstance(root, dict):
+            return root
+        try:
+            return _apply_binding(
+                bindings.bind_new(root, label), "已新建库并签发令牌"
+            )
+        except bindings.BindingError as exc:
+            return exc.to_json()
+
+    @app.tool(
+        name="memory_bind_adopt",
+        description="把本目录已有的 .ai_memory/workspace.db 登记为自有库并签发令牌（存量迁移入口）。",
+    )
+    def memory_bind_adopt(workspace: str | None = None) -> dict[str, Any]:
+        root = _bind_root(workspace)
+        if isinstance(root, dict):
+            return root
+        try:
+            return _apply_binding(
+                bindings.bind_adopt(root), "已把现有库登记为自有库"
+            )
+        except bindings.BindingError as exc:
+            return exc.to_json()
+
+    @app.tool(
+        name="memory_bind_existing",
+        description="把本工作区绑到 registry 里已有的库（A、B 共用一个库）。",
+    )
+    def memory_bind_existing(library: str, workspace: str | None = None) -> dict[str, Any]:
+        """
+        Args:
+            library: 已有库的标签（见 memory_bind_status 的 candidates）。
+            workspace: 可选，项目根目录。
+        """
+        root = _bind_root(workspace)
+        if isinstance(root, dict):
+            return root
+        try:
+            return _apply_binding(
+                bindings.bind_existing(root, library), f"已并入库 `{library}`"
+            )
+        except bindings.BindingError as exc:
+            return exc.to_json()
+
+    @app.tool(
+        name="memory_bind_decline",
+        description="明确表示本工作区不接入记忆库（写入 library=null 令牌，之后不再问）。",
+    )
+    def memory_bind_decline(workspace: str | None = None) -> dict[str, Any]:
+        root = _bind_root(workspace)
+        if isinstance(root, dict):
+            return root
+        try:
+            refusal = bindings.bind_decline(root)
+        except bindings.BindingError as exc:
+            return exc.to_json()
+        # 拒绝态要把记忆工具收回去：这次是「决定不接入」，不是「暂时没接」
+        _unbind(root)
+        payload = refusal.to_json()
+        payload = refusal.to_json()
+        payload["note"] = "已记住这个决定；想改主意随时 memory_bind_new / memory_bind_existing。"
+        return payload
 
     # ------------------------------------------------------------- 生命维持
 
-    @app.tool(
+    @tool(
         name="memory_judge",
         description=(
             "跑一遍到期裁定：按周期活跃度升降遗忘等级。纯机器计算，"
@@ -665,7 +926,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         except Exception as exc:  # noqa: BLE001
             return _err(f"裁定失败：{type(exc).__name__}: {exc}")
 
-    @app.tool(
+    @tool(
         name="memory_archive",
         description="按「久未触碰 + 访问少」归档低价值记忆。默认只预览，dry_run=false 才执行。",
     )
@@ -684,7 +945,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         except Exception as exc:  # noqa: BLE001
             return _err(f"归档失败：{type(exc).__name__}: {exc}")
 
-    @app.tool(name="memory_unarchive", description="把已归档的记忆恢复正常（会重新嵌入）。")
+    @tool(name="memory_unarchive", description="把已归档的记忆恢复正常（会重新嵌入）。")
     def memory_unarchive(memory_id: str) -> dict[str, Any]:
         try:
             with state_lock:
@@ -694,7 +955,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         except Exception as exc:  # noqa: BLE001
             return _err(f"恢复失败：{type(exc).__name__}: {exc}")
 
-    @app.tool(
+    @tool(
         name="memory_purge_candidates",
         description=(
             "删除候选：已归档超期的 + 落在遗忘层（0 级）超期且没复活够的。"
@@ -717,7 +978,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
             note="删除不可恢复。确认后调用 memory_purge(ids=[...])；不确认就保留，它们已不参与检索。",
         )
 
-    @app.tool(
+    @tool(
         name="memory_purge",
         description=(
             "物理删除指定记忆（含向量）。不可恢复；只接受已归档的、"
@@ -740,7 +1001,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         except Exception as exc:  # noqa: BLE001
             return _err(f"删除失败：{type(exc).__name__}: {exc}")
 
-    @app.tool(
+    @tool(
         name="memory_compress_preview",
         description=(
             "取待压缩队列：按遗忘等级推出「当前压得不够深」的经历（只读）。"
@@ -760,7 +1021,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         except Exception as exc:  # noqa: BLE001
             return _err(f"查询失败：{type(exc).__name__}: {exc}")
 
-    @app.tool(
+    @tool(
         name="memory_compress_apply",
         description=(
             "把压好的内容**定向覆盖**回原经历（id、at、条目数都不变）。"
@@ -786,7 +1047,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         except Exception as exc:  # noqa: BLE001
             return _err(f"压缩失败：{type(exc).__name__}: {exc}")
 
-    @app.tool(
+    @tool(
         name="memory_stats",
         description="查看两库统计：经验/经历/日志数量、待复盘、待嵌入、全局库是否膨胀。",
     )
@@ -799,7 +1060,7 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
         data["vec_source"] = _st().vec_source
         return _ok(stats=data)
 
-    @app.tool(
+    @tool(
         name="memory_maintenance",
         description="补跑缺失的 embedding，并返回待复盘与整理提示。",
     )
@@ -860,13 +1121,15 @@ def _parse_args(argv: list[str]) -> tuple[str | None, str | None, str | None]:
 
 
 def _write_probe(
-    argv: list[str], layout: Layout, source: str, token: Token | None, cfg: Config
+    argv: list[str], layout: Layout, source: str, session: "bindings.Session", cfg: Config
 ) -> None:
     """把启动时的关键上下文写进诊断文件。
 
     MCP 协议不提供"当前工作区"信息，所以只能靠观测客户端的行为来确定
     cwd 是什么、解析走了哪条路。这个探针就是为此存在的——出问题时
     先看 `~/.humanity-memory/diagnostics/startup.json`。
+
+    拒绝态也要写：那种时候最需要回答"它到底以为自己在哪儿"。
     """
     try:
         diag = layout.global_dir / "diagnostics"
@@ -878,9 +1141,13 @@ def _write_probe(
             "pid": os.getpid(),
             "ppid": os.getppid(),
             "source": source,
-            "workspace_dir": str(layout.workspace_dir) if layout.workspace_dir else None,
+            "bound": session.ok,
+            "code": session.code,
+            "workspace_root": str(session.workspace_root) if session.workspace_root else None,
+            "library": session.record.library if session.record else None,
+            "library_dir": str(layout.library_dir) if layout.library_dir else None,
             "rules": str(layout.workspace_rules) if layout.workspace_rules else None,
-            "token": str(token.path) if token else None,
+            "token": str(session.token.path) if session.token else None,
             "embedding_configured": cfg.embedding_configured,
         }
         text = json.dumps(payload, ensure_ascii=False, indent=2)
@@ -897,22 +1164,20 @@ def main() -> None:
 
     argv = sys.argv[1:]
     workspace_arg, rules_arg, token_arg = _parse_args(argv)
-
-    token = None
     source = "none"
 
     if token_arg:
-        token_path = resolve_token_path(token_arg)
+        # `--token` 在 v2 里只剩两件事：路径覆盖 + 用令牌里的 workspace 当 hint。
+        # 它**不再**是身份来源 —— 是否放行仍由 §5.5 七步校验决定。
         try:
-            token = Token.load(token_path)
+            token = Token.load(resolve_token_path(token_arg))
         except TokenError as exc:
-            print(f"[humanity-memory] 令牌加载失败：{exc}", file=sys.stderr)
+            print(
+                f"[humanity-memory] 令牌不可用（{exc.code}）：{exc}",
+                file=sys.stderr,
+            )
             raise SystemExit(2) from exc
-        # 令牌里的 embedding 配置优先级最高，必须在 Config.load() 之前注入
-        token.apply_embedding_env()
         workspace_arg = str(token.workspace)
-        if token.rules is not None:
-            rules_arg = str(token.rules)
         source = "token"
         print(
             f"[humanity-memory] token    : {token.path} (label={token.display})",
@@ -924,34 +1189,33 @@ def main() -> None:
         workspace_arg = os.environ["HM_WORKSPACE"]
         source = "env"
     else:
-        # 1) cwd 向上找已存在的 .ai_memory（只找不建）
-        found = find_workspace_dir(create=False)
-        if found is not None:
-            workspace_arg = str(found.parent)
-            source = "cwd"
-        else:
-            # 2) cwd 处在一个「像项目」的目录树里 → 在项目根自动建，
-            #    省掉每个项目手动 init 一次
-            root = find_project_root()
-            if root is not None:
-                workspace_arg = str(root)
-                source = "cwd-project"
-                print(
-                    f"[humanity-memory] 首次在 {root} 使用，自动建立记忆库",
-                    file=sys.stderr,
-                )
-            else:
-                # 3) 兜底：上次用过的工作区
-                last = read_last_workspace()
-                if last is not None:
-                    workspace_arg = str(last)
-                    source = "last"
-                    print(f"[humanity-memory] 沿用上次工作区：{last}", file=sys.stderr)
+        source = "cwd"
 
-    layout = resolve_layout(
-        workspace_arg, rules_path=rules_arg, create=workspace_arg is not None
-    )
-    cfg = Config.load(workspace=layout.workspace_dir)
+    # §5.5 七步校验：任一失败就进拒绝态 —— 不是退出进程，
+        # 而是注册一张只剩 bind_* 的工具面（§6.4）。boot 实例 cwd 落在
+        # `~/.humanity-memory` 时，整个会话还能自救（R-11）。
+    session = bindings.resolve_session(workspace_arg, rules_path=rules_arg)
+
+    if session.ok:
+        layout = session.layout or empty_layout(root=session.workspace_root)
+        cfg = Config.load(library_dir=layout.library_dir)
+        print(
+            f"[humanity-memory] workspace: {layout.library_dir} "
+            f"(来自 {source}, library={session.record.library if session.record else '?'})",
+            file=sys.stderr,
+        )
+        if layout.workspace_rules is not None:
+            print(f"[humanity-memory] rules    : {layout.workspace_rules}", file=sys.stderr)
+    else:
+        layout = empty_layout(root=session.workspace_root)
+        # 拒绝态绝不读库级 toml：那会拿别人的阈值去算（F3）
+        cfg = Config.load(library_dir=NO_LIBRARY)
+        print(
+            f"[humanity-memory] 未接入（{session.code}）：{session.reason}",
+            file=sys.stderr,
+        )
+        for item in session.checklist:
+            print(f"[humanity-memory]   {item}", file=sys.stderr)
 
     if not cfg.embedding_configured:
         print(
@@ -959,23 +1223,10 @@ def main() -> None:
             "设置 HM_EMBED_BASE_URL / HM_EMBED_MODEL 可启用语义检索。",
             file=sys.stderr,
         )
-    if layout.workspace_dir is None:
-        print(
-            "[humanity-memory] 未确定工作区，当前只能读写全局库。"
-            "可用 memory_use_workspace 指定项目目录。",
-            file=sys.stderr,
-        )
-    else:
-        print(
-            f"[humanity-memory] workspace: {layout.workspace_dir} (来自 {source})",
-            file=sys.stderr,
-        )
-        if layout.workspace_rules is not None:
-            print(f"[humanity-memory] rules    : {layout.workspace_rules}", file=sys.stderr)
 
-    _write_probe(argv, layout, source, token, cfg)
+    _write_probe(argv, layout, source, session, cfg)
 
-    app = build_server(cfg, layout=layout)
+    app = build_server(cfg, layout=layout, session=session)
     app.run(transport="stdio")
 
 

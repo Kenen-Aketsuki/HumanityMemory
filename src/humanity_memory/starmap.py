@@ -1239,11 +1239,18 @@ def _levels_from_config(
     等级表是**配置**定义的（档数、每档周期、压缩档），代码里不该有「一共 5 档」
     这种常数。这里只读不写：``Config.load`` 干的活就是找文件 + 解析 + 合并 + 校验。
     """
-    from .config import Config  # 延迟 import：星图本体仍然靠标准库就能跑起来
+    from .config import NO_LIBRARY, Config  # 延迟 import：星图本体仍然靠标准库就能跑起来
 
-    ws = db.parent if db.parent.name == ".ai_memory" else None
+    # 库目录 = 库文件所在目录：自有库是 `.ai_memory`，共享库是 `libraries/<label>`。
+    # 若两者都不像（比如随手拷到临时目录的备份库），宁可**不读**库级配置 ——
+    # 让它去猜 cwd 上面那个项目的 memory.toml 只会拿到一份无关的参数。
+    parent = db.parent
+    if parent.name == ".ai_memory" or (parent / "memory.toml").is_file():
+        lib = parent
+    else:
+        lib = NO_LIBRARY
     try:
-        cfg = Config.load(environ, workspace=ws)
+        cfg = Config.load(environ, library_dir=lib)
     except Exception:  # noqa: BLE001 —— 配置坏了也不该连星图都打不开，退回库里的档位
         return None
     levels = cfg.forget_levels

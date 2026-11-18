@@ -567,19 +567,15 @@ def rewrite_mcp(assume_yes: bool) -> None:
         return
 
     old_args = [str(a) for a in old.get("args", [])]
-    token = ""
-    for i, arg in enumerate(old_args):
-        if arg == "--token" and i + 1 < len(old_args):
-            token = old_args[i + 1]
-    if not token:
-        token = str(Path.home() / ".humanity-memory" / "active.token.json")
+    had_token = "--token" in old_args
 
-    # `--token` 是**全局**参数，必须排在子命令前面。
-    # 写成 `serve --token x` 时 argparse 直接报 unrecognized arguments 退出，
-    # 客户端看到的就是 `MCP error -32000: Connection closed`（实测踩过）。
+    # `--token` 不再是身份来源（A2）：令牌就在 `<项目>/.ai_memory/token.json`，
+    # 由 cwd 发现，客户端配置只剩「exe + serve」。
+    # 这里**不再回填** --token —— 否则迁移（bind migrate）删掉的那一项，
+    # 下次发版又会被原样塞回去，升级一次退一次。
     new = {
         "command": str(CURRENT_LINK / f"{APP_NAME}.exe"),
-        "args": ["--token", token, "serve"],
+        "args": ["serve"],
     }
     if old.get("env"):
         new["env"] = old["env"]
@@ -591,6 +587,8 @@ def rewrite_mcp(assume_yes: bool) -> None:
     say("\n  mcp.json 变更：")
     say(f"    command: {old.get('command')}  →  {new['command']}")
     say(f"    args   : {old_args}  →  {new['args']}")
+    if had_token:
+        say("    （--token 已废弃：令牌改由 <项目>/.ai_memory/token.json 按 cwd 发现）")
     if not confirm("  确认改写客户端配置？", assume_yes):
         warn("已跳过 mcp.json 改写——生产仍会跑旧入口")
         return
