@@ -671,7 +671,12 @@ def cmd_retrieval_report(args: argparse.Namespace) -> int:
     除了检索明细，还把「当前等级表阈值」和「最新一份裁定快照」一起塞进去 ——
     页面才能自己算出「维持/升级需要几次命中」「多少节点在降级线下」。
     """
-    from .reports import latest_judge_snapshot, level_thresholds, read_retrievals
+    from .reports import (
+        latest_judge_snapshot,
+        level_thresholds,
+        read_node_activity,
+        read_retrievals,
+    )
     from .retrieval_view import render_retrieval_html
 
     with _open(args) as store:
@@ -699,6 +704,10 @@ def cmd_retrieval_report(args: argparse.Namespace) -> int:
                 "days": args.days,
                 "levels": level_thresholds(store.cfg),
                 "nodes": nodes,
+                # 热度榜的第二个排序维度：库里的实时活跃度（键 = 节点 id）。
+                # 不用快照里的 activity —— 那是裁定那一刻的切片，而且没跑过裁定的
+                # 工作区压根没有快照，排序维度不能因此消失。
+                "activity": read_node_activity(workspace),
                 "generated": (snapshot or {}).get("generated_at"),
             },
         )

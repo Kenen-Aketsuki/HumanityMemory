@@ -1133,10 +1133,10 @@ WAL 必须先 `checkpoint(TRUNCATE)`，折不全就直接停手——否则换�
 
 | exe 所在位置 | 写 `~\.humanity-memory` | `doctor` |
 | --- | --- | --- |
-| `D:\Wrok_proj\HumanityMemory\release\v0.3.0\`（项目树内） | ❌ `WinError 5` | `readonly database` |
-| `D:\Wrok_proj\HumanityMemory\build\exe-copy\`（换个项目内子目录） | ❌ | `readonly database` |
-| `D:\Wrok_proj\HumanityMemory-release\`（项目同级，**名字仍同前缀**） | ❌ | `readonly database` |
-| `D:\Wrok_proj\HM-release-probe\`（不同前缀） | ✅ | 全绿 |
+| `D:\work\myproj\release\v0.3.0\`（项目树内） | ❌ `WinError 5` | `readonly database` |
+| `D:\work\myproj\build\exe-copy\`（换个项目内子目录） | ❌ | `readonly database` |
+| `D:\work\myproj-release\`（项目同级，**名字仍同前缀**） | ❌ | `readonly database` |
+| `D:\work\other-probe\`（不同前缀） | ✅ | 全绿 |
 | `%LOCALAPPDATA%\HumanityMemory\release\`（**最终选它**） | ✅ | 全绿，embedding 真调 227ms |
 
 前三次失败排除了「权限不够」这类解释：同一个文件、同一个用户、ACL 里 `nino` 是 FullControl，
@@ -1283,7 +1283,7 @@ def resource(name: str) -> Path:
 现在 `~/.workbuddy/mcp.json` 里**根本没有 exe 路径**：
 
 ```json
-"command": "D:/Wrok_proj/HumanityMemory/.venv/Scripts/python.exe",
+"command": "D:/work/myproj/.venv/Scripts/python.exe",
 "args": ["-m", "humanity_memory.mcp_server", "--token", "....token.json"]
 ```
 
@@ -1813,4 +1813,4 @@ def resource(name: str) -> Path:
 - 各类写入粒度 → `skills/humanity-memory/references/writing-guide.md`
 - 召回与检索 → `skills/humanity-memory/references/recall-guide.md`
 - 运行时总入口 → `skills/humanity-memory/SKILL.md`
-- 本文绝对路径 → `D:/Wrok_proj/HumanityMemory/docs/two-tier-memory.md`
+- 本文绝对路径 → `docs/two-tier-memory.md`

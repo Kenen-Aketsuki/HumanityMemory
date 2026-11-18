@@ -17,6 +17,9 @@
 与 `starmap.py` 是同一套链路：读数据 → 生成单文件 HTML → 浏览器打开。
 这样可视化不需要维护第二套取数逻辑。
 
+唯一的例外是 `read_node_activity`：它用只读连接（`mode=ro`）读一次活跃度，
+给检索页的「按活跃度排序」供数。只读、不建表、不写任何一列 —— 那条边界没破。
+
 失败不回滚核心操作
 ------------------
 写报告/写统计失败**不能让检索或裁定失败**：`activity` 已经落库，统计丢了
@@ -26,8 +29,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import quote
 
 from .lifecycle import DAY_MS, period_kind
 
@@ -409,3 +414,50 @@ def level_thresholds(cfg: Any) -> list[dict[str, Any]]:
         )
     levels.sort(key=lambda x: x["level"])
     return levels
+
+
+ACTIVITY_TABLES = ("knowledge", "episodes")
+
+
+def read_node_activity(workspace_dir: Path) -> dict[str, dict[str, Any]]:
+    """库里每个条目的**当前**活跃度，键是节点 id。只读，不写库。
+
+    检索页的「按活跃度排序」拿它当数据源，而不是裁定快照里的 ``activity``：
+
+    * 快照是裁定那一刻的切片，活跃度随时会被下一次召回抬高或按周期清零；
+    * 没跑过裁定的工作区连快照都没有，排序不能因此失效。
+
+    只查有 ``activity`` 列的两张表。日志表没有这一列 —— 它不参与等级机制，
+    也就无所谓活跃度，查出来会是恒 0 的假值（和星图里日志画固定灰同一个理由）。
+
+    任何异常都当「没有数据」：侧栏少一个排序维度，不该让整张页面生成失败。
+    """
+    db = workspace_dir / "workspace.db"
+    if not db.is_file():
+        return {}
+
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        # 与 starmap.open_readonly 同一套写法：as_posix + quote 才能吃下带中文/空格的路径
+        uri = "file:" + quote(db.as_posix(), safe="/:") + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return {}
+    try:
+        for table in ACTIVITY_TABLES:
+            try:
+                rows = conn.execute(
+                    f"SELECT id, activity, forget_level FROM {table}"  # noqa: S608 —— 表名是常量
+                ).fetchall()
+            except sqlite3.Error:
+                continue  # 老库可能还没有这张表，跳过就好
+            for node_id, activity, level in rows:
+                out[str(node_id)] = {
+                    "activity": round(float(activity or 0.0), 4),
+                    "level": int(level) if level is not None else None,
+                }
+    except sqlite3.Error:
+        return out
+    finally:
+        conn.close()
+    return out

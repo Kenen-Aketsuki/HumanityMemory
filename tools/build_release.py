@@ -29,19 +29,22 @@ import sqlite3
 import subprocess
 import sys
 import time
+
+import localenv
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# 发布产物**必须住在项目目录树外**，且路径不能与项目目录同前缀。
-# 原因是实测出来的，不是洁癖：本机宿主沙箱按路径前缀限制「工作区内启动的进程」写工作区外路径。
-# exe 放在 `D:\Wrok_proj\HumanityMemory\...` 或 `...\HumanityMemory-release\...` 都写不了
-# `~/.humanity-memory/global.db`，报 `attempt to write a readonly database`，
-# 客户端表现就是握手前退出 → `MCP error -32000: Connection closed`。
-# `%LOCALAPPDATA%\HumanityMemory\release` 与项目无前缀关系，实测 doctor 全绿、embedding 真调通。
-_LOCALAPPDATA = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
-_DEFAULT_RELEASE = _LOCALAPPDATA / "HumanityMemory" / "release"
-RELEASE = Path(os.environ.get("HM_RELEASE_ROOT") or _DEFAULT_RELEASE).expanduser()
+# 发布产物**必须住在项目目录树外**（真的在树里才算，不含同前缀的兄弟目录）。
+# 具体位置是「这台机器的事」：从 HM_RELEASE_ROOT 环境变量或项目根的 local.env 读，
+# 源码里不出现任何本机路径。未配置时退回用户目录下的通用位置，仅作兜底。
+#
+# 历史：早先这里认为「同前缀的兄弟目录也会被沙箱拦」，2026-11-18 实测未能复现——
+# exe 放在项目同级的 `*-Release` 目录里时，doctor 能读写 `~/.humanity-memory`、
+# 真实 MCP 客户端握手拿到全部工具、也能往用户目录正常写文件。
+# 旧的 `attempt to write a readonly database` 应是早期沙箱行为，故改为按目录边界判断。
+_DEFAULT_RELEASE = Path.home() / "HumanityMemory-Release"
+RELEASE = localenv.get_path("HM_RELEASE_ROOT", _DEFAULT_RELEASE)
 SRC = ROOT / "src"
 TOOLS = ROOT / "tools"
 ENTRY = TOOLS / "release_entry.py"
@@ -866,23 +869,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _assert_release_outside_project() -> None:
-    """发布根必须在项目树外，且**不能与项目路径同前缀**。
+    """发布根必须在项目树外。判断按**目录边界**比较，不做裸字符串前缀。
 
-    实测：`D:\\...\\HumanityMemory-release` 这种同级同前缀目录同样被沙箱拦，
-    只有换成完全不同前缀（`%LOCALAPPDATA%\\HumanityMemory\\release`）才写得进全局库。
-    所以这里用字符串前缀判断，宁可误拦也不放一个"看起来发成功、实际连不上"的包出去。
+    沙箱拦的是「工作区内启动的进程写工作区外路径」，命中条件是路径真的落在
+    项目树里面，而不是名字恰好同前缀。早先这里用 `release.startswith(root)`
+    做过保守拦截，代价是把项目同级的 `*-Release` 兄弟目录也挡了；
+    2026-11-18 实测：exe 放在这种同级目录里仍能正常启动 doctor、
+    读写 `%USERPROFILE%\\.humanity-memory` 全局库、完成真实 MCP 握手，故放宽。
     """
     try:
         release_s = str(RELEASE.resolve())
         root_s = str(ROOT.resolve())
     except OSError:  # pragma: no cover
         return
-    if release_s == root_s or release_s.startswith(root_s):
+    inside = release_s == root_s or release_s.startswith(root_s + os.sep)
+    if inside:
         die(
-            f"发布根不能放在项目目录树内、也不能与项目路径同前缀：{RELEASE}\n"
-            "宿主沙箱按路径前缀拦「工作区内启动的进程写工作区外路径」，\n"
-            "exe 会打不开 ~/.humanity-memory，客户端表现为 MCP error -32000: Connection closed。\n"
-            f"用默认位置（{_DEFAULT_RELEASE}），或把 HM_RELEASE_ROOT 指到一个完全不同前缀的目录。"
+            f"发布根不能放在项目目录树内：{RELEASE}\n"
+            "宿主沙箱会拦「工作区内启动的进程写工作区外路径」，\n"
+            "exe 可能打不开 ~/.humanity-memory，客户端表现为 MCP error -32000: Connection closed。\n"
+            "换一个项目树之外的位置（点名的同级目录即可），写进 local.env 的 HM_RELEASE_ROOT。"
         )
 
 

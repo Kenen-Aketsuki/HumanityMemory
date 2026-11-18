@@ -32,6 +32,8 @@ import sys
 import time
 from pathlib import Path
 
+import localenv
+
 ROOT = Path(__file__).resolve().parent.parent
 WS_DIR = ROOT / ".ai_memory"
 HOME = Path.home()
@@ -40,8 +42,8 @@ MCP_JSON = HOME / ".workbuddy" / "mcp.json"
 ENTRY = "humanity-memory"
 VENV_ENTRY = ROOT / ".venv" / "Scripts" / "humanity-memory.exe"
 
-DEFAULT_RELEASE = Path(os.environ.get("LOCALAPPDATA", str(HOME))) / "HumanityMemory" / "release"
-RELEASE = Path(os.environ.get("HM_RELEASE_ROOT", str(DEFAULT_RELEASE)))
+DEFAULT_RELEASE = Path.home() / "HumanityMemory-Release"
+RELEASE = localenv.get_path("HM_RELEASE_ROOT", DEFAULT_RELEASE)
 CURRENT_LINK = RELEASE / "current"
 
 TAG = time.strftime("%Y%m%d-%H%M%S")
