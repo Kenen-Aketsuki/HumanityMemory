@@ -68,6 +68,14 @@ W_LEXICAL_PASS = 0.30
 # 查询切词用：空格与常见中英分隔符。>=2 字的词才当作可判定单位。
 _QUERY_SPLIT_RE = re.compile(r"[\s,，、;；:：/|·]+")
 
+# RRF 的两个常数：k 用业界惯用的 60；归一化后的门槛 0.20 是实测标定值——
+# 目标条目在 3 路里排 1/2/3 位时约得 0.59，只在单路排第一的无关条目约 0.20。
+_RRF_K = 60
+_RRF_FLOOR = 0.20
+
+# max-pooling 里给「整句相似度」留的锚，避免拆词后只剩局部匹配
+_MAXPOOL_WHOLE_WEIGHT = 0.15
+
 
 def _query_terms(query: str) -> list[str]:
     return [t for t in _QUERY_SPLIT_RE.split(query or "") if len(t) >= 2]
@@ -1308,12 +1316,161 @@ class MemoryStore:
         if not query:
             return []
 
-        floor = self.cfg.min_retrieval if min_score is None else min_score
+        # 显式传 min_score 视为调用方自己接管门槛（测试、精确对比），不启兜底
+        use_fallback = min_score is None
+        floor = self.cfg.min_retrieval if use_fallback else min_score
         hits, _ = self._collect(query, kinds=kinds, scope=scope,
                                 include_invalid=include_invalid,
                                 include_archived=include_archived, limit=limit,
                                 min_score=floor)
+        # 严格层一条都没捞到，才退回宽泛层再找一遍
+        if use_fallback and len(hits) < self.cfg.fallback_min_hits:
+            broad = self._broad_search(
+                query, kinds=kinds, scope=scope,
+                include_invalid=include_invalid,
+                include_archived=include_archived, limit=limit,
+            )
+            if broad:
+                return broad
         return hits
+
+    # ---------------------------------------------------------------- 保底检索
+
+    def _broad_search(
+        self,
+        query: str,
+        *,
+        kinds: Sequence[str] | str | None,
+        scope: str | None,
+        include_invalid: bool,
+        include_archived: bool,
+        limit: int,
+    ) -> list[Hit]:
+        """宽泛层：严格阈值捞不到时的兜底。
+
+        长查询的向量会被多个词平均掉，真正相关的那条反而排到后面
+        （实测「音效实装 工作流程 音效清单 接入 音频」把音效记录挤到 40 名外，
+        而单独查「音效实装」它是第一名）。这里把查询拆开重新召回。
+        """
+        mode = (self.cfg.fallback_mode or "off").strip().lower()
+        if mode == "rrf":
+            return self._broad_rrf(
+                query, kinds=kinds, scope=scope, include_invalid=include_invalid,
+                include_archived=include_archived, limit=limit,
+            )
+        if mode == "maxpool":
+            return self._broad_maxpool(
+                query, kinds=kinds, scope=scope, include_invalid=include_invalid,
+                include_archived=include_archived, limit=limit,
+            )
+        return []
+
+    def _broad_terms(self, query: str) -> list[str]:
+        """拆出用于宽泛检索的查询词；不足两个就不用兜底（单字查询本来就没漂移）。"""
+        terms = _query_terms(query)
+        return terms if len(terms) >= 2 else []
+
+    def _broad_rrf(
+        self,
+        query: str,
+        *,
+        kinds: Sequence[str] | str | None,
+        scope: str | None,
+        include_invalid: bool,
+        include_archived: bool,
+        limit: int,
+    ) -> list[Hit]:
+        """逐词检索 + Reciprocal Rank Fusion。
+
+        每个词单独跑一路检索（不限门槛），再用 Σ 1/(k+rank) 融合。
+        只看排名不看分数，所以各路的分数尺度不用对齐。
+        """
+        terms = self._broad_terms(query)
+        if not terms:
+            return []
+
+        topk = min(self.cfg.max_candidates, max(limit * 3, 20))
+        routes: list[list[Hit]] = []
+        for term in terms:
+            hits, _ = self._collect(
+                term, kinds=kinds, scope=scope,
+                include_invalid=include_invalid, include_archived=include_archived,
+                limit=topk, min_score=0.0,
+            )
+            if hits:
+                routes.append(hits)
+        if not routes:
+            return []
+
+        fused: dict[str, float] = {}
+        keeper: dict[str, Hit] = {}
+        for route in routes:
+            for rank, hit in enumerate(route, 1):
+                key = str(hit.item.id)
+                fused[key] = fused.get(key, 0.0) + 1.0 / (_RRF_K + rank)
+                keeper.setdefault(key, hit)
+
+        ceiling = len(routes) / (_RRF_K + 1)  # 每路都拿第一的理论上限
+        out: list[Hit] = []
+        for key, raw in fused.items():
+            hit = keeper[key]
+            hit.retrieval = raw / ceiling if ceiling else 0.0
+            hit.fallback = True
+            if hit.retrieval >= _RRF_FLOOR:
+                out.append(hit)
+        out.sort(key=lambda h: (h.retrieval, h.score), reverse=True)
+        return out[:limit]
+
+    def _broad_maxpool(
+        self,
+        query: str,
+        *,
+        kinds: Sequence[str] | str | None,
+        scope: str | None,
+        include_invalid: bool,
+        include_archived: bool,
+        limit: int,
+    ) -> list[Hit]:
+        """整句 + 逐词的向量相似度取最大。
+
+        比 RRF 便宜、也比 RRF 更容易放进噪音：只要某个词恰好高分，
+        这条就能上位。所以最后掺一点整句相似度当锚，压一压纯局部匹配。
+        """
+        terms = self._broad_terms(query)
+        if not terms:
+            return []
+
+        variants = [query] + terms
+        topk = min(self.cfg.max_candidates, max(limit * 3, 20))
+        best_hit: dict[str, Hit] = {}
+        whole_sim: dict[str, float] = {}
+
+        for idx, variant in enumerate(variants):
+            hits, _ = self._collect(
+                variant, kinds=kinds, scope=scope,
+                include_invalid=include_invalid, include_archived=include_archived,
+                limit=topk, min_score=0.0,
+            )
+            for hit in hits:
+                key = str(hit.item.id)
+                sim = hit.vector_similarity or 0.0
+                if idx == 0:
+                    whole_sim[key] = sim
+                prev = best_hit.get(key)
+                if prev is None or sim > (prev.vector_similarity or 0.0):
+                    best_hit[key] = hit
+
+        out: list[Hit] = []
+        for key, hit in best_hit.items():
+            best = hit.vector_similarity or 0.0
+            whole = whole_sim.get(key, 0.0)
+            blended = (1.0 - _MAXPOOL_WHOLE_WEIGHT) * best + _MAXPOOL_WHOLE_WEIGHT * whole
+            hit.retrieval = blended
+            hit.fallback = True
+            if blended >= self.cfg.fallback_floor:
+                out.append(hit)
+        out.sort(key=lambda h: (h.retrieval, h.score), reverse=True)
+        return out[:limit]
 
     def _collect(
         self,

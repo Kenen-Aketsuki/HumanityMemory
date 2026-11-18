@@ -382,6 +382,9 @@ class Hit:
     forgotten: bool = False
     # 这一下正好凑满复活次数（只在 deep_recall 里可能为真）
     revived: bool = False
+    # 严格阈值没捞到东西，由宽泛层（RRF / max-pooling）兜底召回。
+    # 精度低于常规检索，读的人该知道它"只是沾边"。
+    fallback: bool = False
 
     @property
     def kind(self) -> str:
@@ -397,6 +400,8 @@ class Hit:
             data["lexical_score"] = round(self.lexical_score, 4)
         if self.needs_verify:
             data["needs_verify"] = True
+        if self.fallback:
+            data["fallback"] = True
         if self.forgotten:
             data["forgotten"] = True
         if self.revived:

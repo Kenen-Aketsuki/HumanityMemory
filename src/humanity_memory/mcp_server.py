@@ -427,6 +427,9 @@ def build_server(cfg: Config | None = None, *, layout: Layout | None = None) -> 
             return _err(f"检索失败：{type(exc).__name__}: {exc}")
         payload: dict[str, Any] = {
             "count": len(hits),
+            # strict = 严格阈值命中；fallback = 严格层没捞到，退回宽泛检索，
+            # 结果只是"沾边"，别当精确匹配用
+            "mode": "fallback" if any(h.fallback for h in hits) else "strict",
             "lines": [h.to_line() for h in hits],
             "degraded": None if _st().embedder.available else "embedding 不可用，本次为关键词检索",
         }

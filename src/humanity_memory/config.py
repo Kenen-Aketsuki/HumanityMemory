@@ -405,6 +405,14 @@ class Config:
     # 常规检索的相关性下限。低于它的候选直接不返回 —— 检索只看相关性，
     # 重要度 / 等级 / 热度都无权把不相关的条目"救"回来。
     min_retrieval: float
+    # 保底检索：严格层捞不到东西时，才用更宽的方式再找一遍。
+    # mode = off | rrf（逐词检索 + 排名融合）| maxpool（各词相似度取最大）
+    fallback_mode: str
+    # 严格层结果少于这个数就触发兜底；1 = 只有完全为空才触发
+    fallback_min_hits: int
+    # 兜底层自身的门槛：maxpool 用相似度尺度（0~1）；rrf 的归一化排名分
+    # 阈值固定在 store._RRF_FLOOR（0.20），不走这个配置，避免两个尺度混用。
+    fallback_floor: float
 
     # 合并后的完整 TOML（新机制从这里取值，别再加平铺字段）。
     # 全部字段无默认值：默认值只允许来自 TOML，留一个 0.0 占位就会
@@ -642,6 +650,13 @@ class Config:
             ),
             min_retrieval=env_float(
                 "HM_MIN_RETRIEVAL", float(_dig(settings, "search", "min_retrieval"))
+            ),
+            fallback_mode=(get("HM_FALLBACK_MODE") or str(_dig(settings, "search", "fallback_mode"))).strip().lower(),
+            fallback_min_hits=env_int(
+                "HM_FALLBACK_MIN_HITS", int(_dig(settings, "search", "fallback_min_hits"))
+            ),
+            fallback_floor=env_float(
+                "HM_FALLBACK_FLOOR", float(_dig(settings, "search", "fallback_floor"))
             ),
             settings=settings,
             layers=layers,
