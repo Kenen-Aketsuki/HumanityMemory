@@ -41,7 +41,11 @@ def _set_level(store: MemoryStore, item_id: str, level: int) -> None:
 
 
 def _score_map(store: MemoryStore, query: str) -> dict[str, float]:
-    return {h.item.id: h.score for h in store.search(query, kinds=["experience"], limit=10)}
+    # 这些用例验的是「各项权重如何拼出 score」，与相关性门槛无关，显式关掉
+    return {
+        h.item.id: h.score
+        for h in store.search(query, kinds=["experience"], limit=10, min_score=0.0)
+    }
 
 
 # ---------------------------------------------------------------- 排序

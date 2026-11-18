@@ -316,4 +316,9 @@ log = 0.30
 # 取 limit * candidate_multiplier 条候选，至少 40 条，上限 max_candidates
 candidate_multiplier = 8
 max_candidates = 240
+# 常规检索的相关性下限（0~1，只看 retrieval = 向量 + 词法融合）。
+# 低于它的候选直接不返回：重要度 / 等级 / 热度都不参与这个判断。
+# 这个值强依赖 embedding 模型：换模型后必须重新标定
+# （做法：拿一个完全无关的查询跑一遍，取它 top1 的相似度，再往上留一点余量）。
+min_retrieval = 0.55
 

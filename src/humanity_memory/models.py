@@ -370,6 +370,9 @@ class LogEntry:
 class Hit:
     item: Any  # Experience | Episode | LogEntry
     score: float
+    # 纯相关性：向量与词法融合后的分，不含重要度 / 等级 / 类型权重。
+    # 检索的门槛与排序都只看它，`score` 仅作展示与破平。
+    retrieval: float = 0.0
     vector_similarity: float | None = None
     lexical_score: float | None = None
     distance: float | None = None
@@ -387,6 +390,7 @@ class Hit:
     def to_dict(self) -> dict[str, Any]:
         data = self.item.to_dict()
         data["score"] = round(self.score, 4)
+        data["retrieval"] = round(self.retrieval, 4)
         if self.vector_similarity is not None:
             data["vector_similarity"] = round(self.vector_similarity, 4)
         if self.lexical_score is not None:

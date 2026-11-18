@@ -182,7 +182,8 @@ def test_search_hits_experience_and_log(env) -> None:
     _, _, store = env
     store.write_memory("设施存档用总文件加模块分文件", tags=["存档"])
     store.append_log("今天重构了存档模块的划分方式")
-    hits = store.search("存档怎么组织")
+    # 假 embedding 的相似度过不了真实门槛，这里只验召回面，显式关掉门槛
+    hits = store.search("存档怎么组织", min_score=0.0)
     assert hits
     kinds = {h.kind for h in hits}
     assert "experience" in kinds

@@ -224,7 +224,8 @@ def test_low_confidence_is_marked_on_read(env) -> None:
     shaky = store.write_memory("大概是这么回事", confidence=max(0.0, floor - 0.2))
     solid = store.write_memory("这条我验过", confidence=min(1.0, floor + 0.2))
 
-    hits = {h.item.id: h for h in store.search("这么回事 我验过", limit=10)}
+    # 本用例只验「标记」，与相关性门槛无关，显式关掉门槛
+    hits = {h.item.id: h for h in store.search("这么回事 我验过", limit=10, min_score=0.0)}
     assert hits[shaky.id].needs_verify is True
     assert hits[solid.id].needs_verify is False
 
@@ -257,7 +258,8 @@ def test_low_confidence_is_marked_on_read(env) -> None:
     shaky = store.write_memory("大概是这么回事", confidence=max(0.0, floor - 0.2))
     solid = store.write_memory("这条我验过", confidence=min(1.0, floor + 0.2))
 
-    hits = {h.item.id: h for h in store.search("这么回事 我验过", limit=10)}
+    # 本用例只验「标记」，与相关性门槛无关，显式关掉门槛
+    hits = {h.item.id: h for h in store.search("这么回事 我验过", limit=10, min_score=0.0)}
     assert hits[shaky.id].needs_verify is True
     assert hits[solid.id].needs_verify is False
 

@@ -402,6 +402,9 @@ class Config:
     vec_extension: str | None
     candidate_multiplier: int
     max_candidates: int
+    # 常规检索的相关性下限。低于它的候选直接不返回 —— 检索只看相关性，
+    # 重要度 / 等级 / 热度都无权把不相关的条目"救"回来。
+    min_retrieval: float
 
     # 合并后的完整 TOML（新机制从这里取值，别再加平铺字段）。
     # 全部字段无默认值：默认值只允许来自 TOML，留一个 0.0 占位就会
@@ -636,6 +639,9 @@ class Config:
             ),
             max_candidates=env_int(
                 "HM_MAX_CANDIDATES", int(_dig(settings, "search", "max_candidates"))
+            ),
+            min_retrieval=env_float(
+                "HM_MIN_RETRIEVAL", float(_dig(settings, "search", "min_retrieval"))
             ),
             settings=settings,
             layers=layers,

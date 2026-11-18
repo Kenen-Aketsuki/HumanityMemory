@@ -65,6 +65,29 @@ _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 W_VECTOR_PASS = 0.70
 W_LEXICAL_PASS = 0.30
 
+# 查询切词用：空格与常见中英分隔符。>=2 字的词才当作可判定单位。
+_QUERY_SPLIT_RE = re.compile(r"[\s,，、;；:：/|·]+")
+
+
+def _query_terms(query: str) -> list[str]:
+    return [t for t in _QUERY_SPLIT_RE.split(query or "") if len(t) >= 2]
+
+
+def _lexical_coverage(query: str, text: str) -> float | None:
+    """查询词在正文里的**绝对覆盖率**（0~1）；一个都没命中就给 None。
+
+    刻意不用 min-max 排名归一化。那种做法会在候选集里恒定造出一个 1.0：
+    哪怕整批候选都不相关，「我是这批里最好的」也能拿满分，然后按权重
+    混进融合分，把无关条目抬进结果（实测一条「探索派遣倒计时」凭这个
+    在「音效」查询里排第一）。
+    """
+    terms = _query_terms(query)
+    if not terms:
+        return None
+    low = (text or "").lower()
+    hit = sum(1 for t in terms if t.lower() in low)
+    return hit / len(terms) if hit else None
+
 # 经历的压缩级别越高越「精炼」，检索权重越高；
 # 刚复盘出来的完整叙述（level 0）内容长、冗余多，降权避免挤占结果。
 EPISODE_LEVEL_WEIGHT = {0: 0.88, 1: 0.93, 2: 0.96, 3: 0.96}
@@ -1267,12 +1290,16 @@ class MemoryStore:
         include_invalid: bool = False,
         include_archived: bool = False,
         limit: int = 8,
-        min_score: float = 0.0,
+        min_score: float | None = None,
     ) -> list[Hit]:
         """混合检索。
 
         `kinds` 接受 None / "all" / "experience" / ["experience", "episode"]，
         也认中文「经验 / 经历 / 日志」。类型就是表，所以这里只做表级选择。
+
+        **门槛与排序都只看相关性**（`Hit.retrieval`），重要度 / 等级 / 类型权重
+        不参与过滤和排序 —— 它们只影响 `score` 的展示值。
+        `min_score` 为 None 时取配置 `[search] min_retrieval`。
 
         **0 级（遗忘层）不进常规检索**（§3.1）——它与归档同义：正文还在，
         但只有当常规检索捞不到东西时，才由 `deep_recall` 去翻。
@@ -1281,9 +1308,11 @@ class MemoryStore:
         if not query:
             return []
 
+        floor = self.cfg.min_retrieval if min_score is None else min_score
         hits, _ = self._collect(query, kinds=kinds, scope=scope,
                                 include_invalid=include_invalid,
-                                include_archived=include_archived, limit=limit)
+                                include_archived=include_archived, limit=limit,
+                                min_score=floor)
         return hits
 
     def _collect(
@@ -1319,8 +1348,9 @@ class MemoryStore:
                     )
                 )
 
-        hits = [h for h in hits if h.score >= min_score]
-        hits.sort(key=lambda h: h.score, reverse=True)
+        # 门槛与排序只看相关性；score（含重要度/等级/类型权重）仅用于展示和破平
+        hits = [h for h in hits if h.retrieval >= min_score]
+        hits.sort(key=lambda h: (h.retrieval, h.score), reverse=True)
         top = hits[:limit]
         # 可信度低于 verify_on_read 的经验，读到时带「先验证再用」标记（§2.2）
         curve = self.confidence_curve
@@ -1633,7 +1663,8 @@ class MemoryStore:
                 if rowid in vec_hits
                 else None
             )
-            lex_sim = self._normalize_rank(lex_hits, rowid) if rowid in lex_hits else None
+            # 词法分走绝对覆盖率：没命中任何查询词就是 None，不参与融合
+            lex_sim = _lexical_coverage(query, getattr(obj, "content", "") or "")
             retrieval = self._fuse(vec_sim, lex_sim)
             base = combine_score(
                 retrieval=retrieval,
@@ -1647,6 +1678,7 @@ class MemoryStore:
                 Hit(
                     item=obj,
                     score=base * self._type_weight(spec, obj),
+                    retrieval=retrieval,
                     vector_similarity=vec_sim,
                     lexical_score=lex_sim,
                     distance=vec_hits.get(rowid),

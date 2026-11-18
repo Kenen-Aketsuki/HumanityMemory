@@ -15,6 +15,9 @@ dist/
 .data/
 .env
 
+# --- 本机路径（每台机器不同，只有 local.env.example 入库）---
+local.env
+
 # --- 记忆库工作区（令牌含工作区绑定与可选凭据，绝不入库）---
 .ai_memory/
 **/memory.token.json
