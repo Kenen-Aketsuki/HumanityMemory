@@ -1,8 +1,23 @@
 @echo off
 chcp 65001 >nul
 setlocal
-set "HM_CLI=%~dp0.venv\Scripts\humanity-memory.exe"
-set "OUT=%TEMP%\humanity_memory_starmap.html"
+rem Release root lives OUTSIDE the project on purpose: the host sandbox blocks
+rem processes started inside the workspace from writing outside it.
+if defined HM_RELEASE_ROOT (
+  set "HM_ROOT=%HM_RELEASE_ROOT%"
+) else (
+  set "HM_ROOT=%LOCALAPPDATA%\HumanityMemory\release"
+)
+set "HM_CLI=%HM_ROOT%\current\humanity-memory.exe"
+set "HM_SRC=published (%HM_ROOT%\current)"
+
+if not exist "%HM_CLI%" (
+  set "HM_CLI=%~dp0.venv\Scripts\humanity-memory.exe"
+  set "HM_SRC=source (.venv dev env; published build not found)"
+)
+
+if not defined HM_STARMAP_OUT set "HM_STARMAP_OUT=%TEMP%\humanity_memory_starmap.html"
+set "OUT=%HM_STARMAP_OUT%"
 
 if "%~1"=="" (
   echo.
@@ -19,10 +34,13 @@ if "%~1"=="" (
 
 if not exist "%HM_CLI%" (
   echo [ERROR] CLI not found: %HM_CLI%
+  echo         Run tools\build_release.py --publish to produce the published build,
+  echo         or install the dev environment into .venv.
   pause
   exit /b 1
 )
 
+echo Using: %HM_SRC%
 echo Analyzing: %~1
 echo.
 "%HM_CLI%" starmap "%~1" --out "%OUT%"

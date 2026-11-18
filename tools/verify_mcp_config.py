@@ -39,6 +39,8 @@ EXPECTED_TOOLS = {
     "log_list",
     "memory_search",
     "memory_recall",
+    "memory_deep_recall",
+    "memory_judge",
     "consolidate_preview",
     "consolidate_apply",
     "memory_stats",
@@ -50,8 +52,6 @@ EXPECTED_TOOLS = {
     "memory_purge",
     "memory_compress_preview",
     "memory_compress_apply",
-    "memory_recompress_preview",
-    "memory_recompress_apply",
 }
 
 

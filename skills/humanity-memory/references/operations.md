@@ -4,12 +4,12 @@
 
 ```
 <项目>/.ai_memory/
-├── workspace.db        # 项目库：facts + episodes + logs
+├── workspace.db        # 项目库：experience + episodes + logs
 └── CORE_RULES.md       # 项目信条
 
 ~/.humanity-memory/
-├── global.db           # 全局库：跨项目 facts
-└── CORE_RULES.md       # 全局信条
+├── CORE_RULES.md              # 全局信条（静态注入，仍然生效）
+└── global.db.retired-20261117 # 已退役的全局库（2026-11-17 关闭，见 design 文档 §8.2）
 
 <仓库根>/.env            # 配置唯一来源
 ```
@@ -27,7 +27,7 @@
 用户主目录和盘符根永远不建。
 
 启动上下文（cwd、走了哪条解析路径、命中的工作区）写在
-`~/.humanity-memory/diagnostics/startup.json`，排查「为什么落到全局库」先看它。
+`~/.humanity-memory/diagnostics/startup.json`，排查「为什么落到这个工作区」先看它。
 
 ## 令牌：把工作区绑定从 mcp.json 解耦
 
@@ -51,7 +51,7 @@ humanity-memory --token <路径> workspace show              # 查看（key 脱�
 ## 配置
 
 ```bash
-# 全局库目录
+# 信条与库所在目录（global.db 已退役，这里现在只放信条/诊断/备份）
 HM_HOME=C:/Users/you/.humanity-memory
 
 # embedding（OpenAI 兼容）
@@ -65,6 +65,26 @@ HM_EMBED_DIM=1024          # 必须和模型实际维度一致
 ```
 
 完整清单见仓库 `.env.example`。
+
+### 阈值配置在哪（四层，后者覆盖前者）
+
+| 层 | 路径 | 定位 |
+| --- | --- | --- |
+| 出厂 | 包内 `memory.default.toml` | 全量默认值，随版本发布，别改 |
+| 安装 | `<安装根>/memory.toml`（与 `.env` 同目录） | **全量模板**，`humanity-memory config template` 整份生成 |
+| 用户 | `~/.humanity-memory/memory.toml` | **增量**，只写要改的键，跨项目 |
+| 项目 | `<项目>/.ai_memory/memory.toml` | **增量**，只写要改的键，优先级最高 |
+
+```bash
+humanity-memory config template        # 生成安装位置的全量模板（已存在会拒绝）
+humanity-memory config template --force   # 覆盖重来
+```
+
+**只改几项就用用户级 / 项目级**，别动安装层那份全量：全量放着等于接管了所有默认值，
+以后出厂调了某个值，你那份的旧值会赢。
+
+**改完必须重启 MCP 客户端**（server 常驻，配置只在进程启动时读一次）。
+CLI 和星图脚本每次都是新进程，改完立刻生效。
 
 ### 没有 embedding 也能用
 
@@ -142,11 +162,11 @@ humanity-memory reindex --reset-vectors
 
 想导入别的机器：把 `.ai_memory/` 整个拷过去即可，路径无关。
 
-## 全局知识膨胀
+## 全局经验膨胀
 
-`memory_stats` 里 `global_knowledge_warn: true` 说明全局知识超过阈值（默认 50）。
+`memory_stats` 里 `global_experience_warn: true` 说明全局经验超过阈值（默认 50）。
 
-跨项目知识本该很少。膨胀通常意味着：
+跨项目经验本该很少。膨胀通常意味着：
 
 - 有些规则类内容该搬到 `CORE_RULES.md`（它们需要 100% 命中，不该靠检索）
 - 有些项目细节该留在各自的 workspace 库
@@ -160,3 +180,5 @@ FROM digests ORDER BY at DESC LIMIT 20;
 ```
 
 `digests.meta` 里存了当次处理掉的 log id 列表，可追溯。
+
+> `knowledge_count` 是**历史列名**（列随表名一起没改），现在数的是经验条数。

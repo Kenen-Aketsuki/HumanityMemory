@@ -153,6 +153,9 @@ class Layout:
     workspace_dir: Path | None
     workspace_db: Path | None
     global_dir: Path
+    # 全局库已于 2026-11-17 关闭（§8.2）。这个字段留着只为了两件事：
+    # 一是 `describe()` 能把"它本该在哪"告诉人，二是留给退役文件的路径计算。
+    # **任何代码都不该再 `open_db(global_db)`** —— 打开就等于建一个空库回来。
     global_db: Path
     workspace_rules: Path | None
     global_rules: Path
@@ -232,10 +235,10 @@ RULES_TEMPLATE = """# 绝对信条（CORE RULES）
 
 ## 记忆纪律
 
-- 可迁移的机制与约定 → 写知识（kind=knowledge）；会变的版本/依赖/路径 → 写现状（kind=state）
-- 一次具体事件的「现象 → 根因 → 落点」 → 写案例（kind=case），带单号的结论放这里
-- 当天发生的事件、排查过程 → 用 log_append 写日志，只追加不改
-- 知识 / 现状换代 → 追加新条目并用 invalidates 顶掉旧的，不删除、不改写正文
+- 可迁移的机制与约定、根因 → 写经验（kind=experience）；一次具体事务的过程与试错 → 写经历（kind=episode）。kind 只认这两个，旧值 knowledge / state / case / narrative 会被直接拒绝
+- 当天发生的事件、排查过程 → 用 log_append 写日志，只追加不改（触发器强制），复盘后清空
+- 经验被推翻 → 追加新经验并用 invalidates 让旧的失效，不删除、不改写正文；经历没有可信度，不参与 memory_verify
+- 分值、等级、遗忘、查重一律由工具裁定，不替它们判断；写入只给 confidence 初值与可验证的证据级别
 """
 
 

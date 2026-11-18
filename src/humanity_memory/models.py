@@ -1,15 +1,16 @@
-"""领域模型：陈述（知识/现状） / 经历（案例/叙述） / 日志。
+"""领域模型：经验 / 经历 / 日志。
 
-命名取舍
---------
-这一层原来叫「事实（fact）」，但那是个误导性的名字 ——
-"Bug #10805 的根因是 X" 也是一条事实，而它恰恰不该进这个库。
-它要收的是**可迁移**的东西，所以陈述层分两种 kind：
+两类记忆，判据只有一条 —— **它是否需要回答「什么时候发生的」**：
 
-    knowledge  知识：离开具体实例仍成立，靠被使用保值，不参与失效
-    state      现状：当前为真但会变（版本、依赖、路径、资源配置），必须能失效
+    experience  经验：可复用的判定与结论，与具体事件解耦，不会压缩，会被推翻重写
+    episode     经历：发生过的事，一条一个单一事务，带上发生时刻，会逐级压缩
+    log         日志：当天原始记录，append-only，喂给复盘
 
-经历层同理：case 是压到三句话的定论，narrative 是保留过程的叙述。
+旧的四类（knowledge / state / case / narrative）已废弃：
+「知识 vs 现状」的差别本质是「多容易变」，用离散类别去表达连续属性，判据只能写在
+prompt 里靠模型自觉；改成初始可信度后，易变的条目自己会被反复验证纠正。
+
+类型由**表**承载，没有行级 kind 列 —— 所以这里 `kind` 是只读属性，不参与写入。
 """
 
 from __future__ import annotations
@@ -22,20 +23,14 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 Scope = Literal["workspace", "global"]
-MemoryType = Literal["knowledge", "state", "case", "narrative", "log"]
+MemoryType = Literal["experience", "episode", "log"]
 
-KnowledgeKind = Literal["knowledge", "state"]
-EpisodeKind = Literal["case", "narrative"]
-
-KNOWLEDGE_KINDS: tuple[str, ...] = ("knowledge", "state")
-EPISODE_KINDS: tuple[str, ...] = ("case", "narrative")
-ALL_KINDS: tuple[str, ...] = ("knowledge", "state", "case", "narrative", "log")
+# 三类对象，两类记忆 + 一类原料
+ALL_KINDS: tuple[str, ...] = ("experience", "episode", "log")
 
 _KIND_LABEL = {
-    "knowledge": "知识",
-    "state": "现状",
-    "case": "案例",
-    "narrative": "经历",
+    "experience": "经验",
+    "episode": "经历",
     "log": "日志",
 }
 
@@ -85,12 +80,12 @@ def _loads(text: str | None, default: Any) -> Any:
         return default
 
 
-# ---------------------------------------------------------------- 陈述层
+# ---------------------------------------------------------------- 经验
 
 
 @dataclass(slots=True)
-class Knowledge:
-    """一条陈述：知识（knowledge）或现状（state）。"""
+class Experience:
+    """一条经验：可复用的判定与结论。"""
 
     rowid: int
     id: str
@@ -108,14 +103,22 @@ class Knowledge:
     invalidated_by: str | None
     archived_at: int | None
     embedded: bool
-    kind: str = "knowledge"
     verified_at: int | None = None
-    state_interval_days: float = 7.0
     meta: dict[str, Any] = field(default_factory=dict)
     db: str = "workspace"
+    # 三个评分维度：可信度、活跃度、遗忘等级，以及活跃度周期的锚点
+    forget_level: int = 3
+    confidence: float = 0.3
+    activity: float = 0.0
+    period_start: int | None = None
+    level0_since: int | None = None
+    # 不落库：只在「本次写入被查重拦下、返回的是既有条目」时为 True。
+    # 字段放在实体上而不是包装成 WriteResult，是为了让既有调用点保持 `item.id` 的写法。
+    deduped: bool = False
+    dup_similarity: float | None = None
 
     @classmethod
-    def from_row(cls, row: Any, db: str = "workspace") -> "Knowledge":
+    def from_row(cls, row: Any, db: str = "workspace") -> "Experience":
         keys = row.keys()
         return cls(
             rowid=row["rowid"],
@@ -134,16 +137,23 @@ class Knowledge:
             invalidated_by=row["invalidated_by"],
             archived_at=row["archived_at"],
             embedded=bool(row["embedded"]),
-            kind=row["kind"] if "kind" in keys else "knowledge",
             verified_at=row["verified_at"] if "verified_at" in keys else None,
-            state_interval_days=(
-                float(row["state_interval_days"])
-                if "state_interval_days" in keys and row["state_interval_days"] is not None
-                else 7.0
-            ),
             meta=_loads(row["meta"], {}),
             db=db,
+            forget_level=int(row["forget_level"]) if "forget_level" in keys else 3,
+            confidence=(
+                float(row["confidence"])
+                if "confidence" in keys and row["confidence"] is not None
+                else 0.3
+            ),
+            activity=float(row["activity"]) if "activity" in keys else 0.0,
+            period_start=row["period_start"] if "period_start" in keys else None,
+            level0_since=row["level0_since"] if "level0_since" in keys else None,
         )
+
+    @property
+    def kind(self) -> str:
+        return "experience"
 
     @property
     def live(self) -> bool:
@@ -153,14 +163,10 @@ class Knowledge:
     def archived(self) -> bool:
         return self.archived_at is not None
 
-    @property
-    def is_state(self) -> bool:
-        return self.kind == "state"
-
     def to_dict(self) -> dict[str, Any]:
         data = {
-            "type": "knowledge",
-            "kind": self.kind,
+            "type": "experience",
+            "kind": "experience",
             "id": self.id,
             "content": self.content,
             "tags": self.tags,
@@ -172,43 +178,44 @@ class Knowledge:
             "created_at": self.created_at,
             "created_iso": iso(self.created_at),
             "access_count": self.access_count,
+            # 三个维度：等级决定多久裁一次，可信度决定读之前要不要先验
+            "forget_level": self.forget_level,
+            "confidence": round(self.confidence, 3),
+            "activity": round(self.activity, 2),
         }
         if self.source:
             data["source"] = self.source
         if self.verified_at:
             data["verified_at"] = self.verified_at
             data["verified_iso"] = iso(self.verified_at)
-        if self.is_state:
-            data["state_interval_days"] = round(self.state_interval_days, 1)
-            # 下次该复核的时刻：上次确认（或创建）之后过一个当前周期
-            due = (self.verified_at or self.created_at) + int(
-                self.state_interval_days * 86_400_000
-            )
-            data["review_due_iso"] = iso(due)
         if self.invalid_at:
             data["invalid_at"] = self.invalid_at
             data["invalid_iso"] = iso(self.invalid_at)
         if self.invalidated_by:
             data["invalidated_by"] = self.invalidated_by
+        if self.deduped:
+            # 语义：这条**没有被新建**，命中的就是库里的这条；活跃度已按 dup_bonus 加过
+            data["deduped"] = True
+            if self.dup_similarity is not None:
+                data["dup_similarity"] = round(self.dup_similarity, 4)
         return data
 
-    def to_line(self) -> str:
+    def to_line(self, *, needs_verify: bool = False, forgotten: bool = False) -> str:
         mark = "" if self.live else "·已失效"
+        if needs_verify and self.live:
+            mark = "·待验证"
+        if forgotten:
+            mark += "·已遗忘"
         scope = "全局" if self.scope == "global" else "项目"
-        label = _KIND_LABEL.get(self.kind, "知识")
-        return f"[{self.id}] ({scope}{label}{mark}) {self.content}"
+        return f"[{self.id}] ({scope}经验{mark}) {self.content}"
 
 
-# 旧名保留为别名，方便外部脚本过渡；新代码一律用 Knowledge
-Fact = Knowledge
-
-
-# ---------------------------------------------------------------- 经历层
+# ---------------------------------------------------------------- 经历
 
 
 @dataclass(slots=True)
 class Episode:
-    """一次具体事件：案例（case）或叙述（narrative）。"""
+    """一条经历：发生过的事，带上发生时刻。"""
 
     rowid: int
     id: str
@@ -224,9 +231,14 @@ class Episode:
     archived_at: int | None
     compression_level: int
     embedded: bool
-    kind: str = "narrative"
     meta: dict[str, Any] = field(default_factory=dict)
     db: str = "workspace"
+    # 经历不用 confidence 列：它的「可信度」是 forget_level 的派生值（§2.2）
+    forget_level: int = 3
+    activity: float = 0.0
+    period_start: int | None = None
+    revive_hits: int = 0
+    level0_since: int | None = None
 
     @classmethod
     def from_row(cls, row: Any, db: str = "workspace") -> "Episode":
@@ -246,23 +258,27 @@ class Episode:
             archived_at=row["archived_at"],
             compression_level=int(row["compression_level"] or 0),
             embedded=bool(row["embedded"]),
-            kind=row["kind"] if "kind" in keys else "narrative",
             meta=_loads(row["meta"], {}),
             db=db,
+            forget_level=int(row["forget_level"]) if "forget_level" in keys else 3,
+            activity=float(row["activity"]) if "activity" in keys else 0.0,
+            period_start=row["period_start"] if "period_start" in keys else None,
+            revive_hits=int(row["revive_hits"]) if "revive_hits" in keys else 0,
+            level0_since=row["level0_since"] if "level0_since" in keys else None,
         )
+
+    @property
+    def kind(self) -> str:
+        return "episode"
 
     @property
     def archived(self) -> bool:
         return self.archived_at is not None
 
-    @property
-    def is_case(self) -> bool:
-        return self.kind == "case"
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "type": "episode",
-            "kind": self.kind,
+            "kind": "episode",
             "id": self.id,
             "content": self.content,
             "day": self.day,
@@ -273,15 +289,17 @@ class Episode:
             "digest_id": self.digest_id,
             "archived": self.archived,
             "compression_level": self.compression_level,
+            "forget_level": self.forget_level,
+            "activity": round(self.activity, 2),
             "db": self.db,
         }
 
-    def to_line(self) -> str:
-        label = "案例" if self.is_case else "经历"
-        return f"[{self.id}] ({self.day}·{label}) {self.content}"
+    def to_line(self, *, needs_verify: bool = False, forgotten: bool = False) -> str:
+        mark = "·已遗忘" if forgotten else ""
+        return f"[{self.id}] ({self.day}·经历{mark}) {self.content}"
 
 
-# ---------------------------------------------------------------- 日志层
+# ---------------------------------------------------------------- 日志
 
 
 @dataclass(slots=True)
@@ -341,7 +359,7 @@ class LogEntry:
             "db": self.db,
         }
 
-    def to_line(self) -> str:
+    def to_line(self, *, needs_verify: bool = False, forgotten: bool = False) -> str:
         return f"[{self.id}] {iso(self.at)} {self.content}"
 
 
@@ -350,11 +368,17 @@ class LogEntry:
 
 @dataclass(slots=True)
 class Hit:
-    item: Any  # Knowledge | Episode | LogEntry
+    item: Any  # Experience | Episode | LogEntry
     score: float
     vector_similarity: float | None = None
     lexical_score: float | None = None
     distance: float | None = None
+    # 低于 verify_on_read 的经验，被读到时提醒先验证再用（§2.2）
+    needs_verify: bool = False
+    # 从遗忘层（0 级）捞出来的：它已经在常规视野之外，读到它得知道这一点（§3.2）
+    forgotten: bool = False
+    # 这一下正好凑满复活次数（只在 deep_recall 里可能为真）
+    revived: bool = False
 
     @property
     def kind(self) -> str:
@@ -367,7 +391,13 @@ class Hit:
             data["vector_similarity"] = round(self.vector_similarity, 4)
         if self.lexical_score is not None:
             data["lexical_score"] = round(self.lexical_score, 4)
+        if self.needs_verify:
+            data["needs_verify"] = True
+        if self.forgotten:
+            data["forgotten"] = True
+        if self.revived:
+            data["revived"] = True
         return data
 
     def to_line(self) -> str:
-        return self.item.to_line()
+        return self.item.to_line(needs_verify=self.needs_verify, forgotten=self.forgotten)

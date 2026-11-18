@@ -82,13 +82,13 @@ humanity-memory --workspace "<根>" doctor     # all_ok: true
    **不对就立刻停机报告、一个字都不写**（防记忆静默分裂写错库）。
 3. `logs_pending == 0` 跳到压缩预览 / 归档预览 / 维护，不硬造内容。
 
-项目特有条款从项目规约文档里提炼，例如「负责人拍定的基调属硬约定，进 knowledge 且
-importance 0.9」「带单号结论只进 case」「自动生成文件不作为结论」。禁止项固定包含：
+项目特有条款从项目规约文档里提炼，例如「负责人拍定的基调属硬约定，进经验且
+importance 0.9」「带单号结论只进经历」「自动生成文件不作为结论」。禁止项固定包含：
 `memory_archive(dry_run=false)`、`memory_purge`、改 `CORE_RULES.md` / 源码 / 配置、
 任何 `git add/commit/push`。
 
 流程顺序：`preview → 提炼 → apply(显式 day, purge=true) → 逐日补最多 5 天 →
-recompress → archive(dry_run=true) → maintenance`。
+compress（队列为空就跳过）→ archive(dry_run=true) → maintenance`。
 
 ---
 
@@ -107,7 +107,7 @@ recompress → archive(dry_run=true) → maintenance`。
 - 按 `## ` 章节 / 一二级标题 / 独立事项切分，**一条日志一个主题**；
   没标题的长文档按空行分段或语义主题拆，别整篇塞成一条巨型日志。
 - 单条过大坏处：embedding 质量下降、复盘时一条日志混了多件事、
-  `case` 该「一事一条」却被挤成流水账、超长内容还会挤占 preview 的 token 预算。
+  经历该「一事一条」却被挤成流水账、超长内容还会挤占 preview 的 token 预算。
 - **原文保留、不预先提炼**：提炼是复盘的工作，导入只做搬运 + 标注。
 - 每条加一行导入头，写清来源路径、原始记录日期、以及
   「勿把它当作导入当天新发生的事件」。
@@ -133,7 +133,7 @@ store.append_log(content, at=<原始日期的 Unix 毫秒>, tags=..., importance
 ### 验证
 
 - 每条 `day` 为原日期、`embedded=1`、`consolidated=0`
-- `stats` 的 `logs_pending` 等于拆出的条数；`knowledge` / `episodes` **仍为 0 行**
+- `stats` 的 `logs_pending` 等于拆出的条数；`experience` / `episodes` **仍为 0 行**
   （证明只录了原始素材，没偷偷复盘）
 - `consolidate_preview()` 返回的 `day` 与 `log_count` 能捞到这批
 - `doctor` 仍 `all_ok: true`

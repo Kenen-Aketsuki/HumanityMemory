@@ -27,6 +27,12 @@ dist/
 # --- 随项目附带的三方二进制（体积大，按需下载）---
 tools/bin/
 
+# --- 发布产物（打包出来的 exe 与库快照，一律不入库；源码 upgrade/ 才是可回滚的凭据）---
+release/
+
+# --- 安装位置的配置（config template 生成，属于这台机器的这套安装，不随仓库走）---
+/memory.toml
+
 # --- 编辑器 ---
 .vscode/
 .idea/

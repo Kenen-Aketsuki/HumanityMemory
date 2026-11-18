@@ -5,8 +5,9 @@
 * **只在 CLI 使用**：不注册 MCP tool，不写 Skill，不对 AI 暴露。
 * **绝不写库**：只用 ``sqlite3.connect(... mode=ro)``，不调用 ``open_db`` /
   ``ensure_schema``，不执行任何 DDL / DML / PRAGMA 写操作，不创建数据库。
-* **零侵入**：不 import ``store``，不依赖 ``Config`` / ``Layout``，
-  只用标准库 + 可选的 sqlite-vec 扩展。
+* **只读配置**：等级表的档数/周期来自项目配置的 ``[[forget.levels]]``，
+  所以会延迟 import ``Config`` 读一次 TOML（只解析，不建目录、不写文件）；
+  配置读不到就退回「库里实际出现过的档位」。不 import ``store``、不用 ``Layout``。
 * 产物只有一个 HTML 文件，数据内嵌，不依赖 CDN、不联网、不常驻进程。
 
 用法::
@@ -17,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import datetime as _dt
 import itertools
 import json
@@ -35,7 +37,7 @@ VEC_TABLES = {
     "episodes": "episodes_vec",
     "logs": "logs_vec",
 }
-KIND_ORDER = ("knowledge", "state", "case", "narrative", "log", "digest")
+KIND_ORDER = ("experience", "episode", "log", "digest")
 
 
 class StarmapError(RuntimeError):
@@ -79,7 +81,7 @@ def _describe_dir(parent: Path, db_path: Path) -> tuple[list[dict[str, Any]], li
 
 
 def resolve_db(target: str | Path) -> tuple[Path, list[str]]:
-    """把拖进来的路径解析成一个 v3 库文件。
+    """把拖进来的路径解析成一个 v5 库文件。
 
     接受三种：``.ai_memory`` 目录 / 项目根目录 / 直接的 ``.db`` 文件。
     绝不新建目录或文件。
@@ -91,7 +93,7 @@ def resolve_db(target: str | Path) -> tuple[Path, list[str]]:
 
     if raw.is_file():
         if ".v2-" in raw.name:
-            raise StarmapError("这是 v2 留档库（facts 表），星图只支持 v3 的 workspace.db")
+            raise StarmapError("这是 v2 留档库（facts 表），星图只支持 v5 的 workspace.db")
         if raw.suffix.lower() != ".db":
             raise StarmapError(f"拖入的是文件但不是 .db：{raw.name}")
         db = raw
@@ -122,24 +124,21 @@ def resolve_db(target: str | Path) -> tuple[Path, list[str]]:
 
 
 def _load_vec(conn: sqlite3.Connection) -> str:
-    """加载 sqlite-vec，只读连接上注册函数，不写库。"""
+    """加载 sqlite-vec，只读连接上注册函数，不写库。
+
+    扩展从 `sqlite_vec` 包内取 —— 源码态与冻结态同一条路，不必猜项目目录。
+    """
     conn.enable_load_extension(True)
     errors: list[str] = []
     try:
         try:
             import sqlite_vec
 
-            sqlite_vec.load(conn)
-            return "pip:sqlite-vec"
+            path = sqlite_vec.loadable_path()
+            conn.load_extension(path)
+            return f"pip:sqlite-vec ({path})"
         except Exception as exc:  # noqa: BLE001
             errors.append(f"pip: {exc}")
-        here = Path(__file__).resolve().parents[2] / "tools" / "bin" / "vec0.dll"
-        if here.is_file():
-            try:
-                conn.load_extension(str(here))
-                return "file:vec0.dll"
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"dll: {exc}")
         raise StarmapError("无法加载 sqlite-vec 扩展：" + " | ".join(errors))
     finally:
         try:
@@ -160,8 +159,8 @@ def inspect_schema(conn: sqlite3.Connection) -> dict[str, Any]:
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if "knowledge" not in tables:
         if "facts" in tables:
-            raise StarmapError("这是 v2 schema（facts 表）。星图只支持 v3（knowledge / episodes / logs）")
-        raise StarmapError("库里没有 knowledge 表，不是有效的 v3 记忆库")
+            raise StarmapError("这是 v2 schema（facts 表）。星图只支持 v4（knowledge / episodes / logs）")
+        raise StarmapError("库里没有 knowledge 表，不是有效的 v4 记忆库")
     meta: dict[str, str] = {}
     if "meta" in tables:
         meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
@@ -184,6 +183,9 @@ def _day_of(ms: int | None) -> str:
     return _dt.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d")
 
 
+_TABLE_KIND = {"knowledge": "experience", "episodes": "episode", "logs": "log"}
+
+
 def read_nodes(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
     for table in MAIN_TABLES:
@@ -203,11 +205,15 @@ def read_nodes(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             created = g("created_at") or g("at") or 0
             invalid_at = g("invalid_at")
             archived_at = g("archived_at")
+            # 遗忘等级：日志表没有这一列（不参与等级机制），先给个临时值 —
+            # run() 拿到配置的等级表后会统一换成表中正间那一档，这里只是兜底。
+            level_raw = g("forget_level")
+            forget_level = int(level_raw) if level_raw is not None else 3
             nodes.append(
                 {
                     "id": r["id"],
                     "table": table,
-                    "kind": g("kind", "log") if table != "logs" else "log",
+                    "kind": _TABLE_KIND[table],
                     "rowid": r["rowid"],
                     "content": (r["content"] or "")[:800],
                     "tags": [str(t) for t in tags][:12],
@@ -215,6 +221,12 @@ def read_nodes(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                     "at": g("at") or created,
                     "importance": float(g("importance") or 0.4),
                     "access_count": int(g("access_count") or 0),
+                    # 活跃度色标的原料：activity 列（检索命中累积，仅知识/经历有）、
+                    # 取用次数、最近一次被碰的时间。日志没有 activity 列，
+                    # 但 access_count / last_accessed_at 照样有，能算个诚实的「冷」。
+                    "activity": float(g("activity") or 0.0),
+                    "has_activity": "activity" in keys,
+                    "last_accessed_at": g("last_accessed_at"),
                     "scope": g("scope", "workspace") or "workspace",
                     "source": g("source"),
                     "digest_id": g("digest_id"),
@@ -223,10 +235,229 @@ def read_nodes(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                     "live": invalid_at is None,
                     "archived": archived_at is not None,
                     "compression_level": int(g("compression_level") or 0),
+                    "forget_level": forget_level,
+                    "has_level": level_raw is not None,
                     "embedded": bool(g("embedded")),
                 }
             )
     return nodes
+
+
+# ---------------------------------------------------------------- 活跃度色标
+
+# 辉光颜色按「活跃度」取三锚点渐变（青 0 → 黄 0.5 → 红 1）。
+# 活跃度本身不能直接当 0~1 用，于是有两种映射（``--activity-mode`` 选）：
+#
+#   * ``ratio``（默认）—— **活跃度 ÷ 本档阈值**。不做跨节点归一，颜色就是
+#     「本周期攒到升档线的几成」，1.0 恰是下一次裁定的晋升线；
+#   * ``rank``  —— **秩归一**（有多少比例的节点比你更不活跃）。分值的量纲是
+#     「命中相似度^幂 的累加」，一个被反复检索的老条目能到几十，线性归一后
+#     其余节点会全挤在青端；秩归一让颜色沿节点均匀铺开。
+#
+# 两种口径各有代价：ratio 忠于阈值但在「整库都在零活跃」时会整片青；rank 好看
+# 但颜色只说明排名、不说明离晋升多远。选哪个写在 meta 里，产物自己会交代。
+ACT_RECENCY_TAU_DAYS = 14.0
+DAY_MS = 86_400_000.0
+RANK_SIGNAL = "activity + log1p(access) + 新鲜度(τ=14天)"
+RATIO_SIGNAL = "activity ÷ 本档升档线"
+
+
+def activity_score(node: dict[str, Any], now_ms: float) -> float:
+    """一个节点的活跃度原始分：三个信号相加，各自校准到「一次典型取用 ≈ 1」。
+
+    * ``activity`` 列 —— 检索命中累积（`excess ** curve_power` 的加总），最硬的信号；
+    * ``log1p(access_count)`` —— 被取用次数，1 次 ≈ 0.69、10 次 ≈ 2.40，压掉长尾；
+    * 新鲜度 ``exp(-age / 14d)`` —— 最近被动过（取用时间，没有就用录入时间），
+      权重上限 1.0，约等于「今天刚碰过」送一次取用的量。
+
+    第三条不是凑数：一个刚建立、还没被检索过的库，前两项全是 0，
+    只有新鲜度能让星图说出「哪些是这两天的、哪些是半个月前的」，
+    否则整张图会是一片死青，色标等于没接。
+    """
+    score = float(node.get("activity") or 0.0)
+    score += math.log1p(max(0, int(node.get("access_count") or 0)))
+    touched = node.get("last_accessed_at") or node.get("at") or 0
+    if touched:
+        age_days = max(0.0, (now_ms - float(touched)) / DAY_MS)
+        score += math.exp(-age_days / ACT_RECENCY_TAU_DAYS)
+    return score
+
+
+def assign_activity_units(
+    nodes: list[dict[str, Any]], now_ms: float | None = None
+) -> dict[str, Any]:
+    """给每个节点写 ``score``（原始分）与 ``act01``（0~1 色标值），就地修改。
+
+    秩归一的三个边界（都有测试盯着）：
+
+    * 最低分恒为 0 —— 一半节点是 0 活跃时，它们就该是冷的青，不能因为
+      「同分占多数」被抬到中间色；
+    * 同分同色 —— 用 ``bisect_left`` 取同分的最小位次，不搞中点插值；
+    * 无从比较时给中性色 0.5 —— 全体同分（含只有一个节点）说明「彼此没有差别」，
+      涂成青会假装它们都冷、涂成红会假装都热，中间色才是老实话；
+      唯一的例外是分值真的全为 0（无时间戳、无取用、无检索累积），那才是全冷。
+
+    复盘恒星（digest）与原始日志（log）都不参与：前者没有 activity 也没有等级，
+    画固定金黄；后者表里压根没有 activity 列，画固定灰（见 :func:`_scored_nodes`）。
+    """
+    now = float(now_ms if now_ms is not None else time.time() * 1000.0)
+    real = _scored_nodes(nodes)
+    for node in nodes:
+        node.setdefault("act01", 0.0)
+        node.setdefault("score", 0.0)
+
+    if not real:
+        return {"mode": "rank", "signal": RANK_SIGNAL, "unit": "秩归一",
+                "scored": 0, "distinct": 0, "max": 0.0, "min": 0.0}
+
+    scores = [activity_score(n, now) for n in real]
+    ordered = sorted(scores)
+    lo, hi = ordered[0], ordered[-1]
+    span_flat = (hi - lo) <= 1e-12
+    unit_flat = 0.5 if hi > 0 else 0.0
+    total = len(ordered)
+
+    for node, s in zip(real, scores):
+        if span_flat:
+            unit = unit_flat
+        else:
+            unit = bisect.bisect_left(ordered, s) / (total - 1)
+        node["act01"] = round(min(1.0, max(0.0, unit)), 4)
+        node["score"] = round(float(s), 3)
+
+    for node in nodes:
+        if node["kind"] == "digest":
+            node["act01"] = 1.0  # 固定金黄，不参与活跃度着色，给满值只为字段完整
+    return {
+        "mode": "rank",
+        "signal": RANK_SIGNAL,
+        "unit": "秩归一",
+        "scored": total,
+        "distinct": len(set(ordered)),
+        "max": round(float(hi), 3),
+        "min": round(float(lo), 3),
+    }
+
+
+def assign_activity_ratio(
+    nodes: list[dict[str, Any]], level_table: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """``act01`` = 当前活跃度 ÷ 本档阈值，就地写 ``score`` / ``gate`` / ``act01``。
+
+    这是色标的第二种口径（用户 2026-11-17 要求试的）：不做任何跨节点归一，
+    0~1 就是这个节点在本档门槛上的进度 ——
+
+    * ``1.0`` 恰好等于升档线，意味着「下一次周期裁定就该升了」；
+    * ``0.5`` 攒了一半，还在往上爬；
+    * ``0`` 本周期一次都没被检索到。
+
+    分子**必须**是库里的 ``activity`` 列，不能换成 ``activity_score``：
+    阈值（``up_threshold``）是生命周期拿 ``activity`` 列比出来的，混入访问次数
+    或新鲜度会让「比例」失去定义——分子分母不同量纲，1.0 就不再对应任何真实事件。
+
+    分母取本档的 ``up_threshold``，见 :func:`level_gates`：顶档没有升档线时用
+    ``down_threshold`` 兜底；没有等级但确实有 activity 的条目（配置外的残留档位）
+    用全表最松的门槛，否则它们会永远钉在 0。
+
+    原始日志不参与 —— 它没有 activity 列，算出来恒为 0，而 0 在这里的含义是
+    「本周期没被检索」，对日志是句假话。它画固定灰，见 :func:`_scored_nodes`。
+
+    返回 ``usable=False`` 表示等级表里一个阈值都没有（配置读不到、退回库内档位时
+    就是这样），调用方应改用秩归一。
+    """
+    real = _scored_nodes(nodes)
+    for node in nodes:
+        node.setdefault("act01", 0.0)
+        node.setdefault("score", 0.0)
+        node.setdefault("gate", 0.0)
+
+    gates = level_gates(level_table)
+    if not gates:
+        return {"usable": False, "mode": "ratio", "scored": 0, "distinct": 0,
+                "zero": 0, "min": 0.0, "max": 0.0}
+    loosest = min(gates.values())
+
+    distinct: set[float] = set()
+    zero = 0
+    hot: list[float] = []
+    used_gates: set[float] = set()
+    for node in real:
+        level = node.get("forget_level") if node.get("has_level") else None
+        gate = gates.get(level) if isinstance(level, int) else None
+        # 没有等级，或库里残留的档位不在配置表里 → 用最松的门槛
+        # （表里只有一档时它就是那一档，不存在「松紧」可言）。
+        if not gate:
+            gate = loosest
+        activity = float(node.get("activity") or 0.0)
+        unit = activity / gate
+        node["act01"] = round(min(1.0, max(0.0, unit)), 4)
+        node["score"] = round(activity, 3)
+        node["gate"] = round(float(gate), 3)
+        distinct.add(node["act01"])
+        used_gates.add(round(float(gate), 3))
+        hot.append(node["act01"])
+        if activity <= 0:
+            zero += 1
+
+    for node in nodes:
+        if node["kind"] == "digest":
+            node["act01"] = 1.0  # 固定金黄，不参与活跃度着色，给满值只为字段完整
+    return {
+        "usable": True,
+        "mode": "ratio",
+        "signal": RATIO_SIGNAL,
+        "unit": "阈值比例",
+        "scored": len(real),
+        "distinct": len(distinct),
+        "zero": zero,
+        "min": round(min(hot), 3) if hot else 0.0,
+        "max": round(max(hot), 3) if hot else 0.0,
+        # 分母范围取「实际用到的那些」而不是整张表：面板上写 34 会让人以为
+        # 真有节点拿 L9 的线当分母，实际这个库最高只到 L5。
+        "gate_lo": round(min(used_gates), 3) if used_gates else 0.0,
+        "gate_hi": round(max(used_gates), 3) if used_gates else 0.0,
+        "gate_levels": len(used_gates),
+    }
+
+
+def assign_activity(
+    nodes: list[dict[str, Any]],
+    level_table: list[dict[str, Any]],
+    *,
+    mode: str = "ratio",
+    now_ms: float | None = None,
+) -> dict[str, Any]:
+    """色标入口：``ratio`` 走阈值比例，``rank`` 走秩归一。
+
+    ``ratio`` 算不出分母时**自动**退回 ``rank``，并在返回里挂 ``fallback`` 说明，
+    不抛异常 —— 配置读不到不该让星图打不开，但也不能悄悄换一套口径。
+    """
+    if mode == "rank":
+        return assign_activity_units(nodes, now_ms)
+    stats = assign_activity_ratio(nodes, level_table)
+    if not stats.get("usable"):
+        ranked = assign_activity_units(nodes, now_ms)
+        ranked.update({
+            "mode": "rank",
+            "signal": RANK_SIGNAL,
+            "unit": "秩归一",
+            "fallback": "等级表里没有可用阈值，已退回秩归一",
+        })
+        return ranked
+    return stats
+
+
+def _scored_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """参与活跃度着色的节点 = 有 ``activity`` 列的那些（知识 + 经历）。
+
+    两类要排除，原因不同：
+
+    * ``digest`` 复盘恒星 —— 没有 activity、没有等级，画固定金黄；
+    * ``log`` 原始日志 —— 表里根本没有 ``activity`` 列（它不进等级体系，
+      复盘完就被清掉）。给它算比例只会得到恒 0 的假值，还会白占一个秩归一的位次，
+      画出来是青的「冷」，可它连「冷」都谈不上，只是没这个概念。固定灰更老实。
+    """
+    return [n for n in nodes if n["kind"] not in ("digest", "log")]
 
 
 def read_vectors(conn: sqlite3.Connection, dim: int) -> dict[tuple[str, int], tuple[float, ...]]:
@@ -417,7 +648,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
 <style>
 :root{
   --bg:#070b14; --panel:#0d1422; --line:#243044; --text:#d8e2f2; --muted:#8292ab;
-  --knowledge:#6fb6ff; --state:#ffc46b; --case:#ff8f8f; --narrative:#b9a5ff;
+  --experience:#6fb6ff; --episode:#b9a5ff;
   --log:#8898ad; --digest:#ffe08a;
 }
 *{box-sizing:border-box}
@@ -434,12 +665,12 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
 .kv span:first-child{color:var(--muted);flex:0 0 auto}
 .kv span:last-child{text-align:right;word-break:break-all}
 label.row{display:flex;align-items:center;gap:8px;margin:5px 0;cursor:pointer;font-size:12px}
-input[type=range]{width:100%;accent-color:var(--knowledge)}
+input[type=range]{width:100%;accent-color:var(--experience)}
 input[type=text]{width:100%;background:#0a101c;color:var(--text);border:1px solid var(--line);
   border-radius:6px;padding:6px 8px;font:inherit;font-size:12px}
 button{background:#16223a;color:var(--text);border:1px solid var(--line);border-radius:6px;
   padding:6px 10px;cursor:pointer;font:inherit;font-size:12px;margin:4px 4px 0 0}
-button:hover{border-color:var(--knowledge)}
+button:hover{border-color:var(--experience)}
 .dot{width:9px;height:9px;border-radius:50%;display:inline-block;flex:0 0 9px}
 #main{flex:1;position:relative;min-width:0}
 canvas{display:block;width:100%;height:100%;cursor:grab}
@@ -455,6 +686,10 @@ canvas.drag{cursor:grabbing}
 #legend{position:absolute;right:16px;bottom:14px;font-size:11px;color:var(--muted);
   pointer-events:none;text-align:right;line-height:1.9}
 .warn{color:#ffc46b;font-size:11px;margin-top:8px;word-break:break-word}
+/* 活跃度色标：三锚点与画布里的辉光同源（青 0 → 黄 0.5 → 红 1） */
+.glowbar{height:10px;border-radius:5px;margin:4px 0 3px;
+  background:linear-gradient(90deg,#0fe0e5 0%,#f6de14 50%,#f10000 100%)}
+.glowscale{display:flex;justify-content:space-between;font-size:11px;color:var(--muted)}
 </style>
 </head>
 <body>
@@ -477,6 +712,18 @@ canvas.drag{cursor:grabbing}
       <div id="kinds"></div>
     </div>
     <div class="sec">
+      <h2>活跃度色标</h2>
+      <div class="glowbar"></div>
+      <div class="glowscale"><span>0 冷</span><span>0.5</span><span>1 热</span></div>
+      <div class="kv"><span>口径</span><span id="actSignal">-</span></div>
+      <div class="kv"><span>分母</span><span id="actGate">-</span></div>
+      <div class="kv"><span>色标跨度</span><span id="actRange">-</span></div>
+    </div>
+    <div class="sec">
+      <h2>遗忘等级（辉光透明度）</h2>
+      <div id="levels"></div>
+    </div>
+    <div class="sec">
       <h2>查找</h2>
       <input type="text" id="search" placeholder="输入关键词或节点 ID，高亮命中条目">
       <label class="row"><input type="checkbox" id="labels"> 显示更多星名</label>
@@ -494,20 +741,48 @@ canvas.drag{cursor:grabbing}
 <script>
 /*__DATA__*/
 (function(){
-const C={knowledge:'#6fb6ff',state:'#ffc46b',case:'#ff8f8f',narrative:'#b9a5ff',log:'#8898ad',digest:'#ffe08a'};
-const L={knowledge:'知识',state:'现状',case:'案例',narrative:'叙述',log:'日志',digest:'复盘'};
+const C={experience:'#6fb6ff',episode:'#b9a5ff',log:'#8898ad',digest:'#ffe08a'};
+const L={experience:'经验',episode:'经历',log:'日志',digest:'复盘'};
 const ET={semantic:'语义近邻',invalidates:'失效链',digest:'复盘溯源',tag:'标签共现'};
 const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
 const tip=document.getElementById('tip');
 let W=0,H=0,DPR=1,view={x:0,y:0,k:1};
 let alpha=1,frame=0,hover=null,selected=null,dragging=null,panning=null,fixedHover=true,downX=0,downY=0;
 const enabled={semantic:true,invalidates:true,digest:true,tag:false};
-const kinds={knowledge:true,state:true,case:true,narrative:true,log:true,digest:true};
+const kinds={experience:true,episode:true,log:true,digest:true};
 let minScore=DATA.meta.min_score;
+// 等级量程与整张等级表都由后端从配置（[[forget.levels]]）带过来。
+// 不写死档数、也不假设等级是 0~N 连续整数：表的形状归配置管，这里只负责画。
+const LVMAX=Math.max(0,(DATA.meta&&DATA.meta.max_level)||0);
+// 顶档是 0（空库的单档占位）时，任何比值都该是 0 而不是 NaN —— 单独给个分母。
+const LVDEN=Math.max(1,LVMAX);
+const LEVELS=(DATA.meta&&DATA.meta.levels&&DATA.meta.levels.length)
+  ?DATA.meta.levels:[{level:LVMAX}];
 let showLabels=document.getElementById('labels').checked;
 
+// 辉光颜色 = 活跃度，三锚点线性渐变：0 = 青 #0FE0E5，0.5 = 黄 #F6DE14，1 = 红 #F10000。
+// 逐通道插值即可：三段跨度都不大（青→黄、黄→红各约 120° 色相），
+// 不会像蓝→黄那样穿过灰带。act01 已由后端算好（默认是「活跃度 ÷ 本档阈值」），
+// 这里只负责取色，不参与任何归一。
+const GLOW_STOPS=[[0,[15,224,229]],[.5,[246,222,20]],[1,[241,0,0]]];
+// 原始日志的固定辉光色：跟它的节点本体同色。日志没有 activity 列，不参与色标 ——
+// 涂青会被读成「很冷」，可它连冷热都不参与，灰色才是「不适用」的正确表情。
+const LOG_GLOW='#8898ad';
+function glowColor(t){
+  t=Math.max(0,Math.min(1,t||0));
+  for(let i=0;i<GLOW_STOPS.length-1;i++){
+    const a=GLOW_STOPS[i],b=GLOW_STOPS[i+1];
+    if(t<=b[0]||i===GLOW_STOPS.length-2){
+      const f=(b[0]===a[0])?0:(t-a[0])/(b[0]-a[0]);
+      const c=a[1].map((v,k)=>Math.round(v+(b[1][k]-v)*f));
+      return 'rgb('+c[0]+','+c[1]+','+c[2]+')';
+    }
+  }
+  return 'rgb(241,0,0)';
+}
+
 function rnd(i){const x=Math.sin(i*127.1+311.7)*43758.5453;return x-Math.floor(x);}
-const centers={knowledge:[-.42,-.30],state:[.42,-.30],case:[-.38,.28],narrative:[.38,.28],log:[0,.02],digest:[0,0]};
+const centers={experience:[-.42,-.18],episode:[.42,-.18],log:[0,.22],digest:[0,0]};
 const nodes=DATA.nodes.map((n,i)=>{
   const c=centers[n.kind]||[0,0];
   return Object.assign({},n,{
@@ -515,6 +790,9 @@ const nodes=DATA.nodes.map((n,i)=>{
     y:H*.5+c[1]*260+(rnd(i+999)-.5)*220,
     vx:0,vy:0,fixed:false,
     r:3+Math.min(9,Math.max(0,n.importance)*8)+(n.kind==='digest'?3:0),
+    // 辉光颜色：复盘恒星固定金黄；原始日志固定灰（与本体同色，不去蹭色标通道）—— 它表里没有 activity 列，
+    // 涂青会被读成「很冷」，可它连冷热都不参与，灰色才是「不适用」的正确表情。
+    gcol:n.kind==='digest'?'#ffe08a':(n.kind==='log'?LOG_GLOW:glowColor(n.act01||0)),
     deg:0
   });
 });
@@ -653,8 +931,22 @@ function draw(){
     const hit=matchesQuery(n,q);
     const focus=n===hover||n===selected||hit;
     ctx.globalAlpha=dim?.42:(focus?1:.9);
-    ctx.beginPath();ctx.arc(n.x,n.y,n.r*2.4,0,6.2832);
-    ctx.fillStyle=col;ctx.globalAlpha*=.10;ctx.fill();
+    // 辉光走两个通道，各管一个维度，谁也不顶替谁：
+    //   颜色 = 活跃度（青 0 → 黄 0.5 → 红 1，见 glowColor / 侧栏色标）；
+    //   透明度 = 遗忘等级（越接近遗忘越淡，像逐渐熄灭的灯）。
+    // 本体大小继续由 importance 决定。
+    // 透明度与半径都按量程归一：0.02（近熄灭）→ 0.395（顶档最亮）。
+    // 档数变多后相邻档的差值自然变小，这是「同样亮度跨度分更多份」的必然代价；
+    // 半径同步归一，两个通道一起表达跨度，低档之间仍能靠「灯大不大」区分。
+    const lvl=Math.max(0,Math.min(LVMAX,n.forget_level||0));
+    const ratio=lvl/LVDEN;
+    const glow=n.kind==='digest'?.26:(n.has_level?0.02+ratio*0.375:0.17);
+    ctx.beginPath();ctx.arc(n.x,n.y,n.r*(2.05+ratio*0.65),0,6.2832);
+    // 颜色跟活跃度走，不再统一白蓝：色相只表达「热不热」，亮度仍由等级单独控制，
+    // 两个通道正交，所以「暗而红」（刚沉底的高活跃条目）和「亮而青」（顶档但没人碰）
+    // 都能读得出来，不会互相污染。
+    ctx.fillStyle=n.gcol;
+    ctx.globalAlpha*=glow;ctx.fill();
     ctx.globalAlpha=dim?.42:(focus?1:.9);
     ctx.beginPath();ctx.arc(n.x,n.y,n.r,0,6.2832);
     ctx.fillStyle=col;ctx.fill();
@@ -699,8 +991,24 @@ function showTip(n){
   tip.innerHTML='<div class="kind" style="color:'+(C[n.kind]||'#8898ad')+'">'+
     esc(L[n.kind]||n.kind)+' · '+esc(n.id)+'</div>'+
     '<div class="body">'+esc(n.content)+'</div>'+
-    '<div class="meta">重要度 '+n.importance.toFixed(2)+' · 访问 '+n.access_count+
-    ' · 邻居 '+n.deg+'<br>'+(n.day?('日期 '+esc(n.day)+' · '):'')+
+    '<div class="meta">'+
+    (n.has_level
+      ? '遗忘等级 <b>L'+n.forget_level+'</b>'+(n.forget_level===0?'（遗忘层）':'')+' · '
+      : '原始日志（不参与等级） · ')+
+    '重要度 '+n.importance.toFixed(2)+' · 访问 '+n.access_count+
+    ' · 邻居 '+n.deg+'<br>'+
+    (n.kind==='digest'
+      ? '复盘恒星（不参与活跃度着色）<br>'
+      : n.kind==='log'
+        ? '原始日志（灰色 · 不参与活跃度着色）<br>'
+        // ratio 口径下把分母摆出来：光看到一个 0.09 没法判断「是懒还是门槛高」，
+        // 写成「0.84 ÷ 9.5 = 0.09」就一目了然。rank 口径没有分母，退回旧写法。
+        : (n.gate
+            ? '活跃度 <b>'+(n.score||0).toFixed(2)+'</b> ÷ 阈值 <b>'+n.gate.toFixed(2)+'</b> = 色标 <b>'+
+              (n.act01||0).toFixed(2)+'</b>'
+            : '活跃度 <b>'+(n.score||0).toFixed(2)+'</b> · 色标 <b>'+(n.act01||0).toFixed(2)+'</b>')+
+          ' <span class="dot" style="background:'+(n.gcol||'#8898ad')+';vertical-align:-1px"></span><br>')+
+    (n.day?('日期 '+esc(n.day)+' · '):'')+
     '作用域 '+esc(n.scope)+(n.archived?' · 已归档':'')+(n.live===false?' · 已失效':'')+
     (n.tags.length?('<br>标签 '+esc(n.tags.join(' / '))):'')+
     (n.source?('<br>来源 '+esc(n.source)):'')+'</div>';
@@ -764,10 +1072,64 @@ function buildUI(){
     '<span class="dot" style="background:'+C[k]+'"></span>'+L[k]+' <span style="color:var(--muted);margin-left:auto">'+
     (m.kind_counts[k]||0)+'</span></label>').join('');
   kd.querySelectorAll('input').forEach(el=>el.onchange=()=>{kinds[el.dataset.k]=el.checked;refresh();});
+  // 等级分布：顺手把每个等级的辉光透明度画成一个小圆点 —— 既是统计也是图例，
+  // 一眼就能看出「库里有没有跨度」。全挤在 L5 时，这里会诚实地显示 0。
+  // 档位、周期都来自配置（LEVELS），不数 0~N：等级表可能不是连续整数，
+  // 也可能只有 4 档，循环次数由数据决定。
+  const lvCount={};let logN=0;
+  DATA.nodes.forEach(n=>{
+    if(n.kind==='digest')return;
+    if(n.has_level){lvCount[n.forget_level]=(lvCount[n.forget_level]||0)+1;}else{logN++;}
+  });
+  const lvEl=document.getElementById('levels');
+  let lvHtml='';
+  LEVELS.forEach(item=>{
+    const lv=item.level, c=lvCount[lv]||0;
+    const a=(0.02+(lv/LVDEN)*0.375).toFixed(3);
+    lvHtml+='<div class="kv"><span><span class="dot" style="background:#dbe8ff;opacity:'+a+'"></span> L'+lv+
+      (item.days!=null?' · '+item.days+' 天':'')+
+      (lv===0?'（遗忘层）':'')+'</span><span style="color:var(--muted)">'+c+'</span></div>';
+  });
+  // 配置外的等级（改过表 / 老数据残留）：照样列出来，别让节点在统计里凭空消失
+  const knownLevels=new Set(LEVELS.map(x=>x.level));
+  Object.keys(lvCount).map(Number).filter(lv=>!knownLevels.has(lv)).sort((a,b)=>b-a).forEach(lv=>{
+    lvHtml+='<div class="kv"><span><span class="dot" style="background:#ffc46b"></span> L'+lv+
+      '（配置外）</span><span style="color:var(--muted)">'+lvCount[lv]+'</span></div>';
+  });
+  if(logN)lvHtml+='<div class="kv"><span>日志（无等级）</span><span style="color:var(--muted)">'+logN+'</span></div>';
+  // 等级表从哪来的，写在面板上 —— 读到配置和退回库内档位是两种可信度，别让人猜
+  const lvSrc={config:'配置 [[forget.levels]]',db:'库内实际档位（未读到配置）',default:'空库占位'}[
+    (DATA.meta&&DATA.meta.level_source)||'']||'';
+  if(lvSrc)lvHtml+='<div class="kv" style="margin-top:6px"><span>等级表</span><span>'+
+    LEVELS.length+' 档 · '+lvSrc+'</span></div>';
+  lvEl.innerHTML=lvHtml;
+  // 色标口径：把「这个颜色是拿什么算的」写在面板上，而不是留在代码注释里。
+  const am=(DATA.meta&&DATA.meta.activity)||{};
+  const isRatio=am.mode==='ratio';
+  document.getElementById('actSignal').textContent=am.signal||'-';
+  // 分母一行只在 ratio 口径下有意义；rank 是按名次分色，没有分母这回事，
+  // 与其写个「-」不如直接把口径差别说清。
+  document.getElementById('actGate').textContent=isRatio
+    ? ((am.gate_lo==null||!am.scored)?'-'
+      :(am.gate_lo===am.gate_hi
+        ? '全表 '+am.gate_lo
+        : '按档 '+am.gate_lo+' ~ '+am.gate_hi+(am.gate_levels?'（'+am.gate_levels+' 档）':'')))
+    : '无（跨节点排名）';
+  document.getElementById('actRange').textContent=am.scored
+    ? ((am.min||0).toFixed(2)+' → '+(am.max||0).toFixed(2)
+      +(isRatio&&am.zero?' · '+am.zero+' 个为 0':''))
+    : '无节点';
   document.getElementById('legend').innerHTML=
+    '<span style="color:#cfe0ff">点大小 = 重要度 · 辉光颜色 = 活跃度 · 辉光透明度 = 遗忘等级</span><br>'+
+    '<span style="color:#0fe0e5">　冷 0</span><span style="color:#8292ab"> ─ </span>'+
+    '<span style="color:#f6de14">中 0.5</span><span style="color:#8292ab"> ─ </span>'+
+    '<span style="color:#f10000">热 1</span><span style="color:#8fa8c8">（'+
+    (isRatio?'活跃度 ÷ 本档阈值，1.0 = 升档线':'秩归一，只表示排名')+'）</span><br>'+
+    '<span style="color:#8fa8c8">　（辉光越淡越接近遗忘，L'+LVMAX+' 最实 · L0 近乎熄灭）</span><br>'+
     '<span style="color:#6fb6ff">虚线粗细 = 语义相似度</span><br>'+
     '<span style="color:#ffc46b">琥珀箭头 = 失效 / 换代</span><br>'+
     '<span style="color:#ffe08a">黄色恒星 = 复盘批次</span><br>'+
+    '<span style="color:'+LOG_GLOW+'">灰色辉光 = 原始日志（无活跃度 / 无等级）</span><br>'+
     '<span style="color:#5fd6a0">绿色实线 = 标签共现</span><br>'+
     '<span style="color:#cfe0ff">悬停 / 选中 / 搜中 = 加粗其可见连线</span>';
   const notes=document.getElementById('notes');
@@ -808,6 +1170,127 @@ def render_html(graph: dict[str, Any]) -> str:
     return _HTML_TEMPLATE.replace("/*__DATA__*/", "const DATA = " + payload + ";")
 
 
+# ---------------------------------------------------------------- 遗忘等级表
+
+
+def _db_levels(nodes: list[dict[str, Any]]) -> list[int]:
+    """库里真实出现过的等级（降序，恒含 0）。配置读不到时的退路。"""
+    seen = {int(n["forget_level"]) for n in nodes if n.get("has_level")}
+    seen.add(0)
+    return sorted(seen, reverse=True)
+
+
+def _slim_level(item: dict[str, Any]) -> dict[str, Any]:
+    """配置里的一档 → 星图要的那几个字段（周期取经验侧，图例上标「几天」）。
+
+    阈值（``up_threshold`` / ``down_threshold``）也带上：活跃度色标要拿它当分母，
+    「当前的活跃度相当于本档门槛的几成」——这是色标唯一有物理意义的读法。
+    顶档按配置约定没有 ``up_threshold``，缺了就不写，让下游显式退化。
+    """
+    level = int(item["level"])
+    days = item.get("period_experience_days", item.get("period_episode_days"))
+    slim: dict[str, Any] = {"level": level}
+    if days is not None:
+        slim["days"] = int(days)
+    if item.get("compress"):
+        slim["compress"] = str(item["compress"])
+    for key in ("up_threshold", "down_threshold"):
+        value = _as_float(item.get(key))
+        if value is not None:
+            slim[key] = value
+    return slim
+
+
+def _as_float(value: Any) -> float | None:
+    """容错取小数：配置可能给 int、字符串，也可能给空。坏值一律当「没有」。"""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def level_gates(level_table: list[dict[str, Any]]) -> dict[int, float]:
+    """每档的「分母」：升档线优先，顶档没有升档线就用它自己的降档线。
+
+    为什么不是降档线：色标要回答的是「离升档还有多远」——分子涨到分母就是一次晋升，
+    这才是活跃度在等级体系里唯一被定义过的参照。顶档升无可升，用降档线兜底，
+    含义退化成「还稳不稳」，可接受；``None`` 表示这档连门槛都没有，交给调用方退化。
+    """
+    gates: dict[int, float] = {}
+    for item in level_table:
+        level = item.get("level")
+        if not isinstance(level, int):
+            continue
+        up = _as_float(item.get("up_threshold"))
+        down = _as_float(item.get("down_threshold"))
+        gate = up if up and up > 0 else (down if down and down > 0 else None)
+        if gate:
+            gates[level] = gate
+    return gates
+
+
+def _levels_from_config(
+    db: Path, environ: dict[str, str] | None = None
+) -> list[dict[str, Any]] | None:
+    """读项目配置里的 ``[[forget.levels]]``；读不到/配置坏了一律返回 None。
+
+    等级表是**配置**定义的（档数、每档周期、压缩档），代码里不该有「一共 5 档」
+    这种常数。这里只读不写：``Config.load`` 干的活就是找文件 + 解析 + 合并 + 校验。
+    """
+    from .config import Config  # 延迟 import：星图本体仍然靠标准库就能跑起来
+
+    ws = db.parent if db.parent.name == ".ai_memory" else None
+    try:
+        cfg = Config.load(environ, workspace=ws)
+    except Exception:  # noqa: BLE001 —— 配置坏了也不该连星图都打不开，退回库里的档位
+        return None
+    levels = cfg.forget_levels
+    return levels or None
+
+
+def resolve_levels(
+    db: Path,
+    nodes: list[dict[str, Any]],
+    environ: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], str, int]:
+    """决定星图的等级轴：返回 ``(降序等级表, 来源, 中性档)``。
+
+    优先级依次降低：
+
+    1. ``config`` —— 项目配置的 ``[[forget.levels]]``，唯一真源。档数、每档周期
+       都从这里来，加一档不需要改代码；
+    2. ``db``     —— 配置读不到时，用库里出现过的档位凑表。**只画真实存在的档**，
+       不用「至少画到 5 档」之类的常数补齐 —— 那会凭空造出库里没有的等级；
+    3. ``default``—— 空库（一条带等级的都没有）时给单档占位，免得图例整块空白。
+
+    中性档用于「没有等级列」的日志当占位（透明度本来就固定 0.17，
+    这一项只影响光晕半径），取表的正中一档，而不是写死 3。
+    """
+    configured = _levels_from_config(db, environ)
+    if configured:
+        table = [_slim_level(item) for item in configured]
+        source = "config"
+    else:
+        db_levels = _db_levels(nodes)
+        if any(n.get("has_level") for n in nodes):
+            table = [{"level": lv} for lv in db_levels]
+            source = "db"
+        else:
+            table = [{"level": 0}]
+            source = "default"
+
+    # 配置表里出现非整数 level 是配置校验该拦的事；真漏了就在这儿剔掉，别让前端吃脏值
+    table = [item for item in table if isinstance(item.get("level"), int)]
+    table.sort(key=lambda item: int(item["level"]), reverse=True)
+    if not table:
+        table, source = [{"level": 0}], "default"
+
+    neutral = int(table[len(table) // 2]["level"])
+    return table, source, neutral
+
+
 # ---------------------------------------------------------------- CLI 入口
 
 
@@ -830,6 +1313,22 @@ def run(args: argparse.Namespace) -> int:
         conn.close()
 
     real_nodes = sum(1 for n in nodes if n["kind"] != "digest")
+
+    # 等级轴由配置的 [[forget.levels]] 生成：档数、每档周期都读配置，
+    # 代码里不写死「一共几档」，也不假设等级是 0~N 连续整数。
+    level_table, level_source, neutral_level = resolve_levels(db, nodes)
+    level_max = int(level_table[0]["level"])
+    # 日志没有等级列（不参与等级机制）：给中间档当占位，透明度本来就固定 0.17，
+    # 这一项只影响光晕半径，取表中正间而不是写死 3。
+    # 复盘恒星排除在外 —— 它连等级都没有，光晕大小一直是「零档」那档。
+    for node in nodes:
+        if node["kind"] != "digest" and not node.get("has_level"):
+            node["forget_level"] = neutral_level
+
+    # 色标必须在等级表定下来之后再算 —— ratio 口径的分母就是这张表给的。
+    act_stats = assign_activity(
+        nodes, level_table, mode=getattr(args, "activity_mode", "ratio")
+    )
     covered = sum(
         1 for n in nodes if n["kind"] != "digest" and (n["table"], n["rowid"]) in vecs
     )
@@ -842,6 +1341,21 @@ def run(args: argparse.Namespace) -> int:
     if covered < real_nodes:
         warnings.append(f"{real_nodes - covered} 条条目没有向量，不参与语义连线")
     all_notes = list(dict.fromkeys(notes + dir_notes + stats["notes"]))
+
+    if act_stats.get("fallback"):
+        warnings.append(str(act_stats["fallback"]))
+    if act_stats.get("mode") == "ratio" and act_stats.get("scored"):
+        # 「整库都在零活跃」在 ratio 口径下会变成整片青，这不是画错了，
+        # 是本周期确实没人被检索到 —— 但必须说出来，否则没人能判断该怪数据还是怪图。
+        zero = int(act_stats.get("zero") or 0)
+        if zero >= int(act_stats["scored"]):
+            warnings.append(
+                "所有条目的 activity 都是 0（本周期没有检索命中），活跃度色标整片偏青"
+            )
+        elif zero * 2 >= int(act_stats["scored"]):
+            warnings.append(
+                f"{zero}/{act_stats['scored']} 条条目的 activity 为 0，色标会偏青那端"
+            )
 
     graph = {
         "nodes": nodes,
@@ -859,6 +1373,12 @@ def run(args: argparse.Namespace) -> int:
             "kind_counts": dict(Counter(n["kind"] for n in nodes)),
             "edge_counts": stats["edge_counts"],
             "min_score": args.min_score,
+            "max_level": level_max,
+            # 整张表交给前端画图例：档位、周期都来自配置，前端不再自己数 0~N
+            "levels": level_table,
+            "level_source": level_source,
+            # 色标口径写进产物，免得日后看 HTML 的人猜「这个青色到底代表什么」
+            "activity": dict(act_stats),
             "generated_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "dir_files": files,
             "notes": all_notes,
@@ -879,6 +1399,7 @@ def run(args: argparse.Namespace) -> int:
         f"{k} {counts.get(k, 0)}" for k in ("semantic", "invalidates", "digest", "tag")
     ))
     print(f"  相似度计算 {stats['semantic_pairs_computed']} 对 · 耗时 {time.time() - started:.1f}s")
+    print(f"  遗忘等级 {len(level_table)} 档（L{level_max} 顶档 · 来源 {level_source}）")
     for w in warnings:
         print(f"  提示：{w}")
     print("  全程只读，未创建或修改任何数据库。")
