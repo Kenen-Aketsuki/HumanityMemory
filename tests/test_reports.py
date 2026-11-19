@@ -385,3 +385,52 @@ def test_stat_card_heading_does_not_collide_with_kind_dot() -> None:
     assert '.card .lbl{' in html, "统计卡标题要有自己的类"
     assert '.card .k{' not in html, "标题不能再挂在圆点类上"
     assert '<div class="lbl">' in html, "卡片模板要真的用 .lbl"
+
+
+def test_hot_rows_filter_retrieval_records_by_entry_id() -> None:
+    """热度榜要能反查「这个条目是在哪次搜索里被命中的」。
+
+    左栏放 ID 搜索框（子串匹配、不区分大小写），点热度榜任一行自动填入 ID
+    并打开第一条命中详情；清空搜索框恢复全部记录。
+    """
+    html = render_retrieval_html(
+        [],
+        meta={"levels": [], "nodes": [], "activity": {"e_abc": {"activity": 1.0, "level": 4}}},
+    )
+
+    assert 'id="qid"' in html, "左栏要有条目 ID 搜索框"
+    assert 'id="listcnt"' in html, "要显示过滤命中了几条 / 总共几条"
+    assert "function matchRec" in html and "function filterById" in html
+    assert "data-id=" in html, "热度榜行要带条目 ID，才能点一下就反查"
+    assert "node.onclick=()=>filterById(node.dataset.id)" in html
+    assert "box.addEventListener('input'" in html, "输入时即时过滤，不用敲回车"
+    assert "清空上面的输入框显示全部" in html, "无匹配时要告诉用户怎么退回全量"
+
+
+def test_hot_rows_filter_retrieval_records_by_entry_id() -> None:
+    """热度榜要能反查「这个条目是在哪次搜索里被命中的」。
+
+    左栏放 ID 搜索框（子串匹配、不区分大小写），点热度榜任一行自动填入 ID
+    并打开第一条命中详情；清空搜索框恢复全部记录。
+    """
+    html = render_retrieval_html(
+        [],
+        meta={"levels": [], "nodes": [], "activity": {"e_abc": {"activity": 1.0, "level": 4}}},
+    )
+
+    assert 'id="qid"' in html, "左栏要有条目 ID 搜索框"
+    assert 'id="listcnt"' in html, "要显示过滤命中了几条 / 总共几条"
+    assert "function matchRec" in html and "function filterById" in html
+    assert "data-id=" in html, "热度榜行要带条目 ID，才能点一下就反查"
+    assert "node.onclick=()=>filterById(node.dataset.id)" in html
+    assert "box.addEventListener('input'" in html, "输入时即时过滤，不用敲回车"
+    assert "清空上面的输入框显示全部" in html, "无匹配时要告诉用户怎么退回全量"
+
+
+def test_detail_highlights_the_entry_being_searched() -> None:
+    """搜索框里有条目 ID 时，详情表格里那条记忆的行也要高亮。"""
+    html = render_retrieval_html([], meta={"levels": [], "nodes": [], "activity": {}})
+
+    assert "tr.hit td{background:" in html, "详情表格要有命中行的高亮样式"
+    assert "function matchId" in html, "高亮判定要和左栏过滤共用一套 ID 匹配规则"
+    assert "matchId(h.id)?' class=\"hit\"'" in html, "命中行要真的挂上高亮类"

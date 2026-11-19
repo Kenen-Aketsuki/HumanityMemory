@@ -12,6 +12,8 @@
     右栏        条目热度榜 + 自动诊断（当前配置偏苛刻还是偏宽松）
                 热度榜支持两种排序：命中次数（页面自己数）与活跃度（库里的实时值），
                 两个数值同时显示 —— 只换顺序而不换数字，没人看得懂排序依据。
+                点热度榜任一条即按它的 ID 过滤左栏记录，从「谁被命中」一步跳到
+                「哪次搜索命中了它」；也可以直接在左栏搜索框敲 ID，清空即全显。
 
 为什么要自己算一遍：活跃度阈值是绝对分数，而「一次检索值多少分」由相似度
 和曲线决定。两个数字都躺在配置里，但**它们相不相配只有算出来才知道** ——
@@ -81,6 +83,14 @@ h2{font-size:12px;font-weight:500;color:var(--muted);margin:0;padding:10px 14px 
 .item{padding:8px 14px;border-bottom:1px solid #161d27;cursor:pointer}
 .item:hover{background:var(--panel)}
 .item.on{background:#17202d;border-left:2px solid var(--exp)}
+/* 按条目 ID 过滤左栏检索记录：搜索框贴在标题下，热度榜行点一下就能填进来 */
+.filter{padding:8px 14px;border-bottom:1px solid var(--line);background:var(--bg);
+  position:sticky;top:36px;z-index:1}
+.filter input{width:100%;background:#151d28;border:1px solid var(--line);border-radius:6px;
+  color:var(--text);font:12px/1.5 inherit;padding:5px 8px;outline:none}
+.filter input:focus{border-color:var(--exp)}
+.filter input::placeholder{color:var(--dim)}
+.filter .cnt{color:var(--dim);font-size:10.5px;margin-top:4px}
 .q{color:var(--text);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .t{color:var(--dim);font-size:11px;margin-top:3px;display:flex;gap:8px}
 .tag{color:var(--warn)}
@@ -93,6 +103,10 @@ table{width:100%;border-collapse:collapse;font-size:12px}
 th{color:var(--muted);font-weight:500;text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);
   position:sticky;top:0;background:var(--bg)}
 td{padding:7px 8px;border-bottom:1px solid #161d27;vertical-align:top}
+/* 搜索框里正在查的那条记忆，在详情表格里也要能一眼看到 */
+tr.hit td{background:#172737}
+tr.hit td:first-child{box-shadow:inset 2px 0 var(--warn)}
+tr.hit .id{color:var(--text)}
 .k{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:6px;vertical-align:1px}
 .id{font-family:ui-monospace,Consolas,monospace;color:var(--dim);font-size:11px}
 .bar{position:relative;height:14px;background:#151d28;border-radius:3px;min-width:70px}
@@ -106,7 +120,11 @@ h2.split{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .sort button:hover{color:var(--text)}
 .sort button.on{color:var(--text);border-color:var(--exp);background:#17202d}
 .sort button:disabled{opacity:.45;cursor:default}
-.hot{display:flex;align-items:center;gap:8px;padding:6px 14px;border-bottom:1px solid #161d27}
+.hot{display:flex;align-items:center;gap:8px;padding:6px 14px;border-bottom:1px solid #161d27;
+  cursor:pointer}
+.hot:hover{background:var(--panel)}
+.hot.on{background:#17202d}
+.hot.on .c{color:var(--text)}
 .hot .n{color:var(--warn);font-size:11px;min-width:20px;text-align:right}
 .hot .c{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
 .hot .lv{color:var(--dim);font-size:11px}
@@ -130,7 +148,14 @@ h2.split{display:flex;align-items:center;justify-content:space-between;gap:8px}
 </header>
 <div class="stats" id="stats"></div>
 <main>
-  <aside><h2>检索记录</h2><div id="list"></div></aside>
+  <aside>
+    <h2>检索记录</h2>
+    <div class="filter">
+      <input id="qid" type="text" placeholder="按条目 ID 过滤检索记录…" autocomplete="off" spellcheck="false">
+      <div class="cnt" id="listcnt"></div>
+    </div>
+    <div id="list"></div>
+  </aside>
   <section><div id="detail"><div class="empty">左侧选一条记录</div></div></section>
   <aside>
     <h2 class="split">条目热度
@@ -221,14 +246,41 @@ function summary(){
     (M.db?M.db+' · ':'')+span+(M.generated?(' · 节点快照 '+ts(M.generated)):'');
 }
 
-function list(){
+// 左栏过滤：输入条目 ID 的子串，只留命中过它的检索记录。
+// 每一行保留 recs 里的原下标 —— detail() 必须拿原下标，不能拿过滤后的位次当索引。
+let qid='';
+function matchId(id){return !!qid&&String(id||'').toLowerCase().indexOf(qid)>=0;}
+function matchRec(r){
+  if(!qid)return true;
+  return (r.hits||[]).some(h=>matchId(h.id));
+}
+function shown(){
+  const out=[];
+  recs.forEach((r,i)=>{if(matchRec(r))out.push({r,i});});
+  return out;
+}
+function list(sel){
   const el=document.getElementById('list');
-  if(!recs.length){el.innerHTML='<div class="empty">还没有检索记录。<br>用 memory_recall 跑几次就会出现。</div>';return;}
-  el.innerHTML=recs.map((r,i)=>
-    '<div class="item'+(i===0?' on':'')+'" data-i="'+i+'">'+
-      '<div class="q">'+esc(r.query||'（空查询）')+'</div>'+
-      '<div class="t"><span>'+ts(r.at)+'</span><span>'+(r.hit_count||(r.hits||[]).length)+' 命中</span>'+
-      (r.deep?'<span class="tag">深度</span>':'')+'</div>'+
+  const rows=shown();
+  const cnt=document.getElementById('listcnt');
+  if(cnt)cnt.textContent=qid
+    ? ('命中该条目 '+rows.length+' / '+recs.length+' 次检索')
+    : (recs.length+' 次检索 · 点右栏条目可反查');
+  if(!rows.length){
+    el.innerHTML='<div class="empty">'+(qid
+      ? '没有检索记录命中过条目 <b>'+esc(qid)+'</b>。<br>清空上面的输入框显示全部。'
+      : '还没有检索记录。<br>用 memory_recall 跑几次就会出现。')+'</div>';
+    document.getElementById('detail').innerHTML=
+      '<div class="empty">'+(qid?'没有匹配的检索记录':'左侧选一条记录')+'</div>';
+    return;
+  }
+  const active=sel==null?rows[0].i:sel;
+  el.innerHTML=rows.map(x=>
+    '<div class="item'+(x.i===active?' on':'')+'" data-i="'+x.i+'">'+
+      '<div class="q">'+esc(x.r.query||'（空查询）')+'</div>'+
+      '<div class="t"><span>'+ts(x.r.at)+'</span><span>'+
+      (x.r.hit_count||(x.r.hits||[]).length)+' 命中</span>'+
+      (x.r.deep?'<span class="tag">深度</span>':'')+'</div>'+
     '</div>').join('');
   el.querySelectorAll('.item').forEach(node=>{
     node.onclick=()=>{
@@ -236,6 +288,31 @@ function list(){
       node.classList.add('on');
       detail(Number(node.dataset.i));
     };
+  });
+}
+
+// 热度榜 → 检索记录：点条目即把 ID 填进框、刷新左栏、打开第一条命中的详情。
+function filterById(id){
+  const box=document.getElementById('qid');
+  qid=String(id||'').toLowerCase();
+  if(box)box.value=id||'';
+  markHot();
+  list();
+  const rows=shown();
+  if(rows.length)detail(rows[0].i);
+}
+function markHot(){
+  document.querySelectorAll('.hot').forEach(n=>
+    n.classList.toggle('on',!!qid&&String(n.dataset.id||'').toLowerCase()===qid));
+}
+function bindQid(){
+  const box=document.getElementById('qid');
+  box.addEventListener('input',()=>{
+    qid=box.value.trim().toLowerCase();
+    markHot();
+    list();
+    const rows=shown();
+    if(rows.length)detail(rows[0].i);
   });
 }
 
@@ -249,7 +326,7 @@ function detail(i){
       ? '<span class="zero">'+(d==null?'—':'0')+'</span>'
       : '<div class="bar"><i style="width:'+Math.max(4,(d/maxDelta*100)).toFixed(1)+'%"></i>'+
         '<span>+'+num(d,3)+'</span></div>';
-    return '<tr>'+
+    return '<tr'+(matchId(h.id)?' class="hit"':'')+'>'+
       '<td>'+(h.rank||'')+'</td>'+
       '<td><span class="k" style="background:'+(C[h.kind]||'#8898ad')+'"></span>'+
         esc(NAMES[h.kind]||h.kind)+'</td>'+
@@ -305,7 +382,8 @@ function hot(){
   el.innerHTML=top.map(x=>{
     const act=x.act==null?'—':num(x.act,2);
     const lv='L'+(x.level==null?'—':x.level);
-    return '<div class="hot" title="命中 '+x.n+' 次 · 活跃度 '+act+' · '+lv+
+    return '<div class="hot'+(qid&&qid===String(x.id).toLowerCase()?' on':'')+
+        '" data-id="'+esc(x.id)+'" title="点击查看命中该条目的检索记录 · 命中 '+x.n+' 次 · 活跃度 '+act+' · '+lv+
         (hasAct?'':'（条目活跃度未采集）')+'">'+
       '<span class="n'+(hotSort==='n'?' on':'')+'">'+x.n+'</span>'+
       '<span class="k" style="background:'+(C[x.kind]||'#8898ad')+'"></span>'+
@@ -314,6 +392,9 @@ function hot(){
       '<span class="a'+(hotSort==='a'?' on':'')+'">'+act+'</span>'+
     '</div>';
   }).join('');
+  el.querySelectorAll('.hot').forEach(node=>{
+    node.onclick=()=>filterById(node.dataset.id);
+  });
 }
 
 function bindHotSort(){
@@ -333,7 +414,7 @@ function bindHotSort(){
   });
 }
 
-summary(); renderStats(); list(); hot(); renderDiag(); bindHotSort();
+summary(); renderStats(); list(); hot(); renderDiag(); bindHotSort(); bindQid();
 if(recs.length)detail(0);
 </script>
 </body>
