@@ -9,12 +9,17 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 DIM = 64
 STATE = {"rate_limit_left": 0}
+
+# 全局库位置只影响 Config 的 home 解析，测试用临时目录即可，别写死某台机器的路径。
+TEST_HOME = Path(tempfile.gettempdir()) / "hm-embed-test"
 
 
 def fake_embedding(text: str) -> list[float]:
@@ -78,7 +83,7 @@ def make_config(base_url: str, dim: int, key: str = "test-key"):
 
     return Config.load(
         {
-            "HM_HOME": "C:/Users/Public/hm-embed-test",
+            "HM_HOME": str(TEST_HOME),
             "HM_EMBED_BASE_URL": base_url,
             "HM_EMBED_MODEL": "mock-embed",
             "HM_EMBED_DIM": str(dim),

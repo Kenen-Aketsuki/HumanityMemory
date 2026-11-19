@@ -157,6 +157,7 @@ def test_consolidated_flag_is_the_only_allowed_update(env) -> None:
 
 
 def test_log_requires_workspace(tmp_path: Path) -> None:
+    """没有库就没有 store —— 断言提前到构造函数（A1 的破口在这里堵）。"""
     home = tmp_path / "home"
     home.mkdir()
     cfg = Config.load({"HM_HOME": str(home), "HM_EMBED_DIM": "8"})
@@ -164,15 +165,11 @@ def test_log_requires_workspace(tmp_path: Path) -> None:
     no_ws.mkdir()
     layout = resolve_layout(no_ws, create=False, home=cfg.home)
     assert layout.workspace_dir is None
-    store = MemoryStore(cfg, layout)
-    try:
-        with pytest.raises(ScopeError):
-            store.append_log("没有工作区")
-        # 全局库已关闭，没有工作区就是彻底写不进去
-        with pytest.raises(ScopeError):
-            store.write_memory("全局可用", scope="global")
-    finally:
-        store.close()
+
+    with pytest.raises(ScopeError, match="memory_unavailable"):
+        MemoryStore(cfg, layout)
+    # 关键：失败发生在构造期，所以不会有一个空库被顺手建出来
+    assert not (no_ws / ".ai_memory").exists()
 
 
 # ---------------------------------------------------------------- 检索
@@ -205,7 +202,8 @@ def test_workspace_isolation(env, tmp_path: Path) -> None:
     store.close()
 
     other = tmp_path / "other"
-    other.mkdir()
+    # A1 之后不再自动建库：要第二个工作区必须显式建目录（真实场景由 bind new 做）
+    (other / ".ai_memory").mkdir(parents=True)
     cfg2 = Config.load({"HM_HOME": str(cfg.home), "HM_EMBED_DIM": "8"})
     layout2 = resolve_layout(other, home=cfg2.home)
     store2 = MemoryStore(cfg2, layout2)

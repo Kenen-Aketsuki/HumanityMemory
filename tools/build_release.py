@@ -29,25 +29,49 @@ import sqlite3
 import subprocess
 import sys
 import time
+
+import localenv
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# 发布产物**必须住在项目目录树外**，且路径不能与项目目录同前缀。
-# 原因是实测出来的，不是洁癖：本机宿主沙箱按路径前缀限制「工作区内启动的进程」写工作区外路径。
-# exe 放在 `D:\Wrok_proj\HumanityMemory\...` 或 `...\HumanityMemory-release\...` 都写不了
-# `~/.humanity-memory/global.db`，报 `attempt to write a readonly database`，
-# 客户端表现就是握手前退出 → `MCP error -32000: Connection closed`。
-# `%LOCALAPPDATA%\HumanityMemory\release` 与项目无前缀关系，实测 doctor 全绿、embedding 真调通。
-_LOCALAPPDATA = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
-_DEFAULT_RELEASE = _LOCALAPPDATA / "HumanityMemory" / "release"
-RELEASE = Path(os.environ.get("HM_RELEASE_ROOT") or _DEFAULT_RELEASE).expanduser()
+# 发布产物**必须住在项目目录树外**（真的在树里才算，不含同前缀的兄弟目录）。
+# 具体位置是「这台机器的事」：从 HM_RELEASE_ROOT 环境变量或项目根的 local.env 读，
+# 源码里不出现任何本机路径。未配置时退回用户目录下的通用位置，仅作兜底。
+#
+# 历史：早先这里认为「同前缀的兄弟目录也会被沙箱拦」，2026-11-18 实测未能复现——
+# exe 放在项目同级的 `*-Release` 目录里时，doctor 能读写 `~/.humanity-memory`、
+# 真实 MCP 客户端握手拿到全部工具、也能往用户目录正常写文件。
+# 旧的 `attempt to write a readonly database` 应是早期沙箱行为，故改为按目录边界判断。
+_DEFAULT_RELEASE = Path.home() / "HumanityMemory-Release"
+RELEASE = localenv.get_path("HM_RELEASE_ROOT", _DEFAULT_RELEASE)
 SRC = ROOT / "src"
 TOOLS = ROOT / "tools"
 ENTRY = TOOLS / "release_entry.py"
 PKG = SRC / "humanity_memory"
 APP_NAME = "humanity-memory"
-WORKSPACE_DB = ROOT / ".ai_memory" / "workspace.db"
+def workspace_db() -> Path | None:
+    """当前源码工作区对应的库文件。
+
+    2026-11-19 起库统一放在 `<安装根>/libraries/<label>`，仓库里只剩
+    `.ai_memory/token.json`。所以**不能**再假定 `<仓库>/.ai_memory/workspace.db` ——
+    那样会在每次发布时静默跳过库备份，回滚时就没有数据还原点。
+    """
+    legacy = ROOT / ".ai_memory" / "workspace.db"
+    if legacy.is_file():          # 老布局（库还在仓库里）
+        return legacy
+    try:
+        if str(SRC) not in sys.path:
+            sys.path.insert(0, str(SRC))
+        from humanity_memory import bindings  # noqa: PLC0415 - 延迟导入，避免构建期副作用
+
+        session = bindings.resolve_session(ROOT)
+        if session.ok and session.library_dir is not None:
+            candidate = session.library_dir / "workspace.db"
+            return candidate if candidate.is_file() else None
+    except Exception as exc:  # noqa: BLE001 - 解析失败只影响快照，不该中断发布
+        warn(f"解析库位置失败：{exc}")
+    return None
 
 CURRENT_LINK = RELEASE / "current"
 CURRENT_TXT = RELEASE / "current.txt"
@@ -225,13 +249,14 @@ def restore_workspace(backup: Path, dest: Path) -> Path:
 
 
 def backup_workspace(version: str) -> Path | None:
-    if not WORKSPACE_DB.is_file():
-        warn(f"没找到 {WORKSPACE_DB}，跳过库备份（只影响回滚时的数据还原）")
+    source = workspace_db()
+    if source is None:
+        warn("没找到工作区的库文件（令牌未接入？），跳过库备份（只影响回滚时的数据还原）")
         return None
     BACKUPS.mkdir(parents=True, exist_ok=True)
     dest = BACKUPS / f"workspace.pre-v{version}.db"
     try:
-        src = sqlite3.connect(f"file:{WORKSPACE_DB.as_posix()}?mode=ro", uri=True, timeout=10.0)
+        src = sqlite3.connect(f"file:{source.as_posix()}?mode=ro", uri=True, timeout=10.0)
         dst = sqlite3.connect(str(dest))
         try:
             src.backup(dst)
@@ -358,12 +383,45 @@ def smoke_env(tmp: Path) -> dict[str, str]:
         {
             "HM_WORKSPACE": str(tmp / "ws"),
             "HM_HOME": str(tmp / "home"),
+            # 库统一放在 <安装根>/libraries；smoke 必须把它指回沙箱，
+            # 否则每跑一次发布就会在生产库目录里留下一个 smoke 库。
+            "HM_LIBRARIES": str(tmp / "libs"),
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUTF8": "1",
         }
     )
     env.pop("HM_RULES_PATH", None)
     return env
+
+
+def smoke_prepare(exe: Path, tmp: Path) -> None:
+    """让 smoke 沙箱处于「已接入」态。
+
+    A1 之后空目录启动会被**正确拒绝**（no_workspace），所以老 smoke 里
+    「空目录跑 doctor 应 all_ok」的假设已经不成立了。这里先用同一个 exe
+    走一遍真实接入路径（bind adopt），顺带把 bind 也 smoke 了 ——
+    这比绕过准入直接塞一个令牌更接近用户实际会做的事。
+    """
+    ws = tmp / "ws" / ".ai_memory"
+    ws.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        [str(exe), "bind", "new", str(tmp / "ws"), "--label", "smoke"],
+        cwd=str(tmp),
+        env=smoke_env(tmp),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(
+            "smoke 准备失败：bind new 未成功\n"
+            f"  stdout: {(proc.stdout or '')[-400:]}\n"
+            f"  stderr: {(proc.stderr or '')[-400:]}"
+        )
+    if not (ws / "token.json").is_file():
+        raise SystemExit("smoke 准备失败：bind new 说成功了，但没有写出 token.json")
 
 
 def smoke_doctor(exe: Path, tmp: Path) -> tuple[list[str], dict]:
@@ -466,7 +524,7 @@ def _json_objects(text: str):
 
 
 def smoke(exe: Path) -> dict:
-    say("  smoke test：doctor + serve 握手")
+    say("  smoke test：绑定 → doctor → serve 握手")
     # 沙盒环境里 AppData\Temp 可能不可写（WinError 5），所以用仓库内目录：
     # 顺手也能验证"在项目里跑"这个真实姿势。目录很小，跑完就清。
     base = ROOT / "build" / f"smoke-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -475,6 +533,10 @@ def smoke(exe: Path) -> dict:
     problems: list[str] = []
     report: dict = {}
     try:
+        try:
+            smoke_prepare(exe, base)
+        except subprocess.TimeoutExpired:
+            problems.append("bind adopt 超时（120s）")
         try:
             doc_problems, report = smoke_doctor(exe, base)
         except subprocess.TimeoutExpired:
@@ -564,19 +626,15 @@ def rewrite_mcp(assume_yes: bool) -> None:
         return
 
     old_args = [str(a) for a in old.get("args", [])]
-    token = ""
-    for i, arg in enumerate(old_args):
-        if arg == "--token" and i + 1 < len(old_args):
-            token = old_args[i + 1]
-    if not token:
-        token = str(Path.home() / ".humanity-memory" / "active.token.json")
+    had_token = "--token" in old_args
 
-    # `--token` 是**全局**参数，必须排在子命令前面。
-    # 写成 `serve --token x` 时 argparse 直接报 unrecognized arguments 退出，
-    # 客户端看到的就是 `MCP error -32000: Connection closed`（实测踩过）。
+    # `--token` 不再是身份来源（A2）：令牌就在 `<项目>/.ai_memory/token.json`，
+    # 由 cwd 发现，客户端配置只剩「exe + serve」。
+    # 这里**不再回填** --token —— 否则迁移（bind migrate）删掉的那一项，
+    # 下次发版又会被原样塞回去，升级一次退一次。
     new = {
         "command": str(CURRENT_LINK / f"{APP_NAME}.exe"),
-        "args": ["--token", token, "serve"],
+        "args": ["serve"],
     }
     if old.get("env"):
         new["env"] = old["env"]
@@ -588,6 +646,8 @@ def rewrite_mcp(assume_yes: bool) -> None:
     say("\n  mcp.json 变更：")
     say(f"    command: {old.get('command')}  →  {new['command']}")
     say(f"    args   : {old_args}  →  {new['args']}")
+    if had_token:
+        say("    （--token 已废弃：令牌改由 <项目>/.ai_memory/token.json 按 cwd 发现）")
     if not confirm("  确认改写客户端配置？", assume_yes):
         warn("已跳过 mcp.json 改写——生产仍会跑旧入口")
         return
@@ -753,7 +813,7 @@ def cmd_rollback(args: argparse.Namespace) -> int:
         backup = None
         say("  --keep-db：只退 exe，库保持现状（新版本写入的数据会成为孤儿字段）")
     elif backup and backup.is_file():
-        now_counts = db_counts(WORKSPACE_DB)
+        now_counts = db_counts(workspace_db())
         lost = db_counts(backup)
         loss = {k: now_counts.get(k, 0) - lost.get(k, 0) for k in set(now_counts) | set(lost)}
         say(f"  库快照 {backup.name}：回滚后这些写入会丢 {loss}")
@@ -762,11 +822,12 @@ def cmd_rollback(args: argparse.Namespace) -> int:
         say("  已取消")
         return 0
 
-    if backup and backup.is_file() and WORKSPACE_DB.is_file():
+    target_db = workspace_db()
+    if backup and backup.is_file() and target_db is not None:
         try:
-            safety = restore_workspace(backup, WORKSPACE_DB)
+            safety = restore_workspace(backup, target_db)
             say(f"  库已还原（回滚前的状态留档 {safety.name}）")
-            after = db_counts(WORKSPACE_DB)
+            after = db_counts(target_db)
             say(f"  还原后条数 {after}")
         except (sqlite3.Error, OSError) as exc:
             die(
@@ -866,23 +927,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _assert_release_outside_project() -> None:
-    """发布根必须在项目树外，且**不能与项目路径同前缀**。
+    """发布根必须在项目树外。判断按**目录边界**比较，不做裸字符串前缀。
 
-    实测：`D:\\...\\HumanityMemory-release` 这种同级同前缀目录同样被沙箱拦，
-    只有换成完全不同前缀（`%LOCALAPPDATA%\\HumanityMemory\\release`）才写得进全局库。
-    所以这里用字符串前缀判断，宁可误拦也不放一个"看起来发成功、实际连不上"的包出去。
+    沙箱拦的是「工作区内启动的进程写工作区外路径」，命中条件是路径真的落在
+    项目树里面，而不是名字恰好同前缀。早先这里用 `release.startswith(root)`
+    做过保守拦截，代价是把项目同级的 `*-Release` 兄弟目录也挡了；
+    2026-11-18 实测：exe 放在这种同级目录里仍能正常启动 doctor、
+    读写 `%USERPROFILE%\\.humanity-memory` 全局库、完成真实 MCP 握手，故放宽。
     """
     try:
         release_s = str(RELEASE.resolve())
         root_s = str(ROOT.resolve())
     except OSError:  # pragma: no cover
         return
-    if release_s == root_s or release_s.startswith(root_s):
+    inside = release_s == root_s or release_s.startswith(root_s + os.sep)
+    if inside:
         die(
-            f"发布根不能放在项目目录树内、也不能与项目路径同前缀：{RELEASE}\n"
-            "宿主沙箱按路径前缀拦「工作区内启动的进程写工作区外路径」，\n"
-            "exe 会打不开 ~/.humanity-memory，客户端表现为 MCP error -32000: Connection closed。\n"
-            f"用默认位置（{_DEFAULT_RELEASE}），或把 HM_RELEASE_ROOT 指到一个完全不同前缀的目录。"
+            f"发布根不能放在项目目录树内：{RELEASE}\n"
+            "宿主沙箱会拦「工作区内启动的进程写工作区外路径」，\n"
+            "exe 可能打不开 ~/.humanity-memory，客户端表现为 MCP error -32000: Connection closed。\n"
+            "换一个项目树之外的位置（点名的同级目录即可），写进 local.env 的 HM_RELEASE_ROOT。"
         )
 
 

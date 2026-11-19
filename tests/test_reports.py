@@ -310,3 +310,78 @@ def test_latest_snapshot_and_levels(env) -> None:
     levels = level_thresholds(cfg)
     assert [lv["level"] for lv in levels] == list(range(1, cfg.max_level + 1))
     assert all(lv["down"] is not None for lv in levels)
+
+
+# ---------------------------------------------------------------- 热度榜两维排序
+
+
+def test_read_node_activity_reads_live_values(env) -> None:
+    """活跃度排序的数据源是库里的实时值，不是裁定快照。
+
+    快照是裁定那一刻的切片，而且没跑过裁定的工作区根本没有快照 ——
+    排序维度不能因为「没跑 judge」就消失。
+    """
+    cfg, store, ws = env
+    from humanity_memory.reports import read_node_activity
+
+    item = store.write_memory("一条会被检索到的记忆", importance=0.5)
+    _force(store, item_id=item.id, activity=3.25, forget_level=4)
+
+    act = read_node_activity(ws)
+    assert act[item.id]["activity"] == 3.25
+    assert act[item.id]["level"] == 4
+
+
+def test_read_node_activity_covers_episodes_and_skips_missing_db(env) -> None:
+    """经历表也要读；库不存在时返回空表而不是抛异常。"""
+    cfg, store, ws = env
+    from humanity_memory.reports import read_node_activity
+
+    ep = store.write_episode("一段会被检索到的经历")
+    with tx(store.workspace_conn):
+        store.workspace_conn.execute(
+            "UPDATE episodes SET activity = ?, forget_level = ? WHERE id = ?",
+            (1.75, 3, ep.id),
+        )
+
+    act = read_node_activity(ws)
+    assert act[ep.id]["activity"] == 1.75
+    assert act[ep.id]["level"] == 3
+
+    assert read_node_activity(ws / "nope") == {}, "目录不存在要优雅降级"
+
+
+def test_hot_list_has_two_sort_dimensions() -> None:
+    """热度榜要能按「命中次数」和「活跃度」两个维度排序。
+
+    两个数值必须同时摆在行里 —— 只改顺序不显示依据的话，用户看不出这次为什么这样排。
+    """
+    html = render_retrieval_html(
+        [],
+        meta={
+            "levels": [{"level": 4, "period": 5, "up": 7.0, "down": 4.0}],
+            "nodes": [],
+            "activity": {"x_1": {"activity": 2.5, "level": 4}},
+        },
+    )
+
+    assert 'id="hotsort"' in html, "热度榜标题旁要有排序切换"
+    assert 'data-k="n"' in html and 'data-k="a"' in html, "两个维度各一个按钮"
+    assert "hotSort" in html, "排序状态要真的参与计算，不是装饰"
+    assert '"activity":{"x_1"' in html or '"x_1"' in html, "活跃度映射要送进页面"
+    assert '<span class="a' in html, "行里要显示活跃度数值"
+    assert "条目活跃度未采集" in html, "没有活跃度数据时要说明，而不是显示一排 —"
+
+
+def test_stat_card_heading_does_not_collide_with_kind_dot() -> None:
+    """统计卡的标题不能复用 `.k`。
+
+    `.k` 是表格里那个 6×6 的类型圆点（display:inline-block + 固定宽高），
+    `.card .k` 只补了颜色和溢出，没有重置盒子 —— 标题会被压成 6px 宽，
+    配上 overflow:hidden 就变成数字上方一小段横线，肉眼几乎看不见。
+    """
+    html = render_retrieval_html([], meta={"levels": [], "nodes": [], "activity": {}})
+
+    assert '.card .lbl{' in html, "统计卡标题要有自己的类"
+    assert '.card .k{' not in html, "标题不能再挂在圆点类上"
+    assert '<div class="lbl">' in html, "卡片模板要真的用 .lbl"

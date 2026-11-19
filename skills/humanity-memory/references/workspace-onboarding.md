@@ -22,21 +22,28 @@
 ### 幂等初始化
 
 ```bash
-humanity-memory --workspace "<工作区根>" init
+humanity-memory bind adopt      # 已有 .ai_memory/workspace.db → 登记它并发令牌
+humanity-memory bind new        # 什么都没有 → 新建库并发令牌
+humanity-memory --workspace "<工作区根>" init   # 已接入：只补信条 + 打开库自检
 ```
 
-`cmd_init` 只做 `ensure_rules`（文件不存在才写模板）+ 打开已有库，**不会重建、不会覆盖数据**，
-所以库已经自动建好时跑一次是安全的。MCP server 在含 `.git` / `.workbuddy` 的项目根启动时
-会按 `cwd-project` 自动建库，这种「已经初始化好了」的情况很常见——如实告诉用户，不要为了
+2026-11-18 起 **不再自动建库**：MCP server 在项目根启动时不会顺手造 `.ai_memory`，
+未接入就返回 `no_token` + 清单。所以「接入」是一件显式的事 —— 先 `bind adopt`
+（沿用已有库）或 `bind new`（新建），再谈别的。
+
+`cmd_init` 只做 `ensure_rules`（文件不存在才写模板）+ 打开已有库，**不会重建、不会覆盖数据**；
+未接入时它会直接给出 bind 提示，不会替你建库。核验过库已存在时，如实告诉用户，不要为了
 显得做了事而删掉重建。
 
 ### 库放哪
 
-- 默认放**工作区根**（`find_workspace_dir` 从 cwd 逐级向上找，子目录都能命中）。
-- git 根在工作区更内层时，把库放外层反而更省事：既覆盖全部子目录，又天然不在版本库里。
-- 若库**必然落在 git 仓库内**：先看 `.git/hooks/pre-commit` 是否已拦截 `.ai_memory/`；
-  再优先用 `.git/info/exclude`（本地忽略、不影响协作者）消掉 untracked 噪声，
-  多并行线共用的仓库尤其不要擅自改 `.gitignore`。
+- **统一放 `<安装根>/libraries/<label>/`**（`libraries_home()`：`HM_LIBRARIES` →
+  安装根/libraries → 用户目录兜底）。`bind new` 直接建在那儿，项目里只留 `token.json`。
+- 老项目若库还在 `<项目>/.ai_memory/workspace.db`，跑 `bind relocate <项目根> --apply`
+  搬过去；幂等，搬过的会返回 `relocated: false`。
+- **库不在 git 仓库里**，所以不需要 `.gitignore` / hook 去挡它了；
+  但反过来：删项目 ≠ 删记忆，清理库要显式去 `libraries/<label>/` 操作。
+- 换机器 / 重装前先备份 `libraries/` —— 它不在任何仓库、也没有云同步。
 
 ### 必跑的验证
 
@@ -76,9 +83,10 @@ humanity-memory --workspace "<根>" doctor     # all_ok: true
 
 以 `references/consolidate-task.md` 为模板，另加三道闸：
 
-1. `memory_use_workspace(path="<工作区>", persist=false)` —— **persist 必须 false**，
-   定时任务不能改掉用户白天会话的工作区选择；不要依赖 server 启动时的 cwd 猜。
-2. `memory_stats()` 校验 `stats.layout.workspace_db` 必须是预期路径，
+1. `memory_use_workspace(path="<工作区>")` —— **必须显式传 path**：定时任务不能靠 server
+   启动时的 cwd 猜（boot 实例的 cwd 可能是 `~/.humanity-memory`），也不许依赖"上次工作区"
+   （那个机制已删除）。`persist` 参数已失效，传了也只是进程内生效。
+2. `memory_stats()` 校验 `stats.layout.library_dir` 必须是预期路径，
    **不对就立刻停机报告、一个字都不写**（防记忆静默分裂写错库）。
 3. `logs_pending == 0` 跳到压缩预览 / 归档预览 / 维护，不硬造内容。
 
@@ -156,7 +164,7 @@ store.append_log(content, at=<原始日期的 Unix 毫秒>, tags=..., importance
 
 | 坑 | 后果 |
 | --- | --- |
-| 把已自动建好的库当成空壳删掉 | 掀掉正在使用的连接、丢失数据 |
+| 把正在用的库当成空壳删掉 | 掀掉正在使用的连接、丢失数据（删前必须核行数与活跃连接） |
 | 库落在 git 仓库内却没配本地忽略 | `?? .ai_memory/` 噪声、被并行线 `git add` 卷走 |
 | 定时任务没确认「持续时间」 | 默认无限期，用户其实只想试运行 |
 | 「凌晨」没落到具体小时 | 每次触发时间不可预期 |

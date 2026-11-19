@@ -17,7 +17,7 @@ from humanity_memory.config import (
 
 @pytest.fixture(autouse=True)
 def _hide_install_layer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """本文件只测「出厂 / 用户 / 项目」三层。
+    """本文件只测「出厂 / 用户 / 库」三层。
 
     仓库根真实存在的 `<安装根>/memory.toml` 会多出一层，让层数断言随机器状态漂移 ——
     安装层单独由 `test_config_layers.py` 负责，这里把它挡掉才能保证测试可重复。
@@ -26,7 +26,7 @@ def _hide_install_layer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def _write_levels(path: Path, levels: list[dict], **forget_overrides) -> None:
-    """把一份等级表写成项目级 memory.toml（数组表是整体替换，必须写全）。"""
+    """把一份等级表写成库级 memory.toml（数组表是整体替换，必须写全）。"""
     forget = {
         "level0_purge_days": 180,
         "archived_purge_days": 180,
@@ -104,21 +104,21 @@ def test_defaults_come_from_toml_not_code(tmp_path: Path) -> None:
 # ---------------------------------------------------------------- 三层覆盖
 
 
-def test_project_overrides_single_key(tmp_path: Path) -> None:
+def test_library_overrides_single_key(tmp_path: Path) -> None:
     home = tmp_path / "home"
     ws = tmp_path / "proj" / ".ai_memory"
     (ws / "memory.toml").parent.mkdir(parents=True)
     ws.joinpath("memory.toml").write_text("[dedup]\ndup_floor = 0.75\n", encoding="utf-8")
 
-    cfg = Config.load({"HM_HOME": str(home)}, workspace=ws)
-    assert [scope for scope, _ in cfg.layers] == ["出厂", "项目"]
+    cfg = Config.load({"HM_HOME": str(home)}, library_dir=ws)
+    assert [scope for scope, _ in cfg.layers] == ["出厂", "库"]
     assert cfg.settings["dedup"]["dup_floor"] == 0.75
     # 同段其它键、别的段，全都继承出厂
     assert cfg.settings["dedup"]["dup_bonus"] == 0.30
     assert cfg.settings["activity"]["sim_floor"] == 0.35
 
 
-def test_user_layer_sits_between_default_and_project(tmp_path: Path) -> None:
+def test_user_layer_sits_between_default_and_library(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
     (home / "memory.toml").write_text("[dedup]\ndup_floor = 0.80\n", encoding="utf-8")
@@ -126,9 +126,9 @@ def test_user_layer_sits_between_default_and_project(tmp_path: Path) -> None:
     ws.mkdir(parents=True)
     (ws / "memory.toml").write_text("[dedup]\ndup_floor = 0.70\n", encoding="utf-8")
 
-    cfg = Config.load({"HM_HOME": str(home)}, workspace=ws)
-    assert [scope for scope, _ in cfg.layers] == ["出厂", "用户", "项目"]
-    assert cfg.settings["dedup"]["dup_floor"] == 0.70  # 项目赢
+    cfg = Config.load({"HM_HOME": str(home)}, library_dir=ws)
+    assert [scope for scope, _ in cfg.layers] == ["出厂", "用户", "库"]
+    assert cfg.settings["dedup"]["dup_floor"] == 0.70  # 库赢
 
 
 # ---------------------------------------------------------------- 校验拒绝启动
@@ -140,7 +140,7 @@ def _expect_error(tmp_path: Path, mutate, needle: str) -> None:
     ws = tmp_path / "proj" / ".ai_memory"
     _write_levels(ws / "memory.toml", levels)
     with pytest.raises(ConfigError) as exc:
-        Config.load({"HM_HOME": str(tmp_path / "home")}, workspace=ws)
+        Config.load({"HM_HOME": str(tmp_path / "home")}, library_dir=ws)
     assert needle in str(exc.value)
 
 
@@ -174,7 +174,7 @@ def test_compression_array_length_must_match_levels(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     with pytest.raises(ConfigError) as exc:
-        Config.load({"HM_HOME": str(tmp_path / "home")}, workspace=ws)
+        Config.load({"HM_HOME": str(tmp_path / "home")}, library_dir=ws)
     assert "required_compression" in str(exc.value)
 
 
@@ -183,7 +183,7 @@ def test_revive_target_must_exist(tmp_path: Path) -> None:
     ws = tmp_path / "proj" / ".ai_memory"
     _write_levels(ws / "memory.toml", levels, revive_to_level=9)
     with pytest.raises(ConfigError) as exc:
-        Config.load({"HM_HOME": str(tmp_path / "home")}, workspace=ws)
+        Config.load({"HM_HOME": str(tmp_path / "home")}, library_dir=ws)
     assert "revive_to_level" in str(exc.value)
 
 
@@ -196,7 +196,7 @@ def test_confidence_band_must_be_ordered(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     with pytest.raises(ConfigError) as exc:
-        Config.load({"HM_HOME": str(tmp_path / "home")}, workspace=ws)
+        Config.load({"HM_HOME": str(tmp_path / "home")}, library_dir=ws)
     assert "verify_on_read" in str(exc.value)
 
 
@@ -205,5 +205,5 @@ def test_broken_toml_reports_the_file(tmp_path: Path) -> None:
     ws.mkdir(parents=True)
     (ws / "memory.toml").write_text("[dedup]\ndup_floor = = 0.9\n", encoding="utf-8")
     with pytest.raises(ConfigError) as exc:
-        Config.load({"HM_HOME": str(tmp_path / "home")}, workspace=ws)
+        Config.load({"HM_HOME": str(tmp_path / "home")}, library_dir=ws)
     assert "memory.toml" in str(exc.value)

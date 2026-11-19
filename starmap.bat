@@ -3,10 +3,19 @@ chcp 65001 >nul
 setlocal
 rem Release root lives OUTSIDE the project on purpose: the host sandbox blocks
 rem processes started inside the workspace from writing outside it.
+rem Path config: env var wins, then local.env in this folder (not tracked by git).
+if not defined HM_RELEASE_ROOT if exist "%~dp0local.env" (
+  for /f "usebackq tokens=1,2 delims==" %%A in ("%~dp0local.env") do (
+    if /i "%%A"=="HM_RELEASE_ROOT" set "HM_RELEASE_ROOT=%%B"
+  )
+)
 if defined HM_RELEASE_ROOT (
   set "HM_ROOT=%HM_RELEASE_ROOT%"
 ) else (
-  set "HM_ROOT=%LOCALAPPDATA%\HumanityMemory\release"
+  echo [ERROR] HM_RELEASE_ROOT is not configured.
+  echo         Set the env var, or copy local.env.example to local.env and fill it in.
+  pause
+  exit /b 1
 )
 set "HM_CLI=%HM_ROOT%\current\humanity-memory.exe"
 set "HM_SRC=published (%HM_ROOT%\current)"
@@ -21,10 +30,15 @@ set "OUT=%HM_STARMAP_OUT%"
 
 if "%~1"=="" (
   echo.
-  echo  Drag a folder onto this bat file to draw its memory starmap:
-  echo    - the .ai_memory folder with workspace.db
-  echo    - or the project root folder
+  echo  Drag a folder or file onto this bat file to draw its memory starmap:
+  echo    - the project root folder            ^(token.json lives here^)
+  echo    - the library folder under   ^<install^>\libraries^\^<label^>
+  echo    - the .ai_memory\token.json file     ^(read-only: library resolved from it^)
   echo    - or the workspace.db file itself
+  echo.
+  echo  Since 2026-11-19 libraries are not kept inside projects: the project
+  echo  only holds .ai_memory\token.json. Read-only tools accept any of the
+  echo  four forms above and never need the registry.
   echo.
   echo  Read-only. No database is created or modified.
   echo.

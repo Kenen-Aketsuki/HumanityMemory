@@ -80,6 +80,31 @@ def _describe_dir(parent: Path, db_path: Path) -> tuple[list[dict[str, Any]], li
     return files, notes
 
 
+def _db_via_readonly(target: Path, notes: list[str]) -> Path | None:
+    """项目根 / `.ai_memory` / 令牌文件 → 顺着身份找到真实的库文件。
+
+    只读：解析失败就返回 `None`，由调用方给出"找不到库"的原话，
+    不在这个函数里造目录、造文件、也不抛异常（星图是纯只读工具）。
+    """
+    try:
+        from . import bindings
+    except Exception:  # noqa: BLE001 - 极端情况下退化为旧的目录查找
+        return None
+    try:
+        layout = bindings.resolve_readonly(target)
+    except Exception:  # noqa: BLE001 - 含 BindingError：都按"找不到"处理
+        return None
+    if layout.library_dir is None:
+        return None
+    candidate = layout.library_dir / "workspace.db"
+    if candidate.is_file():
+        notes.append(
+            f"库不在项目里，已按令牌/库根解析到 {layout.library_dir.name}/workspace.db"
+        )
+        return candidate
+    return None
+
+
 def resolve_db(target: str | Path) -> tuple[Path, list[str]]:
     """把拖进来的路径解析成一个 v5 库文件。
 
@@ -95,11 +120,21 @@ def resolve_db(target: str | Path) -> tuple[Path, list[str]]:
         if ".v2-" in raw.name:
             raise StarmapError("这是 v2 留档库（facts 表），星图只支持 v5 的 workspace.db")
         if raw.suffix.lower() != ".db":
-            raise StarmapError(f"拖入的是文件但不是 .db：{raw.name}")
-        db = raw
+            # 只给令牌也认：令牌里有 workspace + library，顺藤摸到库文件
+            via_token = _db_via_readonly(raw, notes) if raw.suffix.lower() == ".json" else None
+            if via_token is not None:
+                db = via_token
+            else:
+                raise StarmapError(f"拖入的是文件但不是 .db / 令牌：{raw.name}")
+        else:
+            db = raw
     else:
-        candidates = [raw / "workspace.db", raw / ".ai_memory" / "workspace.db"]
+        candidates = [raw / "workspace.db"]
         db = next((p for p in candidates if p.is_file()), None)
+        if db is None:
+            # 库已统一放到 <安装根>/libraries/<label>：项目里只剩 token.json。
+            # 拖进来的多半是项目根（或 `.ai_memory`），这时按令牌解析库位置。
+            db = _db_via_readonly(raw, notes)
         if db is None:
             loose = sorted(p for p in raw.glob("*.db") if ".v2-" not in p.name)
             if len(loose) == 1:
@@ -112,8 +147,8 @@ def resolve_db(target: str | Path) -> tuple[Path, list[str]]:
                 )
             else:
                 raise StarmapError(
-                    f"{raw} 里找不到 workspace.db；请把 .ai_memory 目录、项目根目录"
-                    "或 workspace.db 本身拖进来"
+                    f"{raw} 里找不到 workspace.db；请把项目根目录、"
+                    "<安装根>/libraries/<label> 目录，或 workspace.db 本身拖进来"
                 )
     files, dir_notes = _describe_dir(db.parent, db)
     notes.extend(dir_notes)
@@ -1239,11 +1274,18 @@ def _levels_from_config(
     等级表是**配置**定义的（档数、每档周期、压缩档），代码里不该有「一共 5 档」
     这种常数。这里只读不写：``Config.load`` 干的活就是找文件 + 解析 + 合并 + 校验。
     """
-    from .config import Config  # 延迟 import：星图本体仍然靠标准库就能跑起来
+    from .config import NO_LIBRARY, Config  # 延迟 import：星图本体仍然靠标准库就能跑起来
 
-    ws = db.parent if db.parent.name == ".ai_memory" else None
+    # 库目录 = 库文件所在目录：自有库是 `.ai_memory`，共享库是 `libraries/<label>`。
+    # 若两者都不像（比如随手拷到临时目录的备份库），宁可**不读**库级配置 ——
+    # 让它去猜 cwd 上面那个项目的 memory.toml 只会拿到一份无关的参数。
+    parent = db.parent
+    if parent.name == ".ai_memory" or (parent / "memory.toml").is_file():
+        lib = parent
+    else:
+        lib = NO_LIBRARY
     try:
-        cfg = Config.load(environ, workspace=ws)
+        cfg = Config.load(environ, library_dir=lib)
     except Exception:  # noqa: BLE001 —— 配置坏了也不该连星图都打不开，退回库里的档位
         return None
     levels = cfg.forget_levels

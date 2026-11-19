@@ -1,17 +1,22 @@
-"""配置装配：出厂 TOML + 用户/项目覆盖 + 环境变量覆盖。
+"""配置装配：出厂 TOML + 安装/用户/库覆盖 + 环境变量覆盖。
 
 分工
 ----
-- **行为参数**（阈值、周期、权重、压缩档）全在 TOML 里，三层深合并：
-  项目 > 用户 > 出厂。本模块**不含任何可调数值**，只负责
+- **行为参数**（阈值、周期、权重、压缩档）全在 TOML 里，深合并：
+  库 > 用户 > 安装 > 出厂。本模块**不含任何可调数值**，只负责
   「找到文件 → 解析 → 合并 → 校验」。
 - **凭据**（embedding 的 api_key）只走 `.env` / 环境变量，不进 TOML。
-- **路径**（home、库文件、工作区）也不进 TOML：它由运行环境决定，
+- **路径**（home、库文件、库目录）也不进 TOML：它由运行环境决定，
   写进配置只会让同一份配置在不同机器上打架。
 
 覆盖优先级
 ----------
-`真实环境变量 > TOML（项目 > 用户 > 安装 > 出厂）`
+`真实环境变量 > TOML（库 > 用户 > 安装 > 出厂）`
+
+第四层是**库级**而不是项目级（A4）：自有库时它恰好落在
+`<root>/.ai_memory/memory.toml`，与旧写法一致；共享库时 A、B 读的是
+同一份 `libraries/<label>/memory.toml` —— 配置跟着库走。
+代价是共享组里没法给单个项目调阈值，这是刻意的。
 
 环境变量是最高优先级，保留给三类用法：令牌注入、mcp.json 的 env、调试时临时覆盖。
 它不该成为常态配置手段——那样就回到「参数散落在机器上、换台机器行为不一样」的老路。
@@ -25,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .paths import global_home
 from .resources import resource
 
 DEFAULT_HOME = Path.home() / ".humanity-memory"
@@ -34,6 +40,29 @@ OVERRIDE_CONFIG_NAME = "memory.toml"
 
 # 项目里的记忆目录名（与 paths.WORKSPACE_DIR 一致；此处不 import 以免循环依赖）
 _WORKSPACE_DIR = ".ai_memory"
+
+
+class _NoLibrary:
+    """「明确不读库级配置」的哨兵（F3）。
+
+    为什么需要它：A1 之后「没有库」是一等合法状态（未接入 / 已拒绝），
+    而 `None` 本来表示「自动猜库」。两条语义挤在一个值里就没法区分
+    「我不想读库级 toml」和「帮我猜一个」。所以拒绝态传本对象，
+    `None` 保持自动猜（CLI 与测试依赖这个默认行为）。
+
+    只做身份比较（`is`），不参与布尔判断 —— `if library_dir:` 这种写法
+    在这套语义下本来就是错的：`None` 和哨兵都不是「路径」。
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - 只为报错可读
+        return "NO_LIBRARY"
+
+
+NO_LIBRARY = _NoLibrary()
+# 文档 §F3 写作 `_NO_LIBRARY`；同一个对象，别名只为与文字对齐。
+_NO_LIBRARY = NO_LIBRARY
 
 
 class ConfigError(RuntimeError):
@@ -79,24 +108,39 @@ def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
 
 
 def _find_workspace_dir(start: Path) -> Path | None:
-    """从 start 向上找 `.ai_memory/`，只读不创建（加载配置不该有副作用）。"""
+    """从 start 向上找 `.ai_memory/`，**优先含 `token.json` 的那个**（只读不创建）。
+
+    和 `paths.find_workspace_dir` 同一条规矩：子目录里既有本项目的空壳
+    `.ai_memory`、又有父项目的真库时，不能因为"先撞见"就读父项目的库级配置。
+    """
     try:
         here = start.resolve()
     except OSError:
         return None
+    tokenless: Path | None = None
     for candidate in (here, *here.parents):
         path = candidate / _WORKSPACE_DIR
-        if path.is_dir():
+        if not path.is_dir():
+            continue
+        if (path / "token.json").is_file():
             return path
-    return None
+        if tokenless is None:
+            tokenless = path
+    return tokenless
 
 
 def peek_workspace_dir(environ: dict[str, str] | None = None, home: Path | None = None) -> Path | None:
-    """猜当前工作区（只为了决定读不读项目级 memory.toml）。
+    """猜当前库目录（只为了决定读不读库级 memory.toml）。
 
-    顺序：`HM_WORKSPACE` → `last-workspace.txt` → cwd 向上查找。
-    猜错不影响正确性，只影响项目级覆盖是否被读进来；显式传 `workspace=`
-    给 `Config.load` 时以传入值为准。
+    顺序：`HM_WORKSPACE` → cwd 向上查找（优先含 `token.json` 的）。
+    猜错不影响正确性，只影响库级覆盖是否被读进来；显式传 `library_dir=`
+    给 `Config.load` 时以传入值为准，传 `NO_LIBRARY` 则完全不猜。
+
+    A3 删掉了 `last-workspace.txt` 那一步：进程间不再共享"上次工作区"，
+    猜库只依据本进程的 cwd / 环境变量，猜不到就是没有库级层。
+
+    名字保留 `workspace`：它猜的确实是「项目里的 `.ai_memory`」，
+    自有库时库目录就是它。
     """
     env = os.environ if environ is None else environ
     raw = env.get("HM_WORKSPACE", "").strip()
@@ -104,18 +148,27 @@ def peek_workspace_dir(environ: dict[str, str] | None = None, home: Path | None 
         found = _find_workspace_dir(Path(raw).expanduser())
         if found:
             return found
-    if home is not None:
-        marker = home / "last-workspace.txt"
-        if marker.is_file():
-            try:
-                saved = marker.read_text(encoding="utf-8").strip()
-            except OSError:
-                saved = ""
-            if saved:
-                found = _find_workspace_dir(Path(saved).expanduser())
-                if found:
-                    return found
     return _find_workspace_dir(Path.cwd())
+
+
+def resolve_library_dir(
+    library_dir: Path | str | None | _NoLibrary,
+    environ: dict[str, str] | None = None,
+    home: Path | None = None,
+) -> Path | None:
+    """把 `library_dir` 的三种取值收敛成「库目录 / None」。
+
+    收敛只做一次，且只在这一处 —— 各调用方各解一遍，迟早解出三种口径。
+    """
+    if library_dir is NO_LIBRARY:
+        # 拒绝态：连猜都不猜，否则会读到某个凑巧在 cwd 上面的库级配置
+        return None
+    if library_dir is None:
+        return peek_workspace_dir(environ, home)
+    path = Path(os.path.expandvars(str(library_dir))).expanduser()
+    if not path.is_absolute():
+        path = Path(os.path.abspath(path))
+    return path
 
 
 def install_config_file() -> Path:
@@ -126,16 +179,19 @@ def install_config_file() -> Path:
 
     这一层的定位是「这套安装的**全量**基线」：由 `config write-template` 从出厂默认
     整份生成，人可以在这里一眼看到所有可调项并直接改，不用翻进包目录。
-    与用户级 / 项目级的区别只在定位：那两层是**增量**，只写要改的键。
+    与用户级 / 库级的区别只在定位：那两层是**增量**，只写要改的键。
     """
     return env_file().parent / OVERRIDE_CONFIG_NAME
 
 
-def config_layers(home: Path, workspace: Path | None = None) -> list[tuple[str, Path]]:
+def config_layers(home: Path, library_dir: Path | None = None) -> list[tuple[str, Path]]:
     """按优先级从低到高返回配置层。只返回**实际存在**的覆盖文件。
 
     合并是 `deep_merge` 逐键递归的，所以任何一层都只写自己关心的键即可 ——
     缺的键从更底层补。这也让「安装层是全量模板、出厂升级又加了新键」不会报缺项。
+
+    `library_dir` 是**库目录**（自有库 = `<root>/.ai_memory`，共享库 =
+    `libraries/<label>`）。传 None 表示没有库级层 —— 拒绝态就是这条路径。
     """
     layers: list[tuple[str, Path]] = [("出厂", resource(DEFAULT_CONFIG_NAME))]
     install = install_config_file()
@@ -144,10 +200,10 @@ def config_layers(home: Path, workspace: Path | None = None) -> list[tuple[str, 
     user = home / OVERRIDE_CONFIG_NAME
     if user.is_file():
         layers.append(("用户", user))
-    if workspace is not None:
-        project = workspace / OVERRIDE_CONFIG_NAME
-        if project.is_file():
-            layers.append(("项目", project))
+    if library_dir is not None:
+        library = library_dir / OVERRIDE_CONFIG_NAME
+        if library.is_file():
+            layers.append(("库", library))
     return layers
 
 
@@ -352,6 +408,37 @@ def env_file() -> Path:
 
 ENV_FILE = env_file()
 
+LIBRARIES_DIR = "libraries"
+
+
+def libraries_home() -> Path:
+    """共享组库的根目录。**不放用户目录** —— 库是数据，不是配置。
+
+    顺序：
+    1. `HM_LIBRARIES`（显式指定，跨模式对齐用）
+    2. `<安装根>/libraries/` —— 安装根就是 `.env` 所在目录：
+       冻结态 = 发布根（`.../HumanityMemory-Release`），源码态 = 仓库根。
+    3. 兜底 `~/.humanity-memory/libraries`（只在前两条都拿不到时才会用到）
+
+    为什么不像 registry 那样放 `~/.humanity-memory`：registry / 信条 / 诊断都是
+    配置与索引（几十 KB），库是几 MB 的实体数据。配置跟着用户走、数据跟着安装走，
+    升级 / 回滚 / 换机器时两类东西的心智模型不同，混在一起最容易在 C 盘攒下大文件。
+    """
+    raw = ""
+    try:
+        # 走统一的收集入口：`.env` 里的 HM_LIBRARIES 和真实环境变量同等对待。
+        # 只读 os.environ 的话，写在 `.env` 里的落点会被静默忽略 —— 那种"配置看着生效
+        # 其实没生效"的问题最难查。
+        raw = (_collect_env().get("HM_LIBRARIES") or "").strip()
+    except Exception:  # noqa: BLE001 - 收集失败就退化到默认落点
+        raw = (os.environ.get("HM_LIBRARIES") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    try:
+        return env_file().parent / LIBRARIES_DIR
+    except Exception:  # noqa: BLE001 - 拿不到安装根时退化，不阻塞
+        return global_home() / LIBRARIES_DIR
+
 
 def _collect_env() -> dict[str, str]:
     """优先级：真实环境变量 > ENV_FILE（唯一的 .env 来源）。
@@ -374,6 +461,10 @@ class Config:
     # 存储（路径不进 TOML，由运行环境决定）
     home: Path
     db_path: Path
+    # 生效的库目录；None = 没有库级层（未接入 / 已拒绝的拒绝态）。
+    # 只用于展示与断言，配置本身已经合并完了 —— 别拿它反推库归属，
+    # 归属真相在 registry（§5.4）。
+    library_dir: Path | None
     default_namespace: str
 
     # embedding
@@ -541,20 +632,27 @@ class Config:
     def load(
         cls,
         environ: dict[str, str] | None = None,
-        workspace: Path | None = None,
+        *,
+        library_dir: Path | str | None | _NoLibrary = None,
     ) -> "Config":
         """装配配置。
 
         - `environ` 为 None 时读 `.env` + 真实环境变量；显式传入则只认这一份
           （测试用，避免机器上的 `.env` 偷偷参与）。
-        - `workspace` 是 `.ai_memory` 目录本身；不传则自动推断。
+        - `library_dir` 是**库目录**：自有库 = `<root>/.ai_memory`，共享库 =
+          `~/.humanity-memory/libraries/<label>`。三种取值：
+          * 路径 —— 就用它，读它的 `memory.toml` 作为最高优先级层；
+          * `None` —— 自动猜（`HM_WORKSPACE` → last-workspace → cwd 向上），
+            兼容 CLI 与测试的旧行为；
+          * `NO_LIBRARY` —— **明确不读库级层**，只装配 出厂/安装/用户 三层。
+            拒绝态（未接入 / 已拒绝）必须走这条，否则会拿别人的库级参数去算。
         """
         env = dict(_collect_env() if environ is None else environ)
 
         home = Path(env.get("HM_HOME") or DEFAULT_HOME).expanduser()
-        ws_dir = workspace if workspace is not None else peek_workspace_dir(env, home)
+        lib_dir = resolve_library_dir(library_dir, env, home)
 
-        layers = config_layers(home, ws_dir)
+        layers = config_layers(home, lib_dir)
         settings: dict[str, Any] = {}
         for _, path in layers:
             settings = deep_merge(settings, _toml_load(path))
@@ -567,7 +665,7 @@ class Config:
                 + "\n  - ".join(problems)
                 + f"\n生效的配置层：{where}\n"
                 f"改法：在 {home / OVERRIDE_CONFIG_NAME} 或 "
-                f"{ws_dir / OVERRIDE_CONFIG_NAME if ws_dir else '<项目>/.ai_memory/memory.toml'} "
+                f"{lib_dir / OVERRIDE_CONFIG_NAME if lib_dir else '<库目录>/memory.toml'} "
                 "里修正上面点名的键。"
             )
 
@@ -612,6 +710,7 @@ class Config:
         return cls(
             home=home,
             db_path=Path(get("HM_DB_PATH") or str(home / "memory.db")).expanduser(),
+            library_dir=lib_dir,
             default_namespace=get("HM_NAMESPACE") or "default",
             embed_base_url=get("HM_EMBED_BASE_URL") or str(_dig(settings, "embedding", "base_url")),
             # 凭据只从 env 来，配置里没有这一项
@@ -672,6 +771,7 @@ class Config:
         return {
             "home": str(self.home),
             "db_path": str(self.db_path),
+            "library_dir": str(self.library_dir) if self.library_dir else "no library",
             "namespace": self.default_namespace,
             "layers": [
                 {"scope": name, "path": str(path)} for name, path in self.layers

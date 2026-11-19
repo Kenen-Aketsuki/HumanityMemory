@@ -1,11 +1,15 @@
 #!/bin/sh
 # ---------------------------------------------------------------------------
-# pre-commit: 禁止把「本地专用工具」与「记忆库」提交进版本库
+# pre-commit: 禁止把「本地专用工具 / 记忆库 / 本机真实路径」提交进版本库
 #
-# 拦截范围（暂存区路径命中即拦截）：
+# 第一道：按**暂存区路径**拦截
 #   1. 任何含 ExternalCommandSystem 的路径（含 Unity 生成的 .meta）
 #   2. .workbuddy/ 下的全部内容（记忆 Markdown、离线编译脚本等）
 #   3. .ai_memory/ 下的全部内容（记忆库 db、令牌文件）
+#
+# 第二道：按**新增内容**拦截（见文件末尾）
+#   4. 内容里出现本机真实路径：用户名目录 / 安装目录 / 本机工作根
+#      这类东西一旦进了历史，要清就得改写历史 —— 成本远高于事前拒绝。
 #
 # 为什么连 .db 也要拦：
 #   记忆库是二进制文件，一旦入库每次写入都会产生巨大 diff，
@@ -73,6 +77,62 @@ if [ -n "$tracked" ]; then
     printf '%s\n' "$tracked" | sed 's/^/    ! /'
     printf '%s\n' "${DIM}      如需移出版本库：git rm --cached <路径>（请自行确认后执行）${RST}"
     printf '\n'
+fi
+
+# ---------------------------------------------------------------------------
+# 第二道：内容级检查 —— 禁止把**本机真实路径**写进提交内容
+#
+# 为什么要有这一道：
+#   代码和文档会被推出去，里面的 `D:/Wrok_proj/项目名`、`C:\Users\<你的名字>`
+#   等于把开发者的目录结构与账号名一起公开。这类泄漏不违法，但没必要，
+#   而且一旦进了历史就得改写历史才能清掉 —— 成本远高于事前拒绝。
+#
+# 只拦「绝对路径 + 本机特征」，不拦正常写法：
+#   ✅ D:/proj/YourProject、D:/work/alpha、X:/path、<安装根>/libraries
+#   ❌ D:/Wrok_proj/...、C:/Users/poi77/...、D:\WorkBuddy\resources\...
+#
+# 允许例外：本文件自己（模式串里就含这些词），以及单行加 `# pathguard:allow`
+# ---------------------------------------------------------------------------
+
+# 统一小写比较，避免大小写绕过
+deny='wrok_proj'
+deny="$deny|[a-z]:[\\\\/]+users[\\\\/]"            # C:\Users\<name> / C:/Users/<name>
+deny="$deny|/[a-z]/users/"                          # MSYS 风格 /c/Users/
+deny="$deny|/home/[a-z0-9._-]+/"                    # Linux home
+deny="$deny|/users/[a-z0-9._-]+/"                   # macOS
+deny="$deny|[a-z]:[\\\\/][^ \"'\''|]*workbuddy"     # D:\WorkBuddy\ 安装目录
+
+tmp_added=$(mktemp) || exit 0
+tmp_leak=$(mktemp) || { rm -f "$tmp_added"; exit 0; }
+trap 'rm -f "$tmp_all" "$tmp_bad" "$tmp_added" "$tmp_leak"' EXIT INT TERM HUP
+
+# 只取新增行，带上 文件:行号（-U0 时没有上下文行，行号逐行 +1）
+git -c core.quotepath=false diff --cached -U0 --diff-filter=ACMRT 2>/dev/null | awk '
+    /^\+\+\+ / { f = $2; sub(/^b\//, "", f); next }
+    /^@@ / { if (match($0, /\+[0-9]+/)) ln = substr($0, RSTART + 1, RLENGTH - 1) + 0; next }
+    /^\+/ { printf "%s:%d\t%s\n", f, ln, substr($0, 2); ln++ }
+' > "$tmp_added" 2>/dev/null
+
+# 排除本文件（模式串自身命中）与显式放行行
+grep -v '^tools/hooks/pre-commit:' "$tmp_added" 2>/dev/null \
+  | grep -vi 'pathguard:allow' \
+  | grep -iE "$deny" > "$tmp_leak" 2>/dev/null || true
+
+if [ -s "$tmp_leak" ]; then
+    count=$(wc -l < "$tmp_leak" | tr -d ' ')
+    printf '%s\n' "${BOLD}${RED}提交被阻止：内容里出现本机真实路径${RST}"
+    printf '\n'
+    printf '%s\n' "${RED}命中 ${count} 处（文件:行号 与原文）：${RST}"
+    awk -F'\t' '{ printf "    - %s\n      %s\n", $1, substr($2, 1, 150) }' "$tmp_leak" | head -40
+    printf '\n'
+    printf '%s\n' "${YEL}处理方式：${RST}"
+    printf '%s\n' "  1) 改成占位符（推荐）：${DIM}<安装根>/libraries、D:/proj/YourProject、~/.humanity-memory${RST}"
+    printf '%s\n' "  2) 确属无害的示例，在该行末尾加 ${DIM}# pathguard:allow${RST}"
+    printf '%s\n' "  3) 取消暂存：${DIM}git restore --staged <文件>${RST}"
+    printf '\n'
+    printf '%s\n' "${DIM}  规则：绝对路径 + 本机特征（用户名目录 / 工作根 / 安装目录）。${RST}"
+    printf '\n'
+    exit 1
 fi
 
 exit 0

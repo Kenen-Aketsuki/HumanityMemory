@@ -17,7 +17,7 @@
 ----
     python tools/upgrade_all.py                          # 干跑：只探测、只报告
     python tools/upgrade_all.py --apply                  # 真做
-    python tools/upgrade_all.py --apply --skip project_island_back
+    python tools/upgrade_all.py --apply --skip alpha
 """
 
 from __future__ import annotations
@@ -27,12 +27,16 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import localenv
+
 ROOT = Path(__file__).resolve().parent.parent
 HOME = Path.home()
 GLOBAL_DIR = HOME / ".humanity-memory"
 
 # 默认扫描根：项目库都在 <根>/<项目>/.ai_memory/workspace.db
-DEFAULT_ROOTS = (Path("D:/Wrok_proj"),)
+# 具体位置是本机配置（local.env 的 HM_SCAN_ROOTS，逗号分隔）；
+# 未配置时退回项目所在目录，保证换台机器也能跑起来。
+DEFAULT_ROOTS = tuple(Path(p) for p in localenv.get_list("HM_SCAN_ROOTS")) or (ROOT.parent,)
 
 TARGET_VERSION = 4
 
@@ -183,13 +187,13 @@ def main(argv: list[str] | None = None) -> int:
         "--root",
         action="append",
         default=None,
-        help="项目库扫描根，可多次给；默认 D:/Wrok_proj",
+        help="项目库扫描根，可多次给；默认取 local.env 的 HM_SCAN_ROOTS（未配置则为项目所在目录）",
     )
     parser.add_argument(
         "--skip",
         action="append",
         default=[],
-        help="按路径片段跳过（如 --skip project_island_back）",
+        help="按路径片段跳过（如 --skip alpha）",
     )
     parser.add_argument("paths", nargs="*", help="只处理指定的库文件")
     args = parser.parse_args(argv)

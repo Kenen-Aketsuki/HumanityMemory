@@ -10,6 +10,8 @@
     左栏        检索记录列表（时间倒序）
     中栏        选中那次检索的详情：问了什么、翻出谁、每条活跃度加了多少
     右栏        条目热度榜 + 自动诊断（当前配置偏苛刻还是偏宽松）
+                热度榜支持两种排序：命中次数（页面自己数）与活跃度（库里的实时值），
+                两个数值同时显示 —— 只换顺序而不换数字，没人看得懂排序依据。
 
 为什么要自己算一遍：活跃度阈值是绝对分数，而「一次检索值多少分」由相似度
 和曲线决定。两个数字都躺在配置里，但**它们相不相配只有算出来才知道** ——
@@ -63,7 +65,10 @@ h1{font-size:15px;font-weight:500;margin:0}
 .stats{display:flex;gap:1px;background:var(--line);border-top:1px solid var(--line);
   border-bottom:1px solid var(--line)}
 .card{flex:1;background:var(--bg);padding:9px 16px;min-width:0}
-.card .k{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* 标题用 .lbl 而不是 .k —— .k 是下面表格里那个 6×6 的类型圆点，
+   两者特异性不同但声明不重叠，.card .k 会被圆点规则压成 6px 宽，
+   标题文字 overflow:hidden 后就只剩一小段横线（2026-11-18 修）。 */
+.card .lbl{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .card .v{font-size:16px;font-weight:500;margin-top:2px;letter-spacing:.2px}
 .card .h{color:var(--dim);font-size:10.5px;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .v.warn{color:var(--warn)} .v.bad{color:var(--bad)} .v.ok{color:var(--ok)}
@@ -94,10 +99,22 @@ td{padding:7px 8px;border-bottom:1px solid #161d27;vertical-align:top}
 .bar>i{position:absolute;left:0;top:0;bottom:0;background:var(--up);border-radius:3px;opacity:.55}
 .bar>span{position:relative;padding-left:5px;font-size:11px;color:#bfe9d6}
 .zero{color:var(--dim)}
+h2.split{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.sort{display:inline-flex;gap:4px;flex:0 0 auto}
+.sort button{background:#151d28;border:1px solid var(--line);color:var(--muted);
+  border-radius:9px;padding:1px 8px;font:11px/1.5 inherit;cursor:pointer}
+.sort button:hover{color:var(--text)}
+.sort button.on{color:var(--text);border-color:var(--exp);background:#17202d}
+.sort button:disabled{opacity:.45;cursor:default}
 .hot{display:flex;align-items:center;gap:8px;padding:6px 14px;border-bottom:1px solid #161d27}
 .hot .n{color:var(--warn);font-size:11px;min-width:20px;text-align:right}
 .hot .c{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
 .hot .lv{color:var(--dim);font-size:11px}
+.hot .a{color:var(--dim);font-size:11px;min-width:34px;text-align:right;
+  font-variant-numeric:tabular-nums}
+/* 当前排序维度更亮一档：两个数值并排时，得让人一眼看出「为什么是这个顺序」 */
+.hot .a.on{color:var(--text)}
+.hot .n.on{color:#ffd79a}
 .diag{border-top:1px solid var(--line);margin-top:6px}
 .note{padding:9px 14px;border-bottom:1px solid #161d27;font-size:12px;line-height:1.6}
 .note b{font-weight:500}
@@ -116,7 +133,11 @@ td{padding:7px 8px;border-bottom:1px solid #161d27;vertical-align:top}
   <aside><h2>检索记录</h2><div id="list"></div></aside>
   <section><div id="detail"><div class="empty">左侧选一条记录</div></div></section>
   <aside>
-    <h2>条目热度</h2><div id="hot"></div>
+    <h2 class="split">条目热度
+      <span class="sort" id="hotsort">
+        <button data-k="n" class="on">命中</button><button data-k="a">活跃度</button>
+      </span>
+    </h2><div id="hot"></div>
     <div class="diag"><h2>自动诊断</h2><div id="diag"></div></div>
   </aside>
 </main>
@@ -128,6 +149,10 @@ const M=DATA.meta||{};
 const recs=(DATA.records||[]).slice().sort((a,b)=>(b.at||0)-(a.at||0));
 const levels=(M.levels||[]).slice().sort((a,b)=>a.level-b.level);
 const nodes=M.nodes||[];
+// 实时活跃度：id → {activity, level}。排序的第二个维度用它，不用快照里的 activity ——
+// 快照是裁定那一刻的切片，活跃度随时会被下一次召回改。
+const ACT=M.activity||{};
+const hasAct=Object.keys(ACT).length>0;
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function ts(ms){const d=new Date(ms);const p=n=>String(n).padStart(2,'0');
@@ -153,7 +178,7 @@ const nodeTotal=nodes.length;
 nodes.forEach(n=>{if(n.down!=null&&(n.activity||0)<n.down)belowLine++;});
 
 function card(label,value,hint,cls){
-  return '<div class="card"><div class="k">'+label+'</div><div class="v '+(cls||'')+'">'+value+'</div>'+
+  return '<div class="card"><div class="lbl">'+label+'</div><div class="v '+(cls||'')+'">'+value+'</div>'+
          '<div class="h">'+(hint||'')+'</div></div>';
 }
 function renderStats(){
@@ -253,27 +278,62 @@ function detail(i){
     '</div>';
 }
 
+// 热度榜的两个排序维度：命中次数（本页自己数出来的）与活跃度（库里的实时值）。
+// 两个数值都摆在行里 —— 只改顺序的话，没人能看懂这次排序的依据是什么。
+let hotSort='n';
 function hot(){
   const stat=new Map();
   recs.forEach(r=>(r.hits||[]).forEach(h=>{
-    const cur=stat.get(h.id)||{id:h.id,kind:h.kind,level:h.level,n:0,delta:0};
+    const cur=stat.get(h.id)||{id:h.id,kind:h.kind,level:h.level,n:0,delta:0,act:null};
     cur.n+=1; cur.delta+=(h.delta||0);
-    if(h.level!=null)cur.level=h.level;
+    const live=ACT[h.id];
+    if(live){
+      cur.act=live.activity;
+      // 等级也以库里的为准：命中记录是历史快照，可能已经升/降过档
+      if(live.level!=null)cur.level=live.level;
+    }
     stat.set(h.id,cur);
   }));
-  const top=[...stat.values()].sort((a,b)=>b.n-a.n||b.delta-a.delta).slice(0,40);
+  const val=x=>hotSort==='n'?x.n:(x.act==null?-1:x.act);
+  const other=x=>hotSort==='n'?(x.act==null?-1:x.act):x.n;
+  // 主维度降序 → 另一维度降序 → id 兜底（否则同分行每次刷新顺序都在跳）
+  const top=[...stat.values()].sort((a,b)=>
+    (val(b)-val(a))||(other(b)-other(a))||a.id.localeCompare(b.id)
+  ).slice(0,40);
   const el=document.getElementById('hot');
   if(!top.length){el.innerHTML='<div class="empty">暂无</div>';return;}
-  el.innerHTML=top.map(x=>
-    '<div class="hot">'+
-      '<span class="n">'+x.n+'</span>'+
+  el.innerHTML=top.map(x=>{
+    const act=x.act==null?'—':num(x.act,2);
+    const lv='L'+(x.level==null?'—':x.level);
+    return '<div class="hot" title="命中 '+x.n+' 次 · 活跃度 '+act+' · '+lv+
+        (hasAct?'':'（条目活跃度未采集）')+'">'+
+      '<span class="n'+(hotSort==='n'?' on':'')+'">'+x.n+'</span>'+
       '<span class="k" style="background:'+(C[x.kind]||'#8898ad')+'"></span>'+
       '<span class="c id">'+esc(x.id)+'</span>'+
-      '<span class="lv">L'+(x.level==null?'—':x.level)+'</span>'+
-    '</div>').join('');
+      '<span class="lv">'+lv+'</span>'+
+      '<span class="a'+(hotSort==='a'?' on':'')+'">'+act+'</span>'+
+    '</div>';
+  }).join('');
 }
 
-summary(); renderStats(); list(); hot(); renderDiag();
+function bindHotSort(){
+  const box=document.getElementById('hotsort');
+  if(!box)return;
+  box.querySelectorAll('button').forEach(b=>{
+    if(b.dataset.k==='a'&&!hasAct){
+      b.disabled=true;
+      b.title='库里没有活跃度数据（还没有知识/经历条目，或检索一次都没命中过）';
+    }
+    b.onclick=()=>{
+      if(b.disabled)return;
+      hotSort=b.dataset.k;
+      box.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));
+      hot();
+    };
+  });
+}
+
+summary(); renderStats(); list(); hot(); renderDiag(); bindHotSort();
 if(recs.length)detail(0);
 </script>
 </body>
