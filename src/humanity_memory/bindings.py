@@ -86,7 +86,7 @@ def discover(roots: list[Path], *, depth: int = 3) -> list[Path]:
     """在给定目录下找 `<root>/.ai_memory`，返回工作区目录（不是项目根）。
 
     只读：不创建、不打开库。`depth` 是项目根相对扫描根的层数，
-    默认 3（`D:/Wrok_proj` 这种「一堆工程平铺」的布局一层就够，
+    默认 3（`D:/work` 这种「一堆工程平铺」的布局一层就够，
     留两层给 `work/2026/xxx` 那种按年份归档的习惯）。
     """
     found: list[Path] = []
@@ -231,6 +231,21 @@ def _inspect(ws_dir: Path, label: str, registry: keys.Registry) -> Candidate:
         git=_git_report(root),
     )
     if cand.db is None:
+        # 本地没有库文件，有两种情况，出路完全不同：
+        #   ① 库在共享组（令牌指向 libraries/<label>）→ 这是正常状态，keep
+        #   ② 什么都没有的空壳目录 → skip
+        # 混为一谈会让人以为"这个项目没接进去"，进而重复登记一个本地库。
+        tk_path = token_path(root)
+        if tk_path.is_file():
+            session = resolve_session(root)
+            if session.ok and session.record and session.record.library:
+                cand.label = session.record.library
+                cand.token_state = "shared"
+                cand.action = "keep"
+                cand.reason = f"库在共享组（{session.record.library} → {session.library_dir}）"
+                if session.library_dir is not None:
+                    cand.counts = _counts(session.library_dir / DB_NAME)
+                return cand
         cand.action, cand.reason = "skip", "目录里没有 workspace.db（空壳，不迁移）"
         return cand
     cand.counts = _counts(cand.db)

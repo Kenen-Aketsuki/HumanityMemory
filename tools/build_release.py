@@ -369,6 +369,36 @@ def smoke_env(tmp: Path) -> dict[str, str]:
     return env
 
 
+def smoke_prepare(exe: Path, tmp: Path) -> None:
+    """让 smoke 沙箱处于「已接入」态。
+
+    A1 之后空目录启动会被**正确拒绝**（no_workspace），所以老 smoke 里
+    「空目录跑 doctor 应 all_ok」的假设已经不成立了。这里先用同一个 exe
+    走一遍真实接入路径（bind adopt），顺带把 bind 也 smoke 了 ——
+    这比绕过准入直接塞一个令牌更接近用户实际会做的事。
+    """
+    ws = tmp / "ws" / ".ai_memory"
+    ws.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        [str(exe), "bind", "new", str(tmp / "ws"), "--label", "smoke"],
+        cwd=str(tmp),
+        env=smoke_env(tmp),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(
+            "smoke 准备失败：bind new 未成功\n"
+            f"  stdout: {(proc.stdout or '')[-400:]}\n"
+            f"  stderr: {(proc.stderr or '')[-400:]}"
+        )
+    if not (ws / "token.json").is_file():
+        raise SystemExit("smoke 准备失败：bind new 说成功了，但没有写出 token.json")
+
+
 def smoke_doctor(exe: Path, tmp: Path) -> tuple[list[str], dict]:
     """跑 doctor 并解析 JSON。重点不是 all_ok，而是 detail 里有没有「未配置」。"""
     proc = subprocess.run(
@@ -469,7 +499,7 @@ def _json_objects(text: str):
 
 
 def smoke(exe: Path) -> dict:
-    say("  smoke test：doctor + serve 握手")
+    say("  smoke test：绑定 → doctor → serve 握手")
     # 沙盒环境里 AppData\Temp 可能不可写（WinError 5），所以用仓库内目录：
     # 顺手也能验证"在项目里跑"这个真实姿势。目录很小，跑完就清。
     base = ROOT / "build" / f"smoke-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -478,6 +508,10 @@ def smoke(exe: Path) -> dict:
     problems: list[str] = []
     report: dict = {}
     try:
+        try:
+            smoke_prepare(exe, base)
+        except subprocess.TimeoutExpired:
+            problems.append("bind adopt 超时（120s）")
         try:
             doc_problems, report = smoke_doctor(exe, base)
         except subprocess.TimeoutExpired:

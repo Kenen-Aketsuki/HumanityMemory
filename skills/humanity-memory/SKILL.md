@@ -288,24 +288,22 @@ memory_recall("当前在做的事")                                  # 按话题
 memory_use_workspace(path="D:/proj/YourProject")
 ```
 
-切换后所有读写都落在该项目自己的 `.ai_memory/workspace.db`，**项目之间仍然物理隔离**。
-`persist=true`（默认）会记住这次选择，下次 server 启动自动接上。
+切换后所有读写都落在该项目自己的库，**项目之间仍然物理隔离**。
+它现在**先校验令牌**：该目录没接入就返回 `code` + 清单，不会建库、不会硬切。
+`persist` 参数已失效——进程间不再共享"上次工作区"。
 
-**什么时候要调**：会话开始 `memory_stats` 显示的工作区不对；用户提到了另一个项目的记忆。
+**什么时候要调**：`memory_stats` 显示的工作区不对；用户提到了另一个项目的记忆。
 
-**工作区来自哪里**（优先级从高到低）：
+**工作区/库来自哪里**（优先级从高到低）：
 
-1. `--token` 令牌文件
-2. `--workspace` 命令行
-3. `HM_WORKSPACE` 环境变量
-4. cwd 向上查找**已存在**的 `.ai_memory`
-5. cwd 处在一个像项目的目录里（有 `.git` / `ProjectSettings` / `package.json` 等）
-   → **在项目根自动建立**，不用手动 init
-6. 上次用过的工作区（`~/.humanity-memory/last-workspace.txt`）
-7. 无 → 报错（全局库已关闭，没有兜底库）
+1. `--workspace` 命令行 / `HM_WORKSPACE` 环境变量
+2. cwd 向上查找**含 `token.json` 的** `.ai_memory`
+3. 都没有 → **拒绝**（`no_workspace` / `no_token` + 清单），不建目录、不建库
 
-在子目录（如 `<项目>/Assets/Scripts`）里启动时，会自动归位到项目根，不会在子目录建库。
-用户主目录和盘符根永远不建。
+不接入时（未接入 / 已拒绝），记忆工具**不注册**，只剩
+`memory_bind_status` / `memory_bind_new` / `memory_bind_existing` /
+`memory_bind_adopt` / `memory_bind_decline` / `memory_use_workspace`。
+这时**先问用户**要哪种，再调对应工具——不要自己选，也不要在拒绝态下尝试写入。
 
 ## 存储布局
 

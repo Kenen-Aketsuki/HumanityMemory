@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .paths import global_home
 from .resources import resource
 
 DEFAULT_HOME = Path.home() / ".humanity-memory"
@@ -406,6 +407,37 @@ def env_file() -> Path:
 
 
 ENV_FILE = env_file()
+
+LIBRARIES_DIR = "libraries"
+
+
+def libraries_home() -> Path:
+    """共享组库的根目录。**不放用户目录** —— 库是数据，不是配置。
+
+    顺序：
+    1. `HM_LIBRARIES`（显式指定，跨模式对齐用）
+    2. `<安装根>/libraries/` —— 安装根就是 `.env` 所在目录：
+       冻结态 = 发布根（`.../HumanityMemory-Release`），源码态 = 仓库根。
+    3. 兜底 `~/.humanity-memory/libraries`（只在前两条都拿不到时才会用到）
+
+    为什么不像 registry 那样放 `~/.humanity-memory`：registry / 信条 / 诊断都是
+    配置与索引（几十 KB），库是几 MB 的实体数据。配置跟着用户走、数据跟着安装走，
+    升级 / 回滚 / 换机器时两类东西的心智模型不同，混在一起最容易在 C 盘攒下大文件。
+    """
+    raw = ""
+    try:
+        # 走统一的收集入口：`.env` 里的 HM_LIBRARIES 和真实环境变量同等对待。
+        # 只读 os.environ 的话，写在 `.env` 里的落点会被静默忽略 —— 那种"配置看着生效
+        # 其实没生效"的问题最难查。
+        raw = (_collect_env().get("HM_LIBRARIES") or "").strip()
+    except Exception:  # noqa: BLE001 - 收集失败就退化到默认落点
+        raw = (os.environ.get("HM_LIBRARIES") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    try:
+        return env_file().parent / LIBRARIES_DIR
+    except Exception:  # noqa: BLE001 - 拿不到安装根时退化，不阻塞
+        return global_home() / LIBRARIES_DIR
 
 
 def _collect_env() -> dict[str, str]:

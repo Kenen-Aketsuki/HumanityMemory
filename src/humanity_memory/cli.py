@@ -12,7 +12,7 @@ from typing import Any, Sequence
 
 from . import __version__, rules
 from . import keys as key_registry
-from .config import Config, ConfigError
+from .config import Config, ConfigError, libraries_home
 from .db import SchemaVersionError, detect_fts_tokenizer, get_meta
 from .models import parse_day
 from .paths import ensure_rules, find_workspace_dir, resolve_layout
@@ -72,8 +72,21 @@ def _open(args: argparse.Namespace | None = None) -> MemoryStore:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    layout = _layout(args)
-    cfg = Config.load(library_dir=layout.workspace_dir)
+    """只做「补齐信条 + 打开已有库自检」。**不建库** —— 建库是 bind 的事。"""
+    from . import bindings
+
+    session = bindings.resolve_session(getattr(args, "workspace", None))
+    if not session.ok:
+        payload = session.to_json()
+        payload["hint"] = (
+            "init 不再自动建库：接入用 `bind adopt`（沿用已有库）或 `bind new`（新建）。"
+        )
+        _dump(payload)
+        return 1
+
+    layout = session.layout
+    assert layout is not None and layout.library_dir is not None
+    cfg = Config.load(library_dir=layout.library_dir)
     ensure_rules(layout.global_rules)
     if layout.workspace_rules:
         ensure_rules(layout.workspace_rules)
@@ -82,6 +95,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             {
                 "ok": True,
                 **layout.describe(),
+                "library": session.record.library if session.record else None,
                 "global_rules": str(layout.global_rules),
                 "workspace_rules": str(layout.workspace_rules) if layout.workspace_rules else None,
                 "embedding_available": cfg.embedding_configured,
@@ -407,6 +421,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "config": cfg.describe(),
         "settings": cfg.describe_settings(),
         "layout": layout.describe(),
+        # 共享组库的落点（自有库仍在项目内）：跟着安装走，不进用户目录
+        "libraries_home": str(libraries_home()),
     }
 
     try:
@@ -675,7 +691,7 @@ def _bind_migrate(args: argparse.Namespace) -> int:
 
     if not args.scan:
         print(
-            "错误：migrate 需要至少一个 --scan <目录>，例如 `--scan D:/Wrok_proj`",
+            "错误：migrate 需要至少一个 --scan <目录>，例如 `--scan D:/work`",
             file=sys.stderr,
         )
         return 2
@@ -1257,7 +1273,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="DIR",
-        help="migrate：扫描根目录，可重复（如 --scan D:/Wrok_proj）",
+        help="migrate：扫描根目录，可重复（如 --scan D:/work）",
     )
     p_bind.add_argument(
         "--depth", type=int, default=3, help="migrate：项目根相对扫描根的最大层数（默认 3）"

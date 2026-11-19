@@ -142,96 +142,85 @@ humanity-memory search "引导为什么不触发"
 
 改完需要在连接器管理页面点「信任」。
 
-### 多项目部署（推荐）
+### 多项目：一条配置，令牌钉库
 
-一个 server 进程只服务一个工作区。要服务多个项目，每个项目加一条，用 `--workspace` 锁定：
+`mcp.json` 里**只有 exe 和 `serve`**，不带任何项目路径：
 
 ```json
-"humanity-memory-project-island": {
-  "command": "Your/Path/To/HumanityMemory/.venv/Scripts/python.exe",
-  "args": [
-    "-m", "humanity_memory.mcp_server",
-    "--workspace", "D:/proj/YourProject"
-  ],
-  "env": { "...": "同上" }
+"humanity-memory": {
+  "command": "Your/Path/To/HumanityMemory-Release/current/humanity-memory.exe",
+  "args": ["serve"],
+  "env": { "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1" }
 }
 ```
 
-`--workspace` 指向**项目根**，不是 `.ai_memory` 目录。不传则退化为「从 cwd 向上查找」，
-这在客户端 cwd 不固定时会直接报错（没有全局库兜底）。
+一个 server 服务所有项目：**打开哪个库由当前目录的令牌决定**，
+`<项目>/.ai_memory/token.json` 就是那个项目的接入证明。项目搬家令牌跟着搬。
 
-### 用令牌文件（把凭据从 mcp.json 里拿出来）
-
-`mcp.json` 经常被同步、备份、分享。把 API key 写在里面是一层泄露风险。
-令牌把「工作区绑定 + 信条路径 + embedding 凭据」收进一个文件，`mcp.json` 只留一个路径：
-
-```json
-"args": [
-  "-m", "humanity_memory.mcp_server",
-  "--token", "D:/proj/YourProject/.ai_memory/memory.token.json"
-]
-```
-
-生成令牌：
+给一个项目接入记忆库（在项目根执行，四条选一条）：
 
 ```bash
-# 项目内令牌（不含凭据，可以跟着项目走）
-humanity-memory workspace use D:/proj/YourProject \
-  --token D:/proj/YourProject/.ai_memory/memory.token.json
-
-# 带凭据的令牌（建议放用户目录，别放项目里被 git 提交）
-humanity-memory workspace use D:/proj/YourProject --with-embedding
-# 默认写到 ~/.humanity-memory/active.token.json
-
-humanity-memory --token <路径> workspace show   # 查看（key 会脱敏）
+humanity-memory bind new                     # 新建独立库（默认用目录名当标签）
+humanity-memory bind new --label island      # 新建并指定标签
+humanity-memory bind adopt                   # 沿用本目录已有的 .ai_memory/workspace.db
+humanity-memory bind existing --library island   # 并入已有库（A、B 共用一个库）
+humanity-memory bind decline                 # 本次不接入（记住这个决定，以后不再问）
 ```
 
-令牌内容：
+查看与运维：
+
+```bash
+humanity-memory bindings list          # registry 里有哪些库、谁在用
+humanity-memory --workspace <项目> doctor    # 接入状态 + 配置 + 库自检
+humanity-memory revoke --workspace <项目>    # 撤销钥匙（不动库文件）
+humanity-memory bind move --from <旧> --to <新>   # 项目搬家后修令牌
+```
+
+**没有令牌就什么都不做。** 未接入时不会建目录、不会建库、也不会去翻「上次用过的工作区」——
+它会返回一个错误码 + 一份可照做的清单（`memory_bind_status` 能看到同样的内容）。
+
+### 令牌里有什么（v2）
 
 ```json
 {
-  "version": 1,
-  "label": "YourProject",
+  "version": 2,
+  "key": "hmk_7f3a9c1e…",
   "workspace": "D:/proj/YourProject",
-  "rules": null,
-  "embedding": {}
+  "library": "yourproject",
+  "label": "yourproject"
 }
 ```
 
-- `workspace` 必填，启动时会校验目录存在；项目挪位置后重新 `workspace use` 即可
-- `rules` 留 `null` 就自动探测 `.workbuddy/memory/信条.md`
-- `embedding` 留空则回落到环境变量 / `.env`
-- 优先级：令牌 > `--workspace` > `HM_WORKSPACE` > cwd 查找
+- 只有**身份**：没有 embedding 凭据（凭据走 `.env`），也没有信条路径（信条从项目里探测）。
+- `library: null` 表示**明确不接入**（`bind decline` 的结果）。这是被记住的决定，
+  不是"还没配"——所以它同样拒绝读写，只是不再反复问你。
+- `library` 是**断言，不是寻址**：真正打开哪个库由服务端 registry（`~/.humanity-memory/registry.json`）
+  决定。手改令牌里的 `library` 拿不到别人的库，只会让校验失败。
+- registry 只存 `sha256(salt + key)`，明文钥匙只在令牌文件里。
 
-**令牌不减少配置条数**。它解决的是三件事：凭据集中、改配置不用动客户端、连错工作区能立刻发现。
+### 启动时怎么决定打开哪个库
 
-### 一条配置服务多个项目（不写多条 mcp.json）
-
-一个 server 进程可以运行中切换工作区：
-
-```
-memory_use_workspace(path="D:/proj/YourProject")
-```
-
-切换后读写全部落到该项目自己的 `.ai_memory/workspace.db`，**项目之间仍物理隔离**；
-`persist=true` 会记住选择，下次启动自动接上。
-
-启动时工作区按这个顺序确定：
-
-| 优先级 | 来源 | 说明 |
+| 顺序 | 来源 | 说明 |
 | --- | --- | --- |
-| 1 | `--token` | 令牌文件里写死，最确定 |
-| 2 | `--workspace` | 命令行指定 |
-| 3 | `HM_WORKSPACE` | 环境变量 |
-| 4 | cwd 向上查找 | 只有**已存在** `.ai_memory` 才命中，不会新建 |
-| 5 | 上次用过的工作区 | `~/.humanity-memory/last-workspace.txt` |
-| 6 | 无 | 报错：没有工作区就写不进去（全局库已关闭） |
+| 1 | `--workspace` | 显式指定项目根（运维 / 调试用） |
+| 2 | `HM_WORKSPACE` | 环境变量，同上 |
+| 3 | cwd 向上查找 | **只认含 `token.json` 的 `.ai_memory`** |
+| 4 | 都没有 | 拒绝：`no_workspace` / `no_token` + 清单，不建任何目录 |
 
-如果客户端启动时 cwd 就是项目目录，第 4 条能直接命中——那就是真正的零配置。
-客户端 cwd 不可靠时，靠第 5 条 + agent 调一次 `memory_use_workspace` 兜底。
+`--token <路径>` 仍可传，但它的作用已经降级为「路径覆盖 + 用令牌里的 workspace 当提示」，
+**不再是身份来源**——放行与否仍由七步校验决定。
 
-启动上下文（cwd、解析来源、命中的工作区）会写进
-`~/.humanity-memory/diagnostics/startup.json`，排查「为什么落到这个工作区」时先看它。
+校验顺序（任一失败即拒绝，失败点就是错误码）：
+根目录 → 令牌存在且可解析 → `version == 2` → 令牌的 `workspace` 就是本根 →
+registry 有这把 key 且未撤销 → registry 的 `workspace` / `library` 与令牌一致 →
+`library` 非 null 且库目录存在。
+
+运行中切库用 `memory_use_workspace(path="D:/proj/YourProject")`：它同样先校验令牌，
+通过后才重建 store 并**按新库重载配置**（库级 `memory.toml` 跟着库走）。
+`persist` 参数已失效——进程间不再共享"上次工作区"。
+
+启动上下文（cwd、解析来源、命中的库、错误码）会写进
+`~/.humanity-memory/diagnostics/startup.json`，排查「为什么落到这个库」时先看它。
 
 ### 复用项目已有的信条文件
 
@@ -440,9 +429,19 @@ type_weight: experience 1.00 / episode 0.96 / log 0.90
 ## 开发
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q                    # 170 项单元测试
+./.venv/Scripts/python.exe -m pytest -q                    # 349 项单元测试
 ./.venv/Scripts/python.exe tools/verify_mcp_config.py      # MCP 端到端（隔离环境）
+sh tools/hooks/install.sh                                  # 装 pre-commit 钩子（每台机器一次）
 ```
+
+**提交钩子**拦两件事，都是"进了历史就得改写历史才能清掉"的那类：
+
+1. **本地专用文件**：`ExternalCommandSystem/`、`.workbuddy/`、`.ai_memory/`；
+2. **内容里的本机真实路径**：用户目录、开发机的安装目录、工程根这类绝对路径。
+   只扫**新增行**，且只认"绝对路径 + 本机特征" —— `D:/proj/YourProject`、
+   `<安装根>/libraries` 这类占位符照常放行。
+
+误报时在那一行末尾加 `# pathguard:allow`，并在 review 时说明理由。
 
 ## 已知限制
 

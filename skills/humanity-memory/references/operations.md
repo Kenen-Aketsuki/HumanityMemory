@@ -20,39 +20,51 @@
 不会出现「换个目录 embedding 静默失效」。真实环境变量仍是最高优先级
 （令牌、`mcp.json` 的 env、命令行覆盖都依赖它）。
 
-工作区查找规则：从 cwd 向上逐级找 `.ai_memory`，命中即用。
-都没有时，如果 cwd 处在一个「像项目」的目录树里（含 `.git`、`ProjectSettings`、
-`package.json`、`pyproject.toml`、`.workbuddy` 等标记），会在**项目根**自动建立，
-所以新项目接入通常不需要手动 `init`。
-用户主目录和盘符根永远不建。
+工作区查找规则：从 cwd 向上逐级找 `.ai_memory`，**只认含 `token.json` 的那个**。
+找不到就是「未接入」——不建目录、不建库、也不沿用上次的工作区。
+（2026-11-18 起：自动建库已删除，`last-workspace.txt` 已删除。）
 
-启动上下文（cwd、走了哪条解析路径、命中的工作区）写在
-`~/.humanity-memory/diagnostics/startup.json`，排查「为什么落到这个工作区」先看它。
+启动上下文（cwd、走了哪条解析路径、命中的库、错误码）写在
+`~/.humanity-memory/diagnostics/startup.json`，排查「为什么落到这个库」先看它。
 
-## 令牌：把工作区绑定从 mcp.json 解耦
+## 令牌：项目的接入证明（v2）
 
-`mcp.json` 里写死 API key 有泄露风险（它会被同步、备份、分享）。令牌文件把
-「工作区 + 信条 + 凭据」收进一处，客户端配置里只留一个路径：
+身份在项目里，不在 `mcp.json` 里。客户端配置只剩 `["serve"]`，
+打开哪个库由当前目录的 `<项目>/.ai_memory/token.json` 决定：
 
 ```json
-"args": ["-m", "humanity_memory.mcp_server", "--token", "<令牌路径>"]
+{
+  "version": 2,
+  "key": "hmk_7f3a9c1e…",
+  "workspace": "D:/proj/YourProject",
+  "library": "yourproject",
+  "label": "yourproject"
+}
 ```
+
+接入 / 运维（全部有对应 MCP 工具，`memory_bind_*`）：
 
 ```bash
-humanity-memory workspace use <项目根> --token <令牌路径>   # 建/改
-humanity-memory --token <路径> workspace show              # 查看（key 脱敏）
+humanity-memory bind new [--label 名字]      # 新建独立库 + 发令牌
+humanity-memory bind adopt                   # 沿用本目录已有的 .ai_memory/workspace.db
+humanity-memory bind existing --library 标签  # 并入已有库（A、B 同库）
+humanity-memory bind decline                 # 本次不接入（library=null，记住决定）
+humanity-memory bindings list                # registry：有哪些库、谁在用
+humanity-memory revoke --workspace <项目>     # 撤销钥匙（不动库文件）
+humanity-memory bind move --from <旧> --to <新>   # 搬家后修令牌
 ```
 
-令牌里的 `embedding` 留空就回落到 `.env`。**带凭据的令牌别放项目里**——
-项目会被 git 提交，凭据就跟着走了。放 `~/.humanity-memory/` 下更安全。
+令牌里**没有凭据**：embedding 只走 `.env`（见下）。registry 只存 `sha256(salt+key)`，
+明文钥匙只在令牌文件里；`library` 是断言、真归属在 registry，手改无效。
 
-优先级：令牌 > `--workspace` > `HM_WORKSPACE` > cwd 向上查找。
+启动优先级：`--workspace` > `HM_WORKSPACE` > cwd 向上查找（只认带令牌的）。
+`--token` 仍可传，但只作「路径覆盖 + workspace 提示」，不再是身份来源。
 
 ## 配置
 
 ```bash
 # 信条与库所在目录（global.db 已退役，这里现在只放信条/诊断/备份）
-HM_HOME=C:/Users/you/.humanity-memory
+HM_HOME=~/.humanity-memory
 
 # embedding（OpenAI 兼容）
 HM_EMBED_BASE_URL=https://api.siliconflow.cn/v1

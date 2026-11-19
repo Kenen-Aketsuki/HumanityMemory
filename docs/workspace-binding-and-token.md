@@ -87,7 +87,7 @@ R8 决定了实现形态：拒绝不是「退回某个默认库」，而是**能
 `~/.workbuddy/mcp.json` 里 humanity-memory **只有一条**，写死了一个全局活跃令牌：
 
 ```json
-{ "args": ["--token", "C:/Users/you/.humanity-memory/active.token.json", "serve"] }
+{ "args": ["--token", "C:/path/to/active.token.json", "serve"] }
 ```
 
 `startup.log` 全量 1024 条：`argv: []` 854 条、带 `--token` 155 条；
@@ -153,7 +153,7 @@ v1 的 `state` / `case` / `narrative` 列读法已不存在：
 它们会稳定停在「未接入」，不会再有新库被静默创建。
 
 > **2026-11-18 迁移时复核**：`alpha` / `beta` 是文档早期的**示例条目**，磁盘上已无对应目录。
-> 实际库以 `bind migrate --scan D:/Wrok_proj` 的结果为准，当时是 10 个：上表 7 个真库
+> 实际库以 `bind migrate --scan <工作区根>` 的结果为准，当时是 10 个：上表 7 个真库
 > + `Aketsuki_Unity_MCP`（26/22/0/4）+ `project_island_back`（39/19/21/3，迁移前 `active.token.json`
 > 钉住的就是它）+ `HumanityMemory_dev`（空库，`label = hm_dev`，F1 的 dev 隔离库）。
 
@@ -279,7 +279,7 @@ A1 定案：**没有"全局库模式"这个中间态**。两个非绑定态的�
   "version": 2,
   "salt": "…",
   "libraries": {
-    "island": { "path": "~/.humanity-memory/libraries/island", "created": "2026-11-18" },
+    "island": { "path": "<安装根>/libraries/island", "created": "2026-11-19" },
     "alpha": { "path": "D:/work/alpha/.ai_memory", "created": "2026-11-18" }
   },
   "keys": {
@@ -376,12 +376,12 @@ v1 在这里有「未命中 → 扫 `keys/` 比内容救回」的兜底，**A2 �
 由此：
 
 - **自有库**：库目录就是 `.ai_memory`，所以路径仍是 `<root>/.ai_memory/memory.toml` —— 今天的写法继续有效；
-- **共享库**：配置在 `~/.humanity-memory/libraries/island/memory.toml`，A、B 读到**同一份**。
+- **共享库**：配置在 `<安装根>/libraries/island/memory.toml`，A、B 读到**同一份**。
   这正是 A4 想要的："这个库的最高优先级配置就是它自己的库级配置"；
 - 代价（必须写进 README）：**在共享组里没法给某个项目单独调阈值**。
   需要独立参数就说明它该是独立库。这是刻意的，避免"配置层比库层更细"造成隐性分裂；
 - 实现细节：`Config.load(library_dir=...)` 的入参语义是"**库目录**"
-  （共享时传 `libraries/island`），参数名已从 `workspace` 改掉（T5）；
+  （共享时传 `<安装根>/libraries/island`），参数名已从 `workspace` 改掉（T5）；
   拒绝态传 `NO_LIBRARY` 哨兵（只装配前三层），`None` 仍表示"自动猜"；
   `peek_workspace_dir` 仍用于"还没绑定时猜配置"。
 
@@ -395,12 +395,29 @@ D:/work/A/                              D:/work/A/
    ├─ memory.toml   （库级配置）              D:/work/B/
    ├─ CORE_RULES.md （信条，跟着项目走）        └─ .ai_memory/
    └─ workspace.db                                └─ token.json {"library":"island"}
-                                             ~/.humanity-memory/libraries/island/
+                                             <安装根>/libraries/island/   ← 不放用户目录
                                                 ├─ memory.toml   （A、B 共用这份）
                                                 └─ workspace.db  （A、B 共用这个库）
 
 信条永远在项目里：A、B 各自的 .workbuddy/memory/信条.md 各自生效。
 ```
+
+### 5.9 组库放哪：跟着安装走（`libraries_home()`）
+
+组库**不放用户目录**。解析顺序：
+
+1. `HM_LIBRARIES`（`.env` 或环境变量，两种运行模式用它对齐）；
+2. `<安装根>/libraries/` —— 安装根 = `.env` 所在目录：冻结态是发布根
+   （`…/HumanityMemory-Release`），源码态是仓库根；
+3. 兜底 `~/.humanity-memory/libraries`（前两条都拿不到才会用到）。
+
+理由是两类东西的心智模型不同：**registry / 信条 / 诊断是配置与索引**（几十 KB），
+跟着用户走；**库是实体数据**（MB 级），跟着安装走。混在一起最直接的后果是
+C 盘悄悄攒下几十 MB，而升级 / 回滚时没人会想到去那儿找。
+
+> 本机取值为**发布根下的 `libraries/`**（两份 `.env` 都写了
+> `HM_LIBRARIES`，保证源码态与冻结态指向同一处）。`doctor` 输出里的 `libraries_home`
+> 就是这个值；`bind migrate` 不参与它的决定 —— 库的真实位置永远以 registry 为准。
 
 ---
 
@@ -572,7 +589,7 @@ A2 只改变了令牌**放在哪**，没有改变它的安全等级。
 | --- | --- | --- |
 | **git 提交 / 推送** | **已由 pre-commit 钩子封住**（2026-11-18 实测）。4 个仓库 `majotavern` / `project_island` / `project_island_back` / `beto-client` 的 `.git/hooks/pre-commit` 均含 `.ai_memory/*` 与 `*/.ai_memory/*` 两条 case 分支，命中 `exit 1`；用探针文件 `git add` 后 `git hook run pre-commit` 实测返回退出码 1 并列出路径，清理后暂存区 0 残留。前三个仓库另有 `pre-rebase` / `.bak-hm` 备份，说明是成套维护的；`beto-client` 的钩子是 2026-11-18 自 `majotavern` 移植（Cocos2d-x 工程，已裁掉 Unity 专有规则） | **否**（不靠隔离，靠钩子） |
 | **打包 / 复制工程目录** | 人工动作，频率低 | **否** |
-| **云同步** | `~/OneDrive/WorkBuddy-Portable/` 内实测**无任何 `.db`**，同步的只有 `.workbuddy/memory`（服务端生成的那份），`.ai_memory` 完全不参与 | **是，且这条通道直接不存在** |
+| **云同步** | 便携同步目录内实测**无任何 `.db`**，同步的只有 `.workbuddy/memory`（服务端生成的那份），`.ai_memory` 完全不参与 | **是，且这条通道直接不存在** |
 | **另一个项目的 AI 读你的库** | 2026-11-17 真实发生（island_back 信条注入 HumanityMemory 会话） | **否，且最容易被"隔离了"掩盖** |
 
 钩子的两个边界（不影响结论，但要写下来）：
@@ -779,48 +796,88 @@ A2 把令牌放在固定路径 `<root>/.ai_memory/token.json`，**不存在"给�
         ④层名"项目"→"库"同步改了 `test_config_layers.py` / `test_settings.py` 的层序断言（W1 的一部分）；
         ⑤顺带修了 `starmap._levels_from_config`：库文件不在 `.ai_memory` 也没有同级 `memory.toml` 时传哨兵，
         不再让"随便拷到临时目录的备份库"去猜 cwd 上面那个项目的配置
-- [ ] **T10** `bind migrate --all`：登记库 → 发令牌 → git 拦截核对（4 个已有钩子只核对；`MiscAI` 按用户决定暂不处理）→ 退役 `active.token.json` → `mcp.json` 去 `--token`；顺带 adopt `HumanityMemory_dev`（F1）
+- [x] **T10** `bind migrate --all`：登记库 → 发令牌 → git 拦截核对（4 个已有钩子只核对；`MiscAI` 按用户决定暂不处理）→ 退役 `active.token.json` → `mcp.json` 去 `--token`；顺带 adopt `HumanityMemory_dev`（F1）
       → 验收：`--dry-run` 先出清单；9 个库 + dev 全部可读写；旧行为（last-workspace / 自动建库）此刻仍保留
-      → **2026-11-18 第一段完成**（登记 + 发令牌 + git 核对）：`bind migrate --scan D:/Wrok_proj --apply`，
+      → **2026-11-18 第一段完成**（登记 + 发令牌 + git 核对）：`bind migrate --scan <工作区根> --apply`，
         registry **10 libraries / 10 keys**、明文 key 未落盘，逐个 `check_key(key, workspace, library)` 全通过；
-        重跑（不带 `--label`）全 `keep`。实际库 = `D:/Wrok_proj` 下所有含 `.ai_memory` 的目录
+        重跑（不带 `--label`）全 `keep`。实际库 = 扫描根下所有含 `.ai_memory` 的目录
         （§3.5 里的 `alpha` / `beta` 是示例条目，磁盘上已不存在）。
-      → **第二段（退役 + 客户端 + 发包）2026-11-18 执行后已整体回退**，原因见下：
-        · 当时的做法：升版 v0.5.0 → `--publish --yes`（smoke 通过）→ `bind migrate --apply --mcp-json` 退役旧令牌、
-          `mcp.json` 变 `["serve"]`。
-        · **回退理由（用户判定）**：P1b（T3/T4/T6~T9）尚未落地，发包等于把半成品推上 `current`；而且这一步
-          **根本不需要新包** —— 旧 exe 在没有 `--token` 时同样按 cwd 发现库，T10 只该改 `mcp.json`。
-        · 回退动作：`build_release --rollback --keep-db --yes`（exe 回 v0.4.1，库保持现状不还原，避免丢记录）→
-          `mcp.json` 的 humanity-memory 条目从 `mcp.json.bak-20261118-181613` 恢复为 `["--token", ".../active.token.json", "serve"]`
-          → `active.token.json` / `dev.token.json` 从 `.retired-20261118` 改名复位。
-          实测：`--token active.token.json` 启动 → workspace = project_island_back、24 工具、39 条经历。
-        · 保留不动：`registry.json`（10 libraries / 10 keys）与 10 份项目内 `token.json` —— 旧 exe 不读它们，无冲突。
-        · `v0.5.0` 产物目录仍在（半成品，**不要 `--promote`**）；`pyproject` 版本停在 0.5.0，下次发布沿用或再抬。
-      → **重新执行的条件**：P1b 全部完成（T3/T4/T6/T7/T8/T9）后，一次性做完「发包 + 退役旧令牌 + `mcp.json` 去 `--token`」，
-        不再分两次。届时命令仍是 `bind migrate --apply --mcp-json ~/.workbuddy/mcp.json`（去掉 `--keep-legacy-tokens`）。
-      → 顺带修了 `tools/build_release.py`：发版时**不再回填** `--token`，否则每次发版都会把这一步原样撤销。
+      → **第二段（退役 + 客户端 + 发包）2026-11-18 最终完成**，中间有一次回退，记录在案：
+        · 首次做法（已回退）：升版 v0.5.0 → `--publish` → 退役旧令牌、`mcp.json` 变 `["serve"]`。
+          **回退理由**：P1b 尚未落地，发包等于把半成品推上 `current`；而且这一步根本不需要新包
+          —— 旧 exe 在没有 `--token` 时同样按 cwd 发现库，T10 只该改 `mcp.json`。
+          回退动作：`--rollback --keep-db` + 恢复 `mcp.json` + 令牌改名复位。
+        · 重做（P1b 全部完成后）：升版 **v0.5.1** → `--publish --yes`（smoke：bind new → doctor → serve 全过）
+          → `bind migrate --apply --mcp-json` 退役 `active.token.json` / `dev.token.json`（改名留档）。
+          实测：`current`=v0.5.1、`mcp.json` 只有 `["serve"]`、已接入项目 29 工具 / 未接入目录 6 工具。
+      → 顺带修了 `tools/build_release.py`：发版不再回填 `--token`；smoke 改为先 `bind new` 造一个已接入沙箱
+        （A1 之后空目录跑 doctor 会被正确拒绝，老 smoke 的假设失效）。
       → 已知残留：`tools/switch_to_v4.py`（v4 一次性脚本）仍写 `--token`，重跑会改指源码入口，**别再跑**。
 
 ### P1b · 切换拒绝态（可以停在这里长期观察）
 
-- [ ] **T3** `paths.py`：`workspace_root` / `library_dir`（`workspace_dir` 留别名）；解析链改为"cwd 找含 `token.json` 的 `.ai_memory`"；删 `read/write_last_workspace`（`paths.py:54-80`）
-      → 验收：无令牌时不产生任何目录
-- [ ] **T4** `mcp_server.py`：七步校验 + §6 拒绝契约 + 拒绝态工具裁剪 + 删 `932` 自动建库分支 + 删 `916` last 兜底 + `_write_probe` 容错（C9）
-      → 验收：未接入时 18 个工具不注册；`bind_status` 返回 `code` + checklist
-- [ ] **T6** `memory_use_workspace` 重写（F2）：不 `create`、不 `ensure_rules`、先校验令牌、**按新库重载 `Config`**
-      → 验收：无令牌 → 拒绝 + 清单；切到共享库后读到该库的 `memory.toml`
-- [ ] **T7** 5 个 `bind_*` 工具（均支持 `workspace` 显式入参，供 boot 实例自救）
-      → 验收：`bind_status(workspace=…)` 能预检任意路径
-- [ ] **T8** `cli.py`：`bind new|existing|adopt|decline|move`、`bindings list`、`revoke`、`doctor`；删 `workspace use --with-embedding`
-      → 验收：拒绝态 CLI 返回与 MCP 同一份清单
-- [ ] **T9** `store.py`：`library_dir is None` 前置断言；清 `stats` 的 global 分支（S2）
-      → 验收：CLI 绕过被挡
+- [x] **T3** `paths.py`：`workspace_root` / `library_dir`（`workspace_dir` 留别名）；解析链改为"cwd 找含 `token.json` 的 `.ai_memory`"；删 `read/write_last_workspace`（`paths.py:54-80`）
+      → 验收：无令牌时不产生任何目录（2026-11-18 完成，`tests/test_paths.py` 10 项）
+      → 实现注记：①发现链默认**只认带令牌的** `.ai_memory`，`include_tokenless=True` 专供 `bind_status` 给 adopt 建议；
+        ②显式路径（`--workspace` / `HM_WORKSPACE`）不要求令牌 —— 那是运维出口，不是猜测；
+        ③`find_project_root` 与自动建库分支一并删除；④`config.peek_workspace_dir` 同步去掉 last-workspace 一步。
+- [x] **T4** `mcp_server.py`：七步校验 + §6 拒绝契约 + 拒绝态工具裁剪 + 删 `932` 自动建库分支 + 删 `916` last 兜底 + `_write_probe` 容错（C9）
+      → 验收：未接入时 18 个工具不注册；`bind_status` 返回 `code` + checklist（完成）
+      → 实现注记：校验落在 `bindings.resolve_session()`（七步，失败返回 code+reason+checklist，**不抛异常**）；
+        工具裁剪用「条件装饰器 + 延迟注册」：拒绝态只注册 6 个（5 个 bind_* + use_workspace），
+        绑定成功后 `activate()` 当场把 29 个挂上（R-11 自救不用重启客户端）；`_write_probe` 增补 bound/code/library。
+- [x] **T6** `memory_use_workspace` 重写（F2）：不 `create`、不 `ensure_rules`、先校验令牌、**按新库重载 `Config`**
+      → 验收：无令牌 → 拒绝 + 清单；切到共享库后读到该库的 `memory.toml`（完成，见 `test_library_level_config_follows_the_library`）
+- [x] **T7** 5 个 `bind_*` 工具（均支持 `workspace` 显式入参，供 boot 实例自救）
+      → 验收：`bind_status(workspace=…)` 能预检任意路径（完成）
+      → 实现注记：MCP 工具与 CLI 共用 `bindings.bind_new/adopt/existing/decline/move`，两边不再各写一份。
+- [x] **T8** `cli.py`：`bind new|existing|adopt|decline|move`、`bindings list`、`revoke`、`doctor`；删 `workspace use --with-embedding`
+      → 验收：拒绝态 CLI 返回与 MCP 同一份清单（完成）
+      → 实现注记：①`workspace use` 直接退役（它签的钥匙在 registry 里没有记录），只留 `show`；
+        ②`doctor` 先过准入，未接入时输出与 MCP 同形；③`init` 不再建库，未接入时给 bind 指引。
+- [x] **T9** `store.py`：`library_dir is None` 前置断言；清 `stats` 的 global 分支（S2）
+      → 验收：CLI 绕过被挡（断言在 `MemoryStore.__init__`，失败时连空库都不会被创建）
 
 ### P1c · 收尾
 
-- [ ] **T11** 存量工件：`dev.bat`（F1）、`README.md:163-231`（W2）、`operations.md:32-49`（W3）、`workspace-onboarding.md`（F4/S3/W4）
-- [ ] **T12** 测试：改 `test_config_layers.py` 层名（W1）；新增四态 / 跨项目被拒 / 撤销 / 拒绝态裁剪 / 库级配置共享 / boot 实例救援
-- [ ] **T13** 终验：§10.4 逐条 + 附录 A.1 凭据扫描 0 命中 + 双进程同开
+- [x] **T11** 存量工件：`dev.bat`（F1）、`README.md:163-231`（W2）、`operations.md:32-49`（W3）、`workspace-onboarding.md`（F4/S3/W4）
+      → 另同步：`SKILL.md`（一条配置服务多项目 / 拒绝态工具面）、`tools/build_release.py`（不再回填 `--token`；smoke 改为先 `bind new` 再 doctor）
+- [x] **T12** 测试：改 `test_config_layers.py` 层名（W1）；新增四态 / 跨项目被拒 / 撤销 / 拒绝态裁剪 / 库级配置共享 / boot 实例救援
+      → `tests/test_binding_lifecycle.py` 15 项 + `test_paths.py` 10 项；全量 **347 passed**
+- [x] **T13** 终验：§10.4 逐条 + 附录 A.1 凭据扫描 0 命中 + 双进程同开
+      → 2026-11-18 结果：布局回归逐字节一致（含"未接入零目录"）；拒绝态 6 工具 / 已接入 29 工具；
+        凭据扫描 10 库 595 条 **0 命中**；双进程同开两把 29 工具、A 写 B 立刻可见；
+        发布 **v0.5.1**（smoke：bind new → doctor → serve 握手全过）。
+
+### P2 · 共享绑定（2026-11-19 落地：island 组）
+
+**范围**：只有 `project_island` ↔ `project_island_back` 共库，其余 8 个继续自有库。
+"集中存放"只针对共享组 —— 自有库留在各自项目里是刻意的（删项目即删记忆、令牌跟着项目走）。
+
+| 项 | 结果 |
+| --- | --- |
+| 组库 | `<安装根>/libraries/island/workspace.db`（`…/HumanityMemory-Release/libraries/island`；从 `project_island_back` 搬出，**以它为准**） |
+| 并入 | `project_island` 令牌 `library=island`，读写都落到组库 |
+| 旧库 | `project_island/.ai_memory/workspace.db.merged-20261119`（60 知识 / 84 经历，用户决定**推翻重记**，文件留档不删） |
+| 信条 | 两边 `CORE_RULES.md` → `<项目>/.workbuddy/memory/信条.md`（库一共享，信条就不能再跟着库走） |
+| registry | 删 `project_island` / `project_island_back` 两个标签，新增 `island`；撤销 2 把旧钥匙 |
+| 备份 | `~/.humanity-memory/backups/pre-island-20261119-095639/`（registry + 两个库的活文件） |
+| 验收 | 两边 `resolve_session` 均 ok 且 `library_dir` 相同；back 写 → island 读得到；`bind migrate` 重跑 10 个全 `keep`（岛组显示 `shared`） |
+
+**四个坑（下次照做）**：
+
+1. **跨盘 `shutil.move` 实际是 copy + delete**（D: → C:），删除被沙箱转投回收站而失败时，
+   源文件会留在原地 —— 看起来像"移动成功但源还在"。迁移应显式做
+   `wal_checkpoint(TRUNCATE)` → 复制 → 校验 md5/条数 → 再处理源文件。
+2. **残留 MCP server 进程会一直握着旧库**：这次有 4 个 `python -m humanity_memory.mcp_server
+   --workspace <项目根>`（旧配置留下）把文件锁住，改名报 `WinError 32`。
+   迁移前必须先查 `Win32_Process` 并停掉，否则组库副本会与旧库继续分叉。
+3. **"库在共享组"不等于"空壳"**：本地没有 `workspace.db` 有两种含义。`bindings._inspect`
+   已加 `shared` 状态，避免迁移把共享组项目当成空壳、进而又给它登记一个本地库。
+4. **换落点要"先改 registry，再动文件"**：把组库从 `~/.humanity-memory/libraries` 搬到
+   安装根时，客户端顺手把 MCP server 拉起来、按 registry 里的**旧路径**又打开了旧库，
+   文件被占用、改名报 `WinError 32`。正确顺序：改 registry → 停相关进程 → 复制/校验 →
+   处理旧文件。反序的代价是旧库仍在被写入，组库副本会悄悄落后。
 
 ### 顺序依赖（不做就会踩）
 
