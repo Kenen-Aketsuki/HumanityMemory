@@ -1102,6 +1102,74 @@ def relocate(
     return plan
 
 
+# ---------------------------------------------------------------- 只读入口
+
+
+def resolve_readonly(
+    target: Path | str | None = None, *, rules_path: Path | str | None = None
+) -> Layout:
+    """只读工具的入口：**库目录 / .db 文件 / 项目根 / 令牌文件** 四种输入都认。
+
+    只读工具（星图、检索分析）不该被准入层挡死 —— 它们不改数据，
+    "只给库"（比如把一整个 `libraries/<label>` 目录拷过来离线看）和
+    "只给令牌"（换机器后还没 registry）都是合理用法。
+
+    严格准入仍然属于写路径：写操作走 `resolve_session`，这条捷径只给读。
+    """
+    if target is None or str(target).strip() == "":
+        session = resolve_session(None, rules_path=rules_path)
+        if session.ok and session.layout is not None:
+            return session.layout
+        raise BindingError(
+            session.code or "no_workspace", session.reason, checklist=session.checklist
+        )
+
+    path = Path(os.path.expandvars(str(target).strip().strip('"'))).expanduser()
+    if not path.exists():
+        raise BindingError("no_workspace", f"路径不存在：{path}")
+
+    def direct(lib: Path, root: Path | None = None) -> Layout:
+        return resolve_layout(
+            library_dir=lib, workspace_root=root, rules_path=rules_path, create=False
+        )
+
+    if path.is_file():
+        if path.suffix.lower() == ".db":
+            return direct(path.parent)
+        # 令牌文件：给了身份，库位置由 workspace 字段 + registry（或库根）决定
+        try:
+            token = Token.load(path)
+        except TokenError as exc:
+            raise BindingError(
+                exc.code, f"{path.name} 不是可用的令牌：{exc}"
+            ) from exc
+        session = resolve_session(token.workspace, rules_path=rules_path)
+        if session.ok and session.layout is not None:
+            return session.layout
+        if token.library:  # registry 不可用时的退路：按库根猜
+            cand = libraries_home() / token.library
+            if (cand / DB_NAME).is_file():
+                return direct(cand, token.workspace)
+        raise BindingError(
+            session.code or "token_bad", session.reason, checklist=session.checklist
+        )
+
+    # 目录：先当「库目录」看，再当「项目根 / .ai_memory」看
+    if path.name == WORKSPACE_DIR and (path / DB_NAME).is_file():
+        return direct(path, path.parent)
+    if (path / DB_NAME).is_file():
+        return direct(path)
+    session = resolve_session(path, rules_path=rules_path)
+    if session.ok and session.layout is not None:
+        return session.layout
+    legacy = path / WORKSPACE_DIR
+    if (legacy / DB_NAME).is_file():  # 库还在项目里的老布局
+        return direct(legacy, path)
+    raise BindingError(
+        session.code or "no_workspace", session.reason, checklist=session.checklist
+    )
+
+
 # ---------------------------------------------------------------- 默认退役清单
 
 

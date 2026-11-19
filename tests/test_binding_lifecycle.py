@@ -453,3 +453,100 @@ def test_relocate_is_idempotent(env: Path, monkeypatch: pytest.MonkeyPatch, tmp_
 
     assert again["relocated"] is False
     assert again["reason"] == "已在统一目录"
+
+
+# ---------------------------------------------------------------- 只读工具的入口
+
+
+def test_cli_layout_refuses_unbound_and_creates_nothing(
+    env: Path, tmp_path: Path
+) -> None:
+    """`_layout` 必须走准入层：否则 star map / 报告会在空目录里造一个空库。"""
+    import argparse
+
+    from humanity_memory import cli
+
+    lonely = tmp_path / "lonely"
+    lonely.mkdir()
+    args = argparse.Namespace(workspace=str(lonely), token=None, rules=None)
+
+    with pytest.raises(SystemExit) as exc:
+        cli._layout(args)
+
+    assert exc.value.code == 2
+    assert not (lonely / ".ai_memory").exists(), "拒绝态不许留下任何目录"
+
+
+def test_starmap_resolves_the_library_through_the_token(env: Path) -> None:
+    """拖项目根进来时，星图要能顺着令牌找到 libraries/<label>/workspace.db。"""
+    from humanity_memory import starmap
+
+    root = env / "alpha"
+    _project(root)
+    bindings.bind_adopt(root)
+
+    db, notes = starmap.resolve_db(root)
+
+    assert db.is_file()
+    assert db == root / ".ai_memory" / "workspace.db", "自有库仍按原路径命中"
+
+
+def test_starmap_accepts_a_relocated_library(
+    env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from humanity_memory import starmap
+
+    libs = tmp_path / "libs"
+    monkeypatch.setenv("HM_LIBRARIES", str(libs))
+    root = env / "alpha"
+    root.mkdir()
+    session = bindings.bind_new(root)
+    # 库里得先有文件：真实场景是第一次打开时建表
+    from humanity_memory.store import MemoryStore
+
+    MemoryStore(_cfg(env / "home", session.library_dir), session.layout).close()
+
+    db, notes = starmap.resolve_db(root)
+
+    assert db == libs / "alpha" / "workspace.db"
+    assert any("按令牌" in n for n in notes), notes
+
+# ---------------------------------------------------------------- 只读入口的四种输入
+
+
+def _readonly_fixture(env: Path, monkeypatch, tmp_path: Path):
+    libs = tmp_path / "libs"
+    monkeypatch.setenv("HM_LIBRARIES", str(libs))
+    root = env / "alpha"
+    root.mkdir()
+    session = bindings.bind_new(root)
+    from humanity_memory.store import MemoryStore
+
+    MemoryStore(_cfg(env / "home", session.library_dir), session.layout).close()
+    return root, session
+
+
+def test_readonly_accepts_library_dir(env: Path, monkeypatch, tmp_path: Path) -> None:
+    """只给库目录：离线看一份拷过来的库，不该要求令牌或 registry。"""
+    _, session = _readonly_fixture(env, monkeypatch, tmp_path)
+
+    layout = bindings.resolve_readonly(session.library_dir)
+
+    assert layout.library_dir == session.library_dir
+
+
+def test_readonly_accepts_token_file(env: Path, monkeypatch, tmp_path: Path) -> None:
+    """只给令牌：身份在文件里，库位置由 registry 给出。"""
+    root, session = _readonly_fixture(env, monkeypatch, tmp_path)
+
+    layout = bindings.resolve_readonly(token_path(root))
+
+    assert layout.library_dir == session.library_dir
+
+
+def test_readonly_accepts_db_file(env: Path, monkeypatch, tmp_path: Path) -> None:
+    _, session = _readonly_fixture(env, monkeypatch, tmp_path)
+
+    layout = bindings.resolve_readonly(session.library_dir / "workspace.db")
+
+    assert layout.library_dir == session.library_dir

@@ -14,7 +14,7 @@ from .models import Episode, Experience, Hit, LogEntry
 from .paths import Layout, resolve_layout
 from .store import MemoryStore, NotFound, ScopeError
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 __all__ = [
     "Config",

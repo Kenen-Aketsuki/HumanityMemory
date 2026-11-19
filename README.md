@@ -443,6 +443,11 @@ sh tools/hooks/install.sh                                  # 装 pre-commit 钩�
 
 误报时在那一行末尾加 `# pathguard:allow`，并在 review 时说明理由。
 
+> `starmap.bat` / `report.bat` 优先调用**发布版**（`<发布根>/current`），
+> 只有发布版不存在时才退回 `.venv`。所以改完源码这两个 bat **不会自动跟着变** ——
+> 要么先 `tools/build_release.py --publish`，要么删掉发布根让它退回源码态。
+> 判断当前跑的是哪一版：bat 第二行会打印 `Using: published (...)` 或 `source (...)`。
+
 ## 已知限制
 
 - **同步 SQLite**：并发写靠 WAL + `busy_timeout`，单机单 Agent 够用，高并发需外部串行化

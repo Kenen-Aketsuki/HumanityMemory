@@ -50,7 +50,28 @@ TOOLS = ROOT / "tools"
 ENTRY = TOOLS / "release_entry.py"
 PKG = SRC / "humanity_memory"
 APP_NAME = "humanity-memory"
-WORKSPACE_DB = ROOT / ".ai_memory" / "workspace.db"
+def workspace_db() -> Path | None:
+    """当前源码工作区对应的库文件。
+
+    2026-11-19 起库统一放在 `<安装根>/libraries/<label>`，仓库里只剩
+    `.ai_memory/token.json`。所以**不能**再假定 `<仓库>/.ai_memory/workspace.db` ——
+    那样会在每次发布时静默跳过库备份，回滚时就没有数据还原点。
+    """
+    legacy = ROOT / ".ai_memory" / "workspace.db"
+    if legacy.is_file():          # 老布局（库还在仓库里）
+        return legacy
+    try:
+        if str(SRC) not in sys.path:
+            sys.path.insert(0, str(SRC))
+        from humanity_memory import bindings  # noqa: PLC0415 - 延迟导入，避免构建期副作用
+
+        session = bindings.resolve_session(ROOT)
+        if session.ok and session.library_dir is not None:
+            candidate = session.library_dir / "workspace.db"
+            return candidate if candidate.is_file() else None
+    except Exception as exc:  # noqa: BLE001 - 解析失败只影响快照，不该中断发布
+        warn(f"解析库位置失败：{exc}")
+    return None
 
 CURRENT_LINK = RELEASE / "current"
 CURRENT_TXT = RELEASE / "current.txt"
@@ -228,13 +249,14 @@ def restore_workspace(backup: Path, dest: Path) -> Path:
 
 
 def backup_workspace(version: str) -> Path | None:
-    if not WORKSPACE_DB.is_file():
-        warn(f"没找到 {WORKSPACE_DB}，跳过库备份（只影响回滚时的数据还原）")
+    source = workspace_db()
+    if source is None:
+        warn("没找到工作区的库文件（令牌未接入？），跳过库备份（只影响回滚时的数据还原）")
         return None
     BACKUPS.mkdir(parents=True, exist_ok=True)
     dest = BACKUPS / f"workspace.pre-v{version}.db"
     try:
-        src = sqlite3.connect(f"file:{WORKSPACE_DB.as_posix()}?mode=ro", uri=True, timeout=10.0)
+        src = sqlite3.connect(f"file:{source.as_posix()}?mode=ro", uri=True, timeout=10.0)
         dst = sqlite3.connect(str(dest))
         try:
             src.backup(dst)
@@ -791,7 +813,7 @@ def cmd_rollback(args: argparse.Namespace) -> int:
         backup = None
         say("  --keep-db：只退 exe，库保持现状（新版本写入的数据会成为孤儿字段）")
     elif backup and backup.is_file():
-        now_counts = db_counts(WORKSPACE_DB)
+        now_counts = db_counts(workspace_db())
         lost = db_counts(backup)
         loss = {k: now_counts.get(k, 0) - lost.get(k, 0) for k in set(now_counts) | set(lost)}
         say(f"  库快照 {backup.name}：回滚后这些写入会丢 {loss}")
@@ -800,11 +822,12 @@ def cmd_rollback(args: argparse.Namespace) -> int:
         say("  已取消")
         return 0
 
-    if backup and backup.is_file() and WORKSPACE_DB.is_file():
+    target_db = workspace_db()
+    if backup and backup.is_file() and target_db is not None:
         try:
-            safety = restore_workspace(backup, WORKSPACE_DB)
+            safety = restore_workspace(backup, target_db)
             say(f"  库已还原（回滚前的状态留档 {safety.name}）")
-            after = db_counts(WORKSPACE_DB)
+            after = db_counts(target_db)
             say(f"  还原后条数 {after}")
         except (sqlite3.Error, OSError) as exc:
             die(

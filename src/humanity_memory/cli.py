@@ -53,19 +53,47 @@ def _human(n: int) -> str:
 
 
 def _layout(args: argparse.Namespace | None = None):
+    """解析库布局：**一律走准入层**（令牌 + registry），不再按路径猜。
+
+    2026-11-19 起库统一放在 `<安装根>/libraries/<label>`，`<项目>/.ai_memory`
+    里只剩 `token.json`。如果这里还按路径解析，拿到的是一个"没有库的目录"，
+    `MemoryStore` 一打开就在那儿造一个空库 —— 星图 / 报告看到的就是
+    「有 token 没库」，而写进去的东西也没人知道跑哪去了。
+    """
+    from . import bindings
+
     token_arg = getattr(args, "token", None)
+    hint = getattr(args, "workspace", None)
     if token_arg:
-        token = Token.load(resolve_token_path(token_arg))
-        return resolve_layout(token.workspace)
-    return resolve_layout(
-        getattr(args, "workspace", None),
-        rules_path=getattr(args, "rules", None),
-    )
+        try:
+            hint = str(Token.load(resolve_token_path(token_arg)).workspace)
+        except TokenError as exc:
+            _dump({"ok": False, "code": exc.code, "error": str(exc)})
+            raise SystemExit(2) from exc
+
+    session = bindings.resolve_session(hint, rules_path=getattr(args, "rules", None))
+    if not session.ok or session.layout is None:
+        # 拒绝也是正常结果：把同一份 code + 清单打出来，交给用户照做
+        _dump(session.to_json())
+        raise SystemExit(2)
+    return session.layout
 
 
 def _open(args: argparse.Namespace | None = None) -> MemoryStore:
     layout = _layout(args)
     return MemoryStore(Config.load(library_dir=layout.workspace_dir), layout)
+
+
+def _open_readonly(args: argparse.Namespace | None = None) -> MemoryStore:
+    """只读工具的打开方式：库目录 / .db / 令牌文件 都认，不要求 registry。
+
+    只读工具不该因为"这台机器还没接入"就打不开一份别人拷过来的库。
+    """
+    from . import bindings
+
+    target = getattr(args, "workspace", None) or getattr(args, "token", None)
+    layout = bindings.resolve_readonly(target)
+    return MemoryStore(Config.load(library_dir=layout.library_dir), layout)
 
 
 # ---------------------------------------------------------------- 命令
@@ -996,12 +1024,18 @@ def cmd_retrieval_report(args: argparse.Namespace) -> int:
         read_node_activity,
         read_retrievals,
     )
+    from . import bindings
     from .retrieval_view import render_retrieval_html
 
-    with _open(args) as store:
+    try:
+        store = _open_readonly(args)
+    except bindings.BindingError as exc:
+        _dump(exc.to_json())
+        return 2
+    with store:
         workspace = store.layout.workspace_dir
         if workspace is None:
-            print("错误：当前目录没有 .ai_memory 工作区", file=sys.stderr)
+            print("错误：没有解析到记忆库", file=sys.stderr)
             return 2
 
         records = read_retrievals(workspace, store.cfg, days=args.days)

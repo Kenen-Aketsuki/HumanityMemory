@@ -4,7 +4,16 @@ setlocal
 
 rem ---------------------------------------------------------------------------
 rem  Double-click to build and open the retrieval analysis page.
-rem  Drag a project folder onto it to analyse that workspace instead of the cwd.
+rem  Drag onto it (any of these works, it is read-only):
+rem    - a project folder          (library resolved through its token)
+rem    - a library folder          <install>\libraries\<label>
+rem    - a .ai_memory\token.json  (library resolved from the token)
+rem    - a workspace.db file
+rem  An unbound folder is refused with a code + checklist instead of being
+rem  silently turned into an empty database.
+rem
+rem  Since 2026-11-19 libraries live under <install>\libraries\<label>; the
+rem  project only holds the token.
 rem
 rem  Release root lives OUTSIDE the project on purpose: the host sandbox blocks
 rem  processes started inside the workspace from writing outside it.

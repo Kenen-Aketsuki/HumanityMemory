@@ -30,10 +30,15 @@ set "OUT=%HM_STARMAP_OUT%"
 
 if "%~1"=="" (
   echo.
-  echo  Drag a folder onto this bat file to draw its memory starmap:
-  echo    - the .ai_memory folder with workspace.db
-  echo    - or the project root folder
+  echo  Drag a folder or file onto this bat file to draw its memory starmap:
+  echo    - the project root folder            ^(token.json lives here^)
+  echo    - the library folder under   ^<install^>\libraries^\^<label^>
+  echo    - the .ai_memory\token.json file     ^(read-only: library resolved from it^)
   echo    - or the workspace.db file itself
+  echo.
+  echo  Since 2026-11-19 libraries are not kept inside projects: the project
+  echo  only holds .ai_memory\token.json. Read-only tools accept any of the
+  echo  four forms above and never need the registry.
   echo.
   echo  Read-only. No database is created or modified.
   echo.
