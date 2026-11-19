@@ -385,39 +385,52 @@ v1 在这里有「未命中 → 扫 `keys/` 比内容救回」的兜底，**A2 �
   拒绝态传 `NO_LIBRARY` 哨兵（只装配前三层），`None` 仍表示"自动猜"；
   `peek_workspace_dir` 仍用于"还没绑定时猜配置"。
 
-### 5.8 磁盘布局（两张图看懂）
+### 5.8 磁盘布局（2026-11-19 起：库全部统一存放）
 
 ```
-① 自有库                                     ② 共享（A、B → island）
-D:/work/A/                              D:/work/A/
-└─ .ai_memory/                               └─ .ai_memory/
-   ├─ token.json    {"library":"A"}             └─ token.json   {"library":"island"}
-   ├─ memory.toml   （库级配置）              D:/work/B/
-   ├─ CORE_RULES.md （信条，跟着项目走）        └─ .ai_memory/
-   └─ workspace.db                                └─ token.json {"library":"island"}
-                                             <安装根>/libraries/island/   ← 不放用户目录
-                                                ├─ memory.toml   （A、B 共用这份）
-                                                └─ workspace.db  （A、B 共用这个库）
+① 自有库（A 独占一份）                        ② 共享（A、B → island）
+D:/work/A/                                   D:/work/A/
+└─ .ai_memory/                                 └─ .ai_memory/
+   └─ token.json  {"library":"A"}                 └─ token.json  {"library":"island"}
+   └─ .workbuddy/memory/信条.md                   └─ .workbuddy/memory/信条.md
+                                              D:/work/B/
+<安装根>/libraries/A/                            └─ .ai_memory/
+   ├─ memory.toml   （库级配置）                       └─ token.json {"library":"island"}
+   ├─ workspace.db  （就是记忆本体）
+   ├─ reports/ retrieval/  （派生产物，跟库走）  <安装根>/libraries/island/
+   └─ CORE_RULES.bak / *.bak-*  （库自己的备份）     ├─ memory.toml   （A、B 共用）
+                                                 ├─ workspace.db  （A、B 共用这个库）
+                                                 └─ reports/ retrieval/ archive/
 
 信条永远在项目里：A、B 各自的 .workbuddy/memory/信条.md 各自生效。
 ```
 
-### 5.9 组库放哪：跟着安装走（`libraries_home()`）
+**统一存放的三条理由**：
 
-组库**不放用户目录**。解析顺序：
+1. 库是 MB 级二进制，躺在项目里迟早被 `git add -A` 卷走（R-7b 那一串坑的根源）；
+2. 项目备份 / 打包 / 分享不该捎带记忆；
+3. 反过来 —— 删项目不该连记忆一起删。**代价要记住**：删库必须显式去
+   `<安装根>/libraries/<label>/` 操作，项目里的 `.ai_memory/` 只是一张"身份卡"。
+
+项目里只剩：`.ai_memory/token.json`、`.workbuddy/memory/信条.md`。
+（`bind relocate` 留下的 `_moved-<日期>/` 是搬迁时的旧文件暂存，确认后由人手动清。）
+
+### 5.9 库放哪：统一在 `<安装根>/libraries/<label>`
+
+`libraries_home()` 的解析顺序：
 
 1. `HM_LIBRARIES`（`.env` 或环境变量，两种运行模式用它对齐）；
 2. `<安装根>/libraries/` —— 安装根 = `.env` 所在目录：冻结态是发布根
    （`…/HumanityMemory-Release`），源码态是仓库根；
 3. 兜底 `~/.humanity-memory/libraries`（前两条都拿不到才会用到）。
 
-理由是两类东西的心智模型不同：**registry / 信条 / 诊断是配置与索引**（几十 KB），
-跟着用户走；**库是实体数据**（MB 级），跟着安装走。混在一起最直接的后果是
-C 盘悄悄攒下几十 MB，而升级 / 回滚时没人会想到去那儿找。
+放置原则：**配置跟用户走、数据跟安装走**。registry / 信条 / 诊断是配置与索引（几十 KB），
+留在用户目录；库是实体数据（MB 级），跟着安装。混在一起最直接的后果是 C 盘悄悄攒下
+几十 MB，而升级 / 回滚时没人会想到去那儿找。
 
-> 本机取值为**发布根下的 `libraries/`**（两份 `.env` 都写了
-> `HM_LIBRARIES`，保证源码态与冻结态指向同一处）。`doctor` 输出里的 `libraries_home`
-> 就是这个值；`bind migrate` 不参与它的决定 —— 库的真实位置永远以 registry 为准。
+`bind new` 直接把新库建在 `libraries/*`；遗留的「库在项目里」用 `bind relocate` 搬
+（幂等：已在统一目录就返回 `relocated: false`）。`doctor` 输出里的 `libraries_home`
+就是这个根，`bind migrate` 不参与决定 —— 库的真实位置永远以 registry 为准。
 
 ---
 
@@ -471,6 +484,12 @@ C 盘悄悄攒下几十 MB，而升级 / 回滚时没人会想到去那儿找。
 **必须保留**。原因不是"方便"，而是 §3.4 那个坑没消失：boot 实例的 cwd 可能是
 `~/.humanity-memory`，而 `serverName` 作用域唯一、会话实例不会再 spawn。
 如果未接入态连救援工具都关掉，`no_workspace` 会让**整个会话**没有任何记忆能力，agent 也无法自救。
+
+> **在客户端里的表现**：工具列表只剩 6 个（下面 5 个 `memory_bind_*` + `memory_use_workspace`），
+> 记忆读写工具全部消失。这是拒绝态的正常形态，不是安装坏了 ——
+> 先 `memory_bind_status` 看 `code`，再按清单处理。实测最常见的是
+> `no_workspace`（客户端拿应用安装目录当 cwd 起了 boot 实例），
+> 用 `memory_use_workspace(path=…)` 一步恢复。
 
 | 工具 | 未接入态行为 |
 | --- | --- |

@@ -25,15 +25,20 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from . import keys
+from .config import libraries_home
 from .paths import (
+    CONVENTIONAL_RULES,
+    RULES_FILE,
     WORKSPACE_DIR,
     Layout,
     find_workspace_root,
@@ -42,8 +47,8 @@ from .paths import (
 )
 from .token import Token, TokenError, build_token, same_path, token_path
 
-WORKSPACE_DIR = ".ai_memory"
 DB_NAME = "workspace.db"
+MEMORY_TOML = "memory.toml"
 
 # 扫描时直接跳过的目录：它们下面不可能有项目根，进去只会拖慢整轮迁移
 _SKIP_DIRS = {
@@ -825,15 +830,21 @@ def _settle(root: Path) -> Session:
 def bind_new(
     workspace: Path | str, label: str | None = None, *, registry_path: Path | str | None = None
 ) -> Session:
-    """新建独立库。建目录是**显式动作** —— 只有这条路径允许创建 `.ai_memory`。"""
+    """新建独立库。库落在 `<安装根>/libraries/<label>`，项目里只留令牌锚点。
+
+    统一存放的理由：库跟着安装走、项目里只放"身份"。这样项目备份 / 分享 / 提交
+    都不会捎带 MB 级二进制；删项目也不会连记忆一起删（要删库就显式删 libraries 下那份）。
+    """
     root = _root_of(workspace)
     name = (label or slug(root.name)).strip()
     if not _label_ok(name):
         raise BindingError(
             "library_conflict", f"标签 `{name}` 不合法：只允许小写字母、数字、下划线"
         )
-    lib_dir = root / WORKSPACE_DIR
+    lib_dir = libraries_home() / name
     lib_dir.mkdir(parents=True, exist_ok=True)
+    # `.ai_memory` 退化为「身份锚点」：只放 token.json，不再放库
+    (root / WORKSPACE_DIR).mkdir(parents=True, exist_ok=True)
     try:
         with keys.edit(registry_path) as registry:
             existing = registry.library(name)
@@ -972,6 +983,123 @@ def bind_move(
     token.workspace = new_root
     token.save()
     return moved
+
+
+# ---------------------------------------------------------------- 统一存放
+
+
+def relocate(
+    workspace: Path | str,
+    *,
+    registry_path: Path | str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """把「库在项目里」的自有库搬到统一目录 `<安装根>/libraries/<label>`。
+
+    为什么不再把库放在 `<项目>/.ai_memory`：
+      · 库是 MB 级二进制，躺在仓库里迟早被 `git add -A` 卷走（R-7b 一路的坑）；
+      · 项目备份 / 打包 / 分享都会捎带它；
+      · 反过来，删项目时记忆也跟着没了 —— 数据比代码更该活得久一点。
+
+    搬完项目里只留 `.ai_memory/token.json`（身份锚点）；旧文件不删，
+    归到 `.ai_memory/_moved-<日期>/`，确认无误后由人手动清。
+    """
+    root = _root_of(workspace)
+    session = resolve_session(root)
+    if not session.ok:
+        raise BindingError(
+            session.code or "token_bad", session.reason, checklist=session.checklist
+        )
+    label = session.record.library
+    old = session.library_dir
+    target = libraries_home() / label
+
+    if old is not None and same_path(old, target):
+        return {
+            "ok": True, "relocated": False, "library": label,
+            "path": str(target), "reason": "已在统一目录",
+        }
+    if old is None or not (old / DB_NAME).is_file():
+        raise BindingError(
+            "library_missing", f"{old} 下没有 workspace.db，无从搬运"
+        )
+    if (target / DB_NAME).is_file():
+        raise BindingError(
+            "library_conflict",
+            f"目标已存在库文件：{target / DB_NAME}\n先确认哪份是准的，不要覆盖。",
+        )
+
+    before = _counts(old / DB_NAME)
+    attachments = [
+        name for name in ("reports", "retrieval", "archive", MEMORY_TOML)
+        if (old / name).exists()
+    ]
+    plan = {
+        "ok": True, "relocated": True, "library": label,
+        "from": str(old), "to": str(target),
+        "counts": before, "attachments": attachments,
+    }
+    if dry_run:
+        return plan
+
+    # 先把 WAL 合进主库，保证复制出来的是一份自包含的库
+    con = sqlite3.connect(str(old / DB_NAME))
+    try:
+        con.execute("pragma wal_checkpoint(TRUNCATE)")
+    finally:
+        con.close()
+
+    target.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", "-wal", "-shm"):
+        src = old / f"workspace.db{suffix}"
+        if src.is_file():
+            shutil.copy2(src, target / f"workspace.db{suffix}")
+    for name in attachments:
+        src, dst = old / name, target / name
+        if src.is_dir():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+
+    after = _counts(target / DB_NAME)
+    if after != before:
+        raise BindingError(
+            "library_missing",
+            f"复制校验失败：源 {before} ≠ 目标 {after}\n目标目录保留原样，请人工检查。",
+        )
+
+    try:
+        with keys.edit(registry_path) as registry:
+            registry.set_library(label, target, replace=True)
+    except keys.RegistryError as exc:
+        raise BindingError(exc.code, str(exc)) from exc
+
+    # 信条跟项目走：库目录一搬走，信条必须落地到项目里
+    rules_src = old / RULES_FILE
+    rules_dst = root / CONVENTIONAL_RULES
+    if rules_src.is_file() and not rules_dst.exists():
+        rules_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(rules_src), str(rules_dst))
+
+    # 旧文件归拢留档（不删）
+    stash = root / WORKSPACE_DIR / f"_moved-{time.strftime('%Y%m%d')}"
+    leftovers = [f"workspace.db{s}" for s in ("", "-wal", "-shm")] + attachments
+    for name in leftovers:
+        src = old / name
+        if not src.exists():
+            continue
+        stash.mkdir(parents=True, exist_ok=True)
+        src.rename(stash / name)
+
+    verify = resolve_session(root)
+    plan.update({
+        "ok": verify.ok,
+        "code": verify.code,
+        "library_dir": str(verify.library_dir) if verify.library_dir else None,
+        "stash": str(stash) if stash.is_dir() else None,
+        "rules": str(rules_dst) if rules_dst.is_file() else None,
+    })
+    return plan
 
 
 # ---------------------------------------------------------------- 默认退役清单

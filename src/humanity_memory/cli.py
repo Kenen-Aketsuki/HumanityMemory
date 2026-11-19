@@ -580,6 +580,8 @@ def cmd_bind(args: argparse.Namespace) -> int:
 
     if args.action == "migrate":
         return _bind_migrate(args)
+    if args.action == "relocate":
+        return _bind_relocate(args)
 
     root = Path(args.path).expanduser() if args.path else Path.cwd()
     _, single_label = _label_args(args.label)
@@ -684,6 +686,38 @@ def cmd_revoke(args: argparse.Namespace) -> int:
         }
     )
     return 0 if hits else 1
+
+
+def _bind_relocate(args: argparse.Namespace) -> int:
+    """把库从 `<项目>/.ai_memory` 搬到统一目录（幂等；已是统一目录则跳过）。"""
+    from . import bindings
+
+    if args.scan:
+        roots = []
+        for base in args.scan:          # --scan 是 append 型，可给多个根
+            b = Path(base).expanduser()
+            if not b.is_dir():
+                print(f"错误：扫描根不存在：{b}", file=sys.stderr)
+                return 2
+            roots += [
+                d for d in sorted(b.iterdir())
+                if d.is_dir() and (d / ".ai_memory").is_dir()
+            ]
+    else:
+        roots = [Path(args.path).expanduser() if args.path else Path.cwd()]
+
+    results: list[dict[str, Any]] = []
+    for root in roots:
+        try:
+            results.append(bindings.relocate(root, dry_run=not args.apply))
+        except bindings.BindingError as exc:
+            payload = exc.to_json()
+            payload["workspace_root"] = str(root)
+            results.append(payload)
+
+    ok = all(r.get("ok") for r in results)
+    _dump({"ok": ok, "applied": bool(args.apply), "count": len(results), "results": results})
+    return 0 if ok else 1
 
 
 def _bind_migrate(args: argparse.Namespace) -> int:
@@ -1258,10 +1292,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_ws.add_argument("--key", default=None, help="沿用指定的 key（默认沿用旧令牌或现签一个）")
     p_ws.set_defaults(func=cmd_workspace)
 
-    p_bind = sub.add_parser("bind", help="工作区绑定：new / existing / adopt / decline / move / migrate")
+    p_bind = sub.add_parser("bind", help="工作区绑定：new / existing / adopt / decline / move / relocate / migrate")
     p_bind.add_argument(
         "action",
-        choices=["migrate", "new", "existing", "adopt", "decline", "move"],
+        choices=["migrate", "new", "existing", "adopt", "decline", "move", "relocate"],
     )
     p_bind.add_argument(
         "path", nargs="?", default=None, help="项目根目录（默认 cwd；不要把 .ai_memory 传进来）"

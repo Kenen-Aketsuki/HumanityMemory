@@ -319,3 +319,137 @@ def test_bind_move_updates_token_and_registry(env: Path, tmp_path: Path) -> None
     assert moved["library"] == "old", "标签来自原目录名，搬家不改标签"
     registry = keys.read()
     assert registry.library_path("old") == new / ".ai_memory"
+
+
+# ---------------------------------------------------------------- 统一存放
+
+
+def test_bind_new_puts_the_library_outside_the_project(
+    env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """统一存放：项目里只留 `.ai_memory/token.json`，库落在 libraries/<label>。"""
+    libs = tmp_path / "libs"
+    monkeypatch.setenv("HM_LIBRARIES", str(libs))
+    root = env / "alpha"
+    root.mkdir()
+
+    session = bindings.bind_new(root)
+
+    assert session.ok
+    assert session.library_dir == libs / "alpha"
+    assert not (root / ".ai_memory" / "workspace.db").exists(), "项目里不该再有库"
+    assert (root / ".ai_memory" / "token.json").is_file(), "身份锚点还在"
+
+
+def test_relocate_moves_an_in_project_library(
+    env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = env / "legacy"
+    ws = _project(root)
+    (ws / "CORE_RULES.md").write_text("# 信条", encoding="utf-8")
+    bindings.bind_adopt(root)
+    from humanity_memory.store import MemoryStore
+
+    cfg = _cfg(env / "home", ws)
+    with MemoryStore(cfg, paths.resolve_layout(home=cfg.home, library_dir=ws, workspace_root=root)) as store:
+        store.write_memory("搬家前的知识")
+        store.append_log("搬家前的日志")
+
+    libs = tmp_path / "libs"
+    monkeypatch.setenv("HM_LIBRARIES", str(libs))
+    result = bindings.relocate(root)
+
+    assert result["relocated"] is True
+    assert result["ok"] is True
+    assert result["library_dir"] == str(libs / "legacy")
+    assert (libs / "legacy" / "workspace.db").is_file()
+    # 信条跟着项目走
+    assert (root / ".workbuddy" / "memory" / "信条.md").is_file()
+    # 旧文件不删，归到 _moved-<日期>/
+    assert any(p.name.startswith("_moved-") for p in ws.iterdir())
+    # 搬完仍可读，且内容没丢
+    session = bindings.resolve_session(root)
+    assert session.ok and session.library_dir == libs / "legacy"
+    cfg2 = _cfg(env / "home", session.library_dir)
+    with MemoryStore(cfg2, session.layout) as store2:
+        assert store2.search("搬家前") != []
+
+
+def test_relocate_is_idempotent(env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    libs = tmp_path / "libs"
+    monkeypatch.setenv("HM_LIBRARIES", str(libs))
+    root = env / "alpha"
+    root.mkdir()
+    bindings.bind_new(root)
+
+    again = bindings.relocate(root)
+
+    assert again["relocated"] is False
+    assert again["reason"] == "已在统一目录"
+
+
+# ---------------------------------------------------------------- 统一存放
+
+
+def test_bind_new_puts_the_library_outside_the_project(
+    env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """统一存放：项目里只留 `.ai_memory/token.json`，库落在 libraries/<label>。"""
+    libs = tmp_path / "libs"
+    monkeypatch.setenv("HM_LIBRARIES", str(libs))
+    root = env / "alpha"
+    root.mkdir()
+
+    session = bindings.bind_new(root)
+
+    assert session.ok
+    assert session.library_dir == libs / "alpha"
+    assert not (root / ".ai_memory" / "workspace.db").exists(), "项目里不该再有库"
+    assert (root / ".ai_memory" / "token.json").is_file(), "身份锚点还在"
+
+
+def test_relocate_moves_an_in_project_library(
+    env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = env / "legacy"
+    ws = _project(root)
+    (ws / "CORE_RULES.md").write_text("# 信条", encoding="utf-8")
+    bindings.bind_adopt(root)
+    from humanity_memory.store import MemoryStore
+
+    cfg = _cfg(env / "home", ws)
+    with MemoryStore(cfg, paths.resolve_layout(home=cfg.home, library_dir=ws, workspace_root=root)) as store:
+        store.write_memory("搬家前的知识")
+        store.append_log("搬家前的日志")
+
+    libs = tmp_path / "libs"
+    monkeypatch.setenv("HM_LIBRARIES", str(libs))
+    result = bindings.relocate(root)
+
+    assert result["relocated"] is True
+    assert result["ok"] is True
+    assert result["library_dir"] == str(libs / "legacy")
+    assert (libs / "legacy" / "workspace.db").is_file()
+    # 信条跟着项目走
+    assert (root / ".workbuddy" / "memory" / "信条.md").is_file()
+    # 旧文件不删，归到 _moved-<日期>/
+    assert any(p.name.startswith("_moved-") for p in ws.iterdir())
+    # 搬完仍可读，且内容没丢
+    session = bindings.resolve_session(root)
+    assert session.ok and session.library_dir == libs / "legacy"
+    cfg2 = _cfg(env / "home", session.library_dir)
+    with MemoryStore(cfg2, session.layout) as store2:
+        assert store2.search("搬家前") != []
+
+
+def test_relocate_is_idempotent(env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    libs = tmp_path / "libs"
+    monkeypatch.setenv("HM_LIBRARIES", str(libs))
+    root = env / "alpha"
+    root.mkdir()
+    bindings.bind_new(root)
+
+    again = bindings.relocate(root)
+
+    assert again["relocated"] is False
+    assert again["reason"] == "已在统一目录"

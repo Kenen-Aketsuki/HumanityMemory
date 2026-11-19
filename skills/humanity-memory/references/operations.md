@@ -3,16 +3,24 @@
 ## 存储布局
 
 ```
-<项目>/.ai_memory/
-├── workspace.db        # 项目库：experience + episodes + logs
-└── CORE_RULES.md       # 项目信条
+<安装根>/libraries/<label>/          # 库本体（2026-11-19 起统一存放）
+├── workspace.db        # 记忆库：experience + episodes + logs
+├── memory.toml         # 库级配置（可选，最高优先级）
+├── reports/ retrieval/ # 派生产物（judge 报告、检索缓存）
+└── *.bak-*             # 库自己的备份
+
+<项目>/.ai_memory/token.json         # 身份锚点：只说明"这个项目用哪个库"
+<项目>/.workbuddy/memory/信条.md     # 项目信条（跟着项目走，不跟库）
+<安装根>/.env                        # 配置唯一来源（含 HM_LIBRARIES）
 
 ~/.humanity-memory/
-├── CORE_RULES.md              # 全局信条（静态注入，仍然生效）
-└── global.db.retired-20261117 # 已退役的全局库（2026-11-17 关闭，见 design 文档 §8.2）
-
-<仓库根>/.env            # 配置唯一来源
+├── registry.json              # 库与钥匙的归属索引
+└── CORE_RULES.md              # 全局信条（静态注入，仍然生效）
 ```
+
+**项目之间物理隔离**：不同项目指向不同 label，互不可见（共享组除外）。
+**删库要显式去 `libraries/<label>/`** —— 删项目只删掉那张身份卡，库还在。
+换机器 / 重装时先备份 `libraries/`，它不在任何 git 仓库里。
 
 **`.env` 只认仓库根这一份**（`<仓库根>/.env`，由 `config.py` 相对源码自身位置
 定位，源码不含硬编码绝对路径）。不再读 `~/.humanity-memory/.env` 或 cwd 下的
@@ -113,6 +121,45 @@ humanity-memory doctor
 
 逐项检查扩展、FTS、**append-only 触发器是否安装**、schema 维度、embedding 探活、
 信条文件。任何一项失败退出码为 1。
+
+### 客户端里工具只剩 6 个（记忆相关全不见了）
+
+**这不是安装坏了，是拒绝态。** 未接入时 server 只注册
+`memory_bind_status` / `memory_bind_new` / `memory_bind_existing` /
+`memory_bind_adopt` / `memory_bind_decline` / `memory_use_workspace` 这 6 个，
+其余 24 个（读写、检索、复盘）**根本不注册** —— 模型看不到就不会误调，
+也就不会出现"agent 以为写入成功"这类事故。
+
+第一步永远是看 `code`，别猜：
+
+```
+memory_bind_status()            # 看当前会话
+memory_bind_status(workspace="<项目根>")   # 预检任意路径
+```
+
+| `code` | 含义 | 出路 |
+| --- | --- | --- |
+| `no_workspace` | 当前 cwd 不是任何项目 | 传项目根给 `bind_status`，再 `memory_use_workspace(path=…)` |
+| `no_token` | 是项目，但没接入 | `bind adopt` / `bind new` / `bind existing` |
+| `declined` | 该项目明确选了不接入 | 想改主意就 `bind new` / `bind existing` |
+| `library_missing` | 库目录不在（盘没挂载） | 挂载后重试，或 `bind existing` 换库 |
+| `token_*` / `key_*` | 令牌或钥匙对不上 | 重发令牌：`bind adopt` |
+
+**最常见的一种：`no_workspace` + cwd 是应用安装目录。**
+MCP 客户端偶尔会用「应用所在目录」而不是项目目录起一个 boot 实例
+（它的 cwd 与用户看到的会话无关），于是解析不到任何项目。
+这种情况下 server 本身没坏 —— 处理方式：
+
+```
+memory_use_workspace(path="D:/proj/YourProject")
+```
+
+它会**在同一进程内**校验令牌、切换库，并把 24 个工具当场挂上（返回里的
+`tools_registered` 就是挂载数量），不需要重启客户端。
+若客户端只是缓存了旧的 `tools/list`，刷新/重开会话也能好。
+
+判断"到底是不是拒绝态"的可靠办法：能调通 `memory_stats` 就说明完整工具面已注册；
+调不通（报 unknown tool）才是真的只剩 6 个。
 
 ### `logs 表是 append-only：禁止修改已写入的历史内容`
 

@@ -303,17 +303,23 @@ memory_use_workspace(path="D:/proj/YourProject")
 不接入时（未接入 / 已拒绝），记忆工具**不注册**，只剩
 `memory_bind_status` / `memory_bind_new` / `memory_bind_existing` /
 `memory_bind_adopt` / `memory_bind_decline` / `memory_use_workspace`。
-这时**先问用户**要哪种，再调对应工具——不要自己选，也不要在拒绝态下尝试写入。
+客户端里表现就是**工具列表只剩这 6 个** —— 正常形态，不是装坏了：
+先 `memory_bind_status` 看 `code`，`no_workspace` 就
+`memory_use_workspace(path="<项目根>")` 一步恢复（同一进程内挂满工具）。
+这时**先问用户**要哪种接入，再调对应工具——不要自己选，也不要在拒绝态下尝试写入。
 
 ## 存储布局
 
 ```
-<项目>/.ai_memory/workspace.db    # 项目记忆（物理隔离）
-<项目>/.ai_memory/CORE_RULES.md   # 项目信条
-~/.humanity-memory/CORE_RULES.md  # 全局信条（仍然生效，静态注入）
+<安装根>/libraries/<label>/workspace.db   # 记忆库（统一存放，物理隔离）
+<安装根>/libraries/<label>/memory.toml    # 库级配置（可选）
+<项目>/.ai_memory/token.json              # 身份锚点：这个项目用哪个库
+<项目>/.workbuddy/memory/信条.md          # 项目信条（跟着项目走）
+~/.humanity-memory/CORE_RULES.md          # 全局信条（仍然生效，静态注入）
 ```
 
 **项目之间物理隔离**，换个项目就看不到上一项目的记忆。没有例外了。
+库不在项目里 —— 删项目不会删记忆，删库要显式去 `libraries/<label>/`。
 
 **全局库已在 2026-11-17 关闭**（原 `global.db` 改名为 `global.db.retired-20261117`）：
 AI 自动写入的跨项目库会污染所有项目——在 A 项目看到一条"结论"，实际可能是 B 项目里

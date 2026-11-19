@@ -37,11 +37,13 @@ humanity-memory --workspace "<工作区根>" init   # 已接入：只补信条 +
 
 ### 库放哪
 
-- 默认放**工作区根**（`find_workspace_dir` 从 cwd 逐级向上找，子目录都能命中）。
-- git 根在工作区更内层时，把库放外层反而更省事：既覆盖全部子目录，又天然不在版本库里。
-- 若库**必然落在 git 仓库内**：先看 `.git/hooks/pre-commit` 是否已拦截 `.ai_memory/`；
-  再优先用 `.git/info/exclude`（本地忽略、不影响协作者）消掉 untracked 噪声，
-  多并行线共用的仓库尤其不要擅自改 `.gitignore`。
+- **统一放 `<安装根>/libraries/<label>/`**（`libraries_home()`：`HM_LIBRARIES` →
+  安装根/libraries → 用户目录兜底）。`bind new` 直接建在那儿，项目里只留 `token.json`。
+- 老项目若库还在 `<项目>/.ai_memory/workspace.db`，跑 `bind relocate <项目根> --apply`
+  搬过去；幂等，搬过的会返回 `relocated: false`。
+- **库不在 git 仓库里**，所以不需要 `.gitignore` / hook 去挡它了；
+  但反过来：删项目 ≠ 删记忆，清理库要显式去 `libraries/<label>/` 操作。
+- 换机器 / 重装前先备份 `libraries/` —— 它不在任何仓库、也没有云同步。
 
 ### 必跑的验证
 

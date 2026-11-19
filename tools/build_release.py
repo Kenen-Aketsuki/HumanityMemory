@@ -361,6 +361,9 @@ def smoke_env(tmp: Path) -> dict[str, str]:
         {
             "HM_WORKSPACE": str(tmp / "ws"),
             "HM_HOME": str(tmp / "home"),
+            # 库统一放在 <安装根>/libraries；smoke 必须把它指回沙箱，
+            # 否则每跑一次发布就会在生产库目录里留下一个 smoke 库。
+            "HM_LIBRARIES": str(tmp / "libs"),
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUTF8": "1",
         }
