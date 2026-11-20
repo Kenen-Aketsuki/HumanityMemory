@@ -6,7 +6,7 @@
 
 | 项 | 现状 |
 | --- | --- |
-| 版本 | `0.5.3`（库 schema `v4`） |
+| 版本 | `2.0`（库 schema `v5`；本地构建号形如 `2.0-local.N`，不跟 git） |
 | 运行环境 | Python ≥ 3.10；运行时依赖只有 `sqlite-vec` / `mcp` / `httpx`（3.10 另加 `tomli`） |
 | 记忆类型 | 经验 `experience` / 经历 `episode` / 日志 `log`，外加一层不进库的信条 |
 | 对外形态 | 29 个 MCP 工具 + 21 个 CLI 子命令 + 1 个 Skill |
@@ -592,7 +592,27 @@ python tools/build_release.py --status      # 当前版本、历史、备份、m
 python tools/build_release.py --publish     # 备份库 → 打包 → smoke
 python tools/build_release.py --promote     # 把 current 切到最新构建版本
 python tools/build_release.py --rollback    # 回上一版（exe + 库快照）
+python tools/build_release.py --prune --keep 2   # 清理旧版本，保留最近 2 个 + current
 ```
+
+**版本号分两层，打包不再改源码**：
+
+| 层 | 写在哪 | 谁改 | 进 git 吗 |
+| --- | --- | --- | --- |
+| 大版本（基线） | `pyproject.toml` 的 `version` 与 `__init__.py` 的 `_BASE_VERSION` | 只在源码大版本变化时手改 | 是 |
+| 本地构建序号 | `<发布根>/local_build.json` | `--publish` 每次自动 +1 | 否（发布根在项目树外） |
+
+所以日常微调直接 `--publish`，产物版本是 `2.0-local.3` 这种形式，`--version` / `doctor` /
+MCP initialize 报的都是它；源码一个字节都不动，工作区不会冒出「版本号没提交」的脏文件。
+版本号是打包时随包写进 `version.txt` 的（`__init__._packaged_version()` 读它，源码态读不到就回落基线）。
+
+基线变了（比如改成 `2.0`），序号自动从 `local.1` 重新数。要打一个不带本地后缀的纯净版本号
+（正式发版），显式指定：`--publish --target 2.0`。同版本重复构建用 `--force`，
+旧目录会被改名留档成 `v<版本>.stale-<时间戳>`。
+
+滚动发布**不会覆盖**旧目录，每个版本约 50MB（onedir 打包带了 Python 运行时和 sqlite-vec）。
+攒多了用 `--prune --keep N` 收拾：保留最近 N 个 + `current`，同时把对应条目从 `history.json`
+摘掉、配套库快照一起删；被进程占用的目录只 warn 跳过，不会因为一个删不掉就中途失败。
 
 `starmap.bat` / `report.bat` / `upgrade.bat` 优先调用**发布版**，只有发布版不存在时才退回 `.venv`，
 所以改完源码这三个 bat 不会自动跟着变 —— 要么先 `--publish`，要么删掉发布根让它退回源码态。

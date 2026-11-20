@@ -105,13 +105,31 @@ class WebSource:
         except OSError:
             return (0, 0)
 
-    def _db_sig(self) -> tuple[int, int]:
-        """库 + WAL/SHM：其他进程写入时 WAL 会变，签名跟着变。"""
+    def _db_sig(self) -> tuple[int, ...]:
+        """库（mtime/size）+ WAL 待落盘字节数。口径 =「数据或待落盘量变了吗」。
+
+        两个**必须排除**的量，它们会随「自己去读」而变，把只读观测变成刷新风暴：
+
+        1. `-shm`：WAL 的共享内存索引。没有别的连接常驻时，只读连接每取一次数
+           都要重新登记 read mark，其 mtime 必涨（NTFS 实测每次查询都涨）。
+        2. `-wal` 的存在性与 mtime：没有任何连接时，只读连接一关闭就会把空 WAL
+           删掉、下次打开又重建，mtime 一直翻。**大小**才是有效信息：缺失与
+           0 字节都表示「没有待落盘数据」，等价归一成 0。
+
+        漏不掉真实写入：提交必追加 WAL 帧（size 变），checkpoint 折回主库后
+        `.db` 的 mtime/size 变；clean close 时的 checkpoint 同样改 `.db`。
+        回归见 tests/test_webtool.py::test_signature_stable_across_reads。
+        """
         sig = self._stat_sig(self.db)
-        for suffix in ("-wal", "-shm"):
-            w = Path(str(self.db) + suffix)
-            sig += self._stat_sig(w)
+        sig += (self._wal_size(),)
         return sig
+
+    def _wal_size(self) -> int:
+        """WAL 待落盘字节数；文件不存在（或没有连接、已被清理）视为 0。"""
+        try:
+            return Path(str(self.db) + "-wal").stat().st_size
+        except OSError:
+            return 0
 
     def sig_starmap(self) -> str:
         return str(self._db_sig())

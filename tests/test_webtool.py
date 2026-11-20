@@ -65,7 +65,14 @@ def test_search_test_never_writes_library() -> None:
 
     def snap() -> dict:
         d: dict = {}
-        for p in list(lib.glob("workspace.db*")) + list(lib.glob("retrieval/*.jsonl")):
+        # 只比「真写入才会变」的量：主库 (mtime, size) + WAL 待落盘字节数。
+        # -shm 的 mtime 与 -wal 的存在性会被只读连接自己改动（登记 read mark、
+        # 最后一个连接关闭时清理空 WAL），放进来就是假阳性，测不出真写入。
+        st = (lib / "workspace.db").stat()
+        d["db"] = (st.st_mtime_ns, st.st_size)
+        wal = lib / "workspace.db-wal"
+        d["wal_bytes"] = wal.stat().st_size if wal.exists() else 0
+        for p in lib.glob("retrieval/*.jsonl"):
             st = p.stat()
             d[p.name] = (st.st_mtime_ns, st.st_size)
         con = sqlite3.connect(
@@ -532,3 +539,54 @@ def test_frontend_reports_heartbeat() -> None:
     assert "left>5?5000:1000" in compact, "失联倒计时缺少 5s/1s 分档节奏"
     assert "前端失联 · 后端将在" in html, "缺少失联倒计时文案"
     assert "stopLostCountdown()" in html, "心跳恢复后未撤销失联倒计时"
+
+
+# ---------------------------------------------------------------- 10. 状态签名不抖动
+
+
+def test_signature_stable_across_reads(tmp_path: Path) -> None:
+    """只读取数不得改变签名（读 ≠ 数据变了）。
+
+    回归：签名曾把 `workspace.db-shm` 算进去。WAL 的 shm 是共享内存索引，
+    没有别的连接常驻时，只读连接每查一次都要重新登记 read mark，文件 mtime
+    随之上涨 —— 于是「自己读一次」被判成「数据变了」：前端每 4s 一轮
+    「重载 iframe → /api/starmap 读库 → 签名又变 → 再重载」，星图整页重算，
+    视图缩放与拖拽位置每次被重置。
+
+    这里必须**先关掉写入端的连接**再建 WebSource：有常驻写连接时 shm 的
+    mtime 反而稳定（页已在映射里），那样测等于没测。关掉它复现的正是
+    「单开观测台看库」的现场。
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    proj = tmp_path / "proj"
+    (proj / ".ai_memory").mkdir(parents=True)
+    cfg = Config.load({"HM_HOME": str(home), "HM_EMBED_DIM": "8"})
+    layout = resolve_layout(proj, home=cfg.home)
+    store = MemoryStore(cfg, layout)
+    try:
+        store.write_memory("签名不抖动的被测记忆", importance=0.5)
+    finally:
+        store.close()
+
+    src = WebSource(layout.library_dir)
+    before = (src.sig_starmap(), src.sig_review())
+    for _ in range(3):
+        conn = src.connect()
+        try:
+            conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()
+            conn.execute("SELECT COUNT(*) FROM episodes").fetchone()
+        finally:
+            conn.close()
+    assert (src.sig_starmap(), src.sig_review()) == before, (
+        "只读查询改变了签名：前端会把『自己在读』当成『数据变了』，陷入循环重载"
+    )
+
+
+def test_signature_changes_on_real_write(lib) -> None:
+    """真实写入必须改变签名 —— 去掉 shm 不能顺手把「实时刷新」也修掉。"""
+    store, libdir = lib
+    src = WebSource(libdir)
+    before = src.sig_starmap()
+    store.write_memory("签名必须跟着真实写入变化", importance=0.5)
+    assert src.sig_starmap() != before, "库真的变了签名却没变：前端将不再自动刷新"

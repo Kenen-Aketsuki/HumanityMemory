@@ -349,10 +349,10 @@ POST /api/search-test  {"query": "...", "limit": 8, "kinds": null}
 
 | 数据源 | 签名输入 |
 | --- | --- |
-| starmap | `workspace.db` 的 `(mtime_ns, size)` + WAL 文件存在性/大小 |
+| starmap | `workspace.db` 的 `(mtime_ns, size)` + WAL 待落盘字节数（缺失按 0） |
 | recall | `retrieval/` 下所有 `*.jsonl` 的 `(name, mtime_ns, size)` 汇总 |
-| review（复盘记录） | `reports/judge/` 下 `*.json` 的最大 mtime + 文件数 + 库 mtime（新增/顶替取自库） |
-| memory（记忆现状） | 库 mtime + **当前分钟的 unix 时间戳**（倒计时会随时间走，不能只靠库 mtime） |
+| review（复盘记录） | `reports/judge/` 下 `*.json` 的最大 mtime + 文件数 + 库签名（新增/顶替取自库） |
+| memory（记忆现状） | 库签名 + **当前分钟的 unix 时间戳**（倒计时会随时间走，不能只靠库 mtime） |
 
 前端每 4 秒请求 `/api/status`，与上次签名比对：**哪个变了就只重拉哪个视图**，
 并在界面角落显示"最后刷新"时间。这样既不缓存陈旧快照，又避免无谓重建星图
@@ -362,7 +362,13 @@ POST /api/search-test  {"query": "...", "limit": 8, "kinds": null}
 
 - 后端**不做内存缓存**，每个 API 请求现读现算 —— 天然跟进库状态；
 - 若某数据源被删空（如检索日志被清理），签名变化触发前端清空该视图并显示空状态；
-- 若库正被其他进程写入（WAL 变化），签名会跟着变，前端自动刷新。
+- 若库正被其他进程写入（WAL 变化），签名会跟着变，前端自动刷新；
+- **签名只能取样「真写入才会变」的量**：`-shm` 的 mtime 与 `-wal` 的存在性/mtime
+  都会被只读连接自己改动（登记 read mark；最后一个连接关闭时空 WAL 被清理），
+  一旦入签名，观测台「自己在读」就会被判成「数据变了」，前端 4s 一轮重载 iframe、
+  星图整页重算且视角丢失。回归：
+  `tests/test_webtool.py::test_signature_stable_across_reads`。同理，只读断言的快照
+  也只比 `.db` 的 `(mtime, size)` 与 WAL 字节数，不把 `-shm` 算进去。
 
 ### 8.1 心跳探活与自动退出
 
@@ -435,8 +441,9 @@ POST /api/search-test  {"query": "...", "limit": 8, "kinds": null}
 1. **纯函数契约**：`build_graph_payload` 的输出与旧 `run()` 写出的 graph 结构一致；
    `/api/recall` 的 records/meta 与 `cmd_retrieval_report` 塞进 HTML 的 DATA 一致。
 2. **只读断言（硬性）**：search-test 调用前后对库目录做快照
-   （`workspace.db` + `-wal` + `-shm` 的 mtime/size、`retrieval/*.jsonl` 行数、
-   `activity` 列抽样值），三者全部不变才算通过。
+   （`.db` 的 `(mtime, size)`、WAL 待落盘字节数、`retrieval/*.jsonl` 的
+   `(mtime, size)`、`activity` 列抽样值），三者全部不变才算通过。快照**不比**
+   `-shm` 的 mtime / `-wal` 的存在性 —— 它们会被只读连接自身改动（§8）。
 3. **空数据源**：无 `retrieval/`、无 `reports/judge/` 的库（lilith）各端点返回空结构而非 500。
 4. **中文路径**：用带中文/空格的库目录验证 `mode=ro + quote(as_posix)` 取数正常。
 5. **实时刷新**：模拟新增一条 JSONL 记录，验证 `/api/status` 签名变化、前端触发重拉。
