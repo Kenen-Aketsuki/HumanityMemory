@@ -1,37 +1,22 @@
-"""记忆的生命周期：时间衰减、访问强化、综合打分。
+"""记忆的生命周期：等级裁定、综合打分、归档判据。
 
 设计取舍
 --------
-库里 `memories.strength` 存的是**最后一次被触碰时的强度**，不是当前强度。
-真实强度必须实时算：它随「距离上次访问的时间」按半衰期指数衰减。
-这样写入/强化只需要一次 UPDATE，读取时零写放大。
+排序的第三项是**遗忘等级**，不是「强度」。旧方案用半衰期衰减 + 访问频次算一个
+0~1 的 strength，问题在于它把两件事混在一个数里：内容多久没被碰（衰减）和
+被碰过几次（频次）。等级把这件事拆干净了 —— 一个周期裁定一次，只动一级，
+而且三个月后能回答「它为什么在这一级」。
+
+`decay` / `lifecycle_strength` / `usage_factor` 已随旧方案删除；
+半衰期配置也从 TOML 里撤了，它没有消费者。
 """
 
 from __future__ import annotations
 
-import math
-from typing import Sequence
+from dataclasses import dataclass
+from typing import Any, Mapping, Sequence
 
 DAY_MS = 86_400_000.0
-
-
-def decay(strength: float, elapsed_ms: float, halflife_days: float) -> float:
-    """指数衰减：经过 halflife_days 后强度减半。"""
-    if strength <= 0 or halflife_days <= 0:
-        return 0.0
-    days = max(0.0, elapsed_ms) / DAY_MS
-    return strength * math.pow(0.5, days / halflife_days)
-
-
-def current_strength(
-    strength: float,
-    last_touch_ms: int | None,
-    now_ms: int,
-    halflife_days: float,
-) -> float:
-    if last_touch_ms is None:
-        return strength
-    return decay(strength, now_ms - last_touch_ms, halflife_days)
 
 
 def reinforce(strength: float, boost: float = 0.20) -> float:
@@ -49,50 +34,18 @@ def combine_score(
     *,
     retrieval: float,
     importance: float,
-    strength: float,
+    level: float,
     w_retrieval: float,
     w_importance: float,
-    w_strength: float,
+    w_level: float,
 ) -> float:
-    total = w_retrieval + w_importance + w_strength
+    """三项加权。`level` 传的是 `level_factor()` 的结果（0~1 倍率），不是等级本身。"""
+    total = w_retrieval + w_importance + w_level
     if total <= 0:
         return 0.0
     return (
-        w_retrieval * retrieval + w_importance * importance + w_strength * strength
+        w_retrieval * retrieval + w_importance * importance + w_level * level
     ) / total
-
-
-def usage_factor(access_count: int, cap: int = 20) -> float:
-    """「用进废退」的进。
-
-    从未被召回也有 0.5 的底分 —— 新写入的内容不该因为"还没被用过"而被惩罚；
-    之后随召回次数对数增长，很快饱和到 1.0。
-    """
-    if access_count <= 0:
-        return 0.5
-    return 0.5 + 0.5 * min(1.0, math.log1p(access_count) / math.log1p(cap))
-
-
-def recency_factor(age_ms: float, halflife_days: float) -> float:
-    return decay(1.0, age_ms, halflife_days)
-
-
-def lifecycle_strength(
-    created_ms: int,
-    access_count: int,
-    now_ms: int,
-    halflife_days: float,
-    *,
-    recency_weight: float = 0.55,
-) -> float:
-    """综合新鲜度与使用频次，得到一个 0~1 的强度。
-
-    事实的 halflife 极长，recency 近乎恒定，强度几乎只由使用频次决定 ——
-    这正是「事实不遗忘、但常用的更容易浮上来」的期望行为。
-    """
-    recency = recency_factor(max(0, now_ms - created_ms), halflife_days)
-    usage = usage_factor(access_count)
-    return recency_weight * recency + (1.0 - recency_weight) * usage
 
 
 def archive_decision(
@@ -102,99 +55,23 @@ def archive_decision(
     now_ms: int,
     ttl_days: float,
     max_access: int,
-    *,
-    verified_ms: int | None = None,
-    access_extends: bool = True,
 ) -> tuple[bool, str]:
-    """判断一条记忆该不该归档（**现状已不走这里，见 state_review_status**）。
+    """判断一条记忆该不该归档。
 
-    为什么不用 strength 阈值：`usage_factor` 有 0.5 底分（新内容不该被惩罚），
-    导致再冷的条目强度也跌不到 0，拿绝对阈值归档会永远不触发。
+    为什么不用「分数低于阈值」：任何把新鲜度卷进分数的方案都有一个下限
+    （新内容不该被惩罚），结果再冷的条目也跌不到 0，拿绝对阈值归档永远不触发。
     改用两个显性条件 —— 「多久没被碰过」+「被访问过几次」，更好解释也好调。
-
-    `access_extends=False` 是 state 从前的用法（被检索到不算续命）。现状改用
-    复核梯子与宽限期后由 `state_review_status` 独立判定，这里的开关只为兼容保留。
 
     归档是**可逆的**：只置 archived_at，默认检索不到，内容一行不动。
     """
-    if access_extends:
-        touch = last_access_ms if last_access_ms is not None else created_ms
-    else:
-        touch = max(created_ms, verified_ms or 0)
+    touch = last_access_ms if last_access_ms is not None else created_ms
     age_days = max(0.0, now_ms - touch) / DAY_MS
 
-    if access_extends and access_count > max_access:
+    if access_count > max_access:
         return False, f"访问 {access_count} 次（阈值 {max_access}），保留"
     if age_days < ttl_days:
         return False, f"{age_days:.0f} 天未确认（未到 {ttl_days:.0f} 天）"
-    if not access_extends:
-        return True, f"{age_days:.0f} 天未被确认，现状可能已过时"
     return True, f"{age_days:.0f} 天未用且仅访问 {access_count} 次"
-
-
-# ---------------------------------------------------------------- 现状的复核
-# 现状不该靠「被读到」续命，也不该靠「访问次数」留人 —— 它只有一条命：
-# 到点了有人来看一眼。看一眼还在，续一段；发现不对，当场删掉。
-#
-# 周期不是固定的：刚写下的现状最容易错（写的时候就过时了），所以 1 天就验一次；
-# 连续验过几次都没变，才逐步放宽到 7 天。这就是「渐进式周期」。
-
-REVIEW_OK = "ok"
-REVIEW_DUE = "due"
-REVIEW_OVERDUE = "overdue"
-
-
-def next_interval(current_days: float, ladder: Sequence[float]) -> float:
-    """复核确认「没变」之后升一档；已在顶端就留在顶端。"""
-    steps = sorted(float(x) for x in ladder if x > 0) or [max(float(current_days), 1.0)]
-    for step in steps:
-        if step > current_days:
-            return step
-    return steps[-1]
-
-
-def state_grace_days(interval_days: float, cap_days: float) -> float:
-    """宽限期 = 一个当前周期，但不超过 cap。单次到期只宽限一次。"""
-    return min(max(float(interval_days), 0.0), max(float(cap_days), 0.0))
-
-
-def state_deadlines(
-    created_ms: int,
-    verified_ms: int | None,
-    interval_days: float,
-    grace_cap_days: float,
-) -> tuple[int, int]:
-    """返回 (该复核的时刻, 宽限结束的时刻)，单位毫秒。
-
-    起点取「创建」与「上次确认」中较晚者 —— 未确认过就从创建时刻起算。
-    """
-    base = max(int(created_ms), int(verified_ms or 0))
-    interval = max(float(interval_days), 0.0)
-    due = base + int(interval * DAY_MS)
-    expire = due + int(state_grace_days(interval, grace_cap_days) * DAY_MS)
-    return due, expire
-
-
-def state_review_status(
-    created_ms: int,
-    verified_ms: int | None,
-    interval_days: float,
-    now_ms: int,
-    grace_cap_days: float,
-) -> tuple[str, str]:
-    """现状的复核状态：ok / due（该复核了）/ overdue（宽限也过了）。
-
-    overdue 的条目在归档扫描时会被归档；due 的只进待复核清单，等有人来看。
-    """
-    due, expire = state_deadlines(created_ms, verified_ms, interval_days, grace_cap_days)
-    if now_ms < due:
-        left = (due - now_ms) / DAY_MS
-        return REVIEW_OK, f"还有 {left:.1f} 天到期"
-    if now_ms < expire:
-        left = (expire - now_ms) / DAY_MS
-        return REVIEW_DUE, f"已到期，宽限剩 {left:.1f} 天"
-    late = (now_ms - expire) / DAY_MS
-    return REVIEW_OVERDUE, f"宽限已过 {late:.1f} 天，应归档"
 
 
 # ---------------------------------------------------------------- 初始粒度
@@ -218,11 +95,221 @@ def initial_compression_level(importance: float) -> int:
     return 2
 
 
-def recompress_threshold(base_days: float, importance: float) -> float:
-    """压缩门槛按重要性缩放：重要的压得慢，琐碎的压得快。
+def compression_target(required: Sequence[int], forget_level: int) -> int:
+    """把 `forget_level` 查成目标 `compression_level`。
 
-    importance 0.9 → 1.5 倍门槛；0.2 → 0.8 倍。
-    这样「被用户骂了」能比「修了个拼写」多保留一倍的细节时长。
+    越界取边界值而不是报错：等级表由配置驱动，改了档数忘了改压缩表时，
+    「压到最深」比「整条流程崩掉」更接近本意。真正的长度校验在启动时做
+    （`validate_settings`），这里只是不让运行时因为下标越界炸掉。
+    """
+    if not required:
+        return 0
+    index = max(0, min(int(forget_level), len(required) - 1))
+    return int(required[index])
+
+
+# ---------------------------------------------------------------- 遗忘等级
+# 等级不是枚举，是数据：档位、周期、双阈值、压缩档全在 TOML 的 [[forget.levels]]。
+# 这里只把那张表读成运行时视图，判定本身是纯函数 —— 可单测、也能三个月后照着解释。
+#
+# 「周期维度」按表分：经验一张表、经历一张表，各配一个周期。
+# 分开配置是因为经历忘得快 —— 这与「这条属于四类里的哪一类」无关，类型只有两种。
+
+PERIOD_EXPERIENCE = "experience"
+PERIOD_EPISODE = "episode"
+
+_PERIOD_KINDS = frozenset({PERIOD_EXPERIENCE, PERIOD_EPISODE})
+
+
+def period_kind(row_kind: str | None) -> str:
+    """对象类型 → 周期维度。只有经历走快周期，其余（经验 / 日志）走慢周期。"""
+    value = (row_kind or "").strip().lower()
+    return PERIOD_EPISODE if value in ("episode", "narrative", "case") else PERIOD_EXPERIENCE
+
+
+@dataclass(frozen=True)
+class LevelSpec:
+    """等级表的一档。字段全可缺省，缺了就是「这档没有这条规矩」。"""
+
+    level: int
+    period_experience_days: float | None = None
+    period_episode_days: float | None = None
+    up_threshold: float | None = None
+    down_threshold: float | None = None
+    compress: str | None = None
+
+    def period_days(self, dimension: str) -> float | None:
+        if dimension == PERIOD_EPISODE:
+            return self.period_episode_days
+        return self.period_experience_days
+
+
+@dataclass(frozen=True)
+class Decision:
+    """一次裁定的结论。`action` 只有三种，调用方不必认识等级表。"""
+
+    level: int
+    action: str  # up / down / hold
+    reason: str
+
+
+def _as_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):  # pragma: no cover - 配置校验已挡住
+        return None
+
+
+class LevelTable:
+    """`[[forget.levels]]` 的运行时视图。
+
+    只做查询，不持有连接、不写库 —— 判定与落盘分开，才能给「干跑」一条同一套逻辑的路。
+    """
+
+    __slots__ = ("_specs", "max_level", "levels")
+
+    def __init__(self, levels: Sequence[Mapping[str, Any]]) -> None:
+        specs: dict[int, LevelSpec] = {}
+        for item in levels:
+            spec = LevelSpec(
+                level=int(item["level"]),
+                period_experience_days=_as_float(item.get("period_experience_days")),
+                period_episode_days=_as_float(item.get("period_episode_days")),
+                up_threshold=_as_float(item.get("up_threshold")),
+                down_threshold=_as_float(item.get("down_threshold")),
+                compress=item.get("compress"),
+            )
+            specs[spec.level] = spec
+        self._specs = specs
+        self.levels = tuple(sorted(specs, reverse=True))
+        self.max_level = self.levels[0] if self.levels else 0
+
+    @classmethod
+    def from_config(cls, cfg: Any) -> "LevelTable":
+        """`cfg` 只要求有 `forget_levels`（Config 的派生属性），不 import Config。"""
+        return cls(cfg.forget_levels)
+
+    # ---- 查询 ----
+    def spec(self, level: int) -> LevelSpec | None:
+        return self._specs.get(int(level))
+
+    def has(self, level: int) -> bool:
+        return int(level) in self._specs
+
+    def period_days(self, level: int, dimension: str = PERIOD_EXPERIENCE) -> float | None:
+        spec = self._specs.get(int(level))
+        return None if spec is None else spec.period_days(dimension)
+
+    def period_ms(self, level: int, dimension: str = PERIOD_EXPERIENCE) -> float | None:
+        days = self.period_days(level, dimension)
+        return None if days is None else days * DAY_MS
+
+    def is_due(
+        self,
+        level: int,
+        period_start_ms: int | None,
+        now_ms: int,
+        dimension: str = PERIOD_EXPERIENCE,
+    ) -> bool:
+        """到没到该裁定的时刻。
+
+        `period_start_ms is None`（老数据没写过这列）→ 视为「还没开始计时」，
+        由调用方拿创建时刻兜底；这里返回 False，避免把一堆老条目一次性全判了。
+        """
+        if int(level) <= 0:
+            return False
+        span = self.period_ms(level, dimension)
+        if span is None or period_start_ms is None:
+            return False
+        return (int(now_ms) - int(period_start_ms)) >= span
+
+    # ---- 裁定 ----
+    def decide(
+        self,
+        level: int,
+        activity: float,
+        dimension: str = PERIOD_EXPERIENCE,
+    ) -> Decision:
+        """周期末的等级裁定：升一级 / 降一级 / 维持，**最多动一级**。
+
+        滞回：升级线与降级线之间是死区，落在死区不动作。配置校验保证
+        升级线恒高于本档与上一档的降级线，所以「同时满足升和降」不可能出现。
+        """
+        level = int(level)
+        spec = self._specs.get(level)
+        if spec is None:
+            raise ValueError(f"等级 {level} 不在配置的等级表里（{self.levels}）")
+        if level <= 0:
+            return Decision(level, "hold", "遗忘层不参与周期裁定（只能复活或删除）")
+
+        activity = float(activity)
+        up = spec.up_threshold
+        if up is not None and activity >= up:
+            if level >= self.max_level:
+                return Decision(level, "hold", f"活跃度 {activity:.1f} ≥ {up:g}，但 {level} 已是顶档")
+            return Decision(level + 1, "up", f"活跃度 {activity:.1f} ≥ 升级线 {up:g}")
+
+        down = spec.down_threshold
+        if down is not None and activity < down:
+            return Decision(max(0, level - 1), "down", f"活跃度 {activity:.1f} < 降级线 {down:g}")
+
+        if up is None and down is None:
+            return Decision(level, "hold", "本档既无升降线，维持")
+        if up is None:
+            return Decision(level, "hold", f"活跃度 {activity:.1f} 未低于降级线 {down:g}")
+        if down is None:
+            return Decision(level, "hold", f"活跃度 {activity:.1f} 未达升级线 {up:g}")
+        return Decision(
+            level, "hold", f"活跃度 {activity:.1f} 落在死区 [{down:g}, {up:g})"
+        )
+
+
+def initial_level(importance: float, bands: Sequence[Mapping[str, Any]]) -> int:
+    """按 importance 从 `[[initial.bands]]` 里挑初始等级。
+
+    bands 必须按 `min_importance` 降序（配置校验强制），所以「第一个满足的」就是对的档。
+    上限由配置校验保证「顶档不可录入即设」，这里不再重复判断。
     """
     value = max(0.0, min(1.0, float(importance)))
-    return base_days * (0.6 + value)
+    for band in bands:
+        if value >= float(band["min_importance"]):
+            return int(band["level"])
+    return int(bands[-1]["level"])
+
+
+def activity_contribution(
+    similarity: float, *, sim_floor: float, curve_power: float
+) -> float:
+    """一次检索命中给活跃度加多少（§2.1）。
+
+    平方而非线性：高相关的一次命中，价值远大于擦边命中的十次 ——
+    否则「什么都能蹭一点」的条目会靠数量取胜。
+    """
+    excess = float(similarity) - float(sim_floor)
+    if excess <= 0:
+        return 0.0
+    return excess ** float(curve_power)
+
+
+def level_factor(
+    level: int,
+    max_level: int,
+    power: float,
+    overrides: Mapping[int, float] | None = None,
+) -> float:
+    """等级在检索排序里的倍率：`(level / 最高等级) ^ power`。
+
+    0 级恒为 0 —— 遗忘层根本不该进常规检索，倍率为 0 是「万一漏进来也排最后」的兜底。
+    想逐级手调就在 TOML 里填映射表，不走公式。
+    """
+    level = int(level)
+    if level <= 0:
+        return 0.0
+    if overrides and level in overrides:
+        return float(overrides[level])
+    if int(max_level) <= 0:
+        return 0.0
+    ratio = min(level, int(max_level)) / int(max_level)
+    return ratio ** float(power)

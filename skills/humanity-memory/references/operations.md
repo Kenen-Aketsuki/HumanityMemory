@@ -3,16 +3,24 @@
 ## 存储布局
 
 ```
-<项目>/.ai_memory/
-├── workspace.db        # 项目库：facts + episodes + logs
-└── CORE_RULES.md       # 项目信条
+<安装根>/libraries/<label>/          # 库本体（2026-11-19 起统一存放）
+├── workspace.db        # 记忆库：experience + episodes + logs
+├── memory.toml         # 库级配置（可选，最高优先级）
+├── reports/ retrieval/ # 派生产物（judge 报告、检索缓存）
+└── *.bak-*             # 库自己的备份
+
+<项目>/.ai_memory/token.json         # 身份锚点：只说明"这个项目用哪个库"
+<项目>/.workbuddy/memory/信条.md     # 项目信条（跟着项目走，不跟库）
+<安装根>/.env                        # 配置唯一来源（含 HM_LIBRARIES）
 
 ~/.humanity-memory/
-├── global.db           # 全局库：跨项目 facts
-└── CORE_RULES.md       # 全局信条
-
-<仓库根>/.env            # 配置唯一来源
+├── registry.json              # 库与钥匙的归属索引
+└── CORE_RULES.md              # 全局信条（静态注入，仍然生效）
 ```
+
+**项目之间物理隔离**：不同项目指向不同 label，互不可见（共享组除外）。
+**删库要显式去 `libraries/<label>/`** —— 删项目只删掉那张身份卡，库还在。
+换机器 / 重装时先备份 `libraries/`，它不在任何 git 仓库里。
 
 **`.env` 只认仓库根这一份**（`<仓库根>/.env`，由 `config.py` 相对源码自身位置
 定位，源码不含硬编码绝对路径）。不再读 `~/.humanity-memory/.env` 或 cwd 下的
@@ -20,39 +28,51 @@
 不会出现「换个目录 embedding 静默失效」。真实环境变量仍是最高优先级
 （令牌、`mcp.json` 的 env、命令行覆盖都依赖它）。
 
-工作区查找规则：从 cwd 向上逐级找 `.ai_memory`，命中即用。
-都没有时，如果 cwd 处在一个「像项目」的目录树里（含 `.git`、`ProjectSettings`、
-`package.json`、`pyproject.toml`、`.workbuddy` 等标记），会在**项目根**自动建立，
-所以新项目接入通常不需要手动 `init`。
-用户主目录和盘符根永远不建。
+工作区查找规则：从 cwd 向上逐级找 `.ai_memory`，**只认含 `token.json` 的那个**。
+找不到就是「未接入」——不建目录、不建库、也不沿用上次的工作区。
+（2026-11-18 起：自动建库已删除，`last-workspace.txt` 已删除。）
 
-启动上下文（cwd、走了哪条解析路径、命中的工作区）写在
-`~/.humanity-memory/diagnostics/startup.json`，排查「为什么落到全局库」先看它。
+启动上下文（cwd、走了哪条解析路径、命中的库、错误码）写在
+`~/.humanity-memory/diagnostics/startup.json`，排查「为什么落到这个库」先看它。
 
-## 令牌：把工作区绑定从 mcp.json 解耦
+## 令牌：项目的接入证明（v2）
 
-`mcp.json` 里写死 API key 有泄露风险（它会被同步、备份、分享）。令牌文件把
-「工作区 + 信条 + 凭据」收进一处，客户端配置里只留一个路径：
+身份在项目里，不在 `mcp.json` 里。客户端配置只剩 `["serve"]`，
+打开哪个库由当前目录的 `<项目>/.ai_memory/token.json` 决定：
 
 ```json
-"args": ["-m", "humanity_memory.mcp_server", "--token", "<令牌路径>"]
+{
+  "version": 2,
+  "key": "hmk_7f3a9c1e…",
+  "workspace": "D:/proj/YourProject",
+  "library": "yourproject",
+  "label": "yourproject"
+}
 ```
+
+接入 / 运维（全部有对应 MCP 工具，`memory_bind_*`）：
 
 ```bash
-humanity-memory workspace use <项目根> --token <令牌路径>   # 建/改
-humanity-memory --token <路径> workspace show              # 查看（key 脱敏）
+humanity-memory bind new [--label 名字]      # 新建独立库 + 发令牌
+humanity-memory bind adopt                   # 沿用本目录已有的 .ai_memory/workspace.db
+humanity-memory bind existing --library 标签  # 并入已有库（A、B 同库）
+humanity-memory bind decline                 # 本次不接入（library=null，记住决定）
+humanity-memory bindings list                # registry：有哪些库、谁在用
+humanity-memory revoke --workspace <项目>     # 撤销钥匙（不动库文件）
+humanity-memory bind move --from <旧> --to <新>   # 搬家后修令牌
 ```
 
-令牌里的 `embedding` 留空就回落到 `.env`。**带凭据的令牌别放项目里**——
-项目会被 git 提交，凭据就跟着走了。放 `~/.humanity-memory/` 下更安全。
+令牌里**没有凭据**：embedding 只走 `.env`（见下）。registry 只存 `sha256(salt+key)`，
+明文钥匙只在令牌文件里；`library` 是断言、真归属在 registry，手改无效。
 
-优先级：令牌 > `--workspace` > `HM_WORKSPACE` > cwd 向上查找。
+启动优先级：`--workspace` > `HM_WORKSPACE` > cwd 向上查找（只认带令牌的）。
+`--token` 仍可传，但只作「路径覆盖 + workspace 提示」，不再是身份来源。
 
 ## 配置
 
 ```bash
-# 全局库目录
-HM_HOME=C:/Users/you/.humanity-memory
+# 信条与库所在目录（global.db 已退役，这里现在只放信条/诊断/备份）
+HM_HOME=~/.humanity-memory
 
 # embedding（OpenAI 兼容）
 HM_EMBED_BASE_URL=https://api.siliconflow.cn/v1
@@ -65,6 +85,26 @@ HM_EMBED_DIM=1024          # 必须和模型实际维度一致
 ```
 
 完整清单见仓库 `.env.example`。
+
+### 阈值配置在哪（四层，后者覆盖前者）
+
+| 层 | 路径 | 定位 |
+| --- | --- | --- |
+| 出厂 | 包内 `memory.default.toml` | 全量默认值，随版本发布，别改 |
+| 安装 | `<安装根>/memory.toml`（与 `.env` 同目录） | **全量模板**，`humanity-memory config template` 整份生成 |
+| 用户 | `~/.humanity-memory/memory.toml` | **增量**，只写要改的键，跨项目 |
+| 项目 | `<项目>/.ai_memory/memory.toml` | **增量**，只写要改的键，优先级最高 |
+
+```bash
+humanity-memory config template        # 生成安装位置的全量模板（已存在会拒绝）
+humanity-memory config template --force   # 覆盖重来
+```
+
+**只改几项就用用户级 / 项目级**，别动安装层那份全量：全量放着等于接管了所有默认值，
+以后出厂调了某个值，你那份的旧值会赢。
+
+**改完必须重启 MCP 客户端**（server 常驻，配置只在进程启动时读一次）。
+CLI 和星图脚本每次都是新进程，改完立刻生效。
 
 ### 没有 embedding 也能用
 
@@ -81,6 +121,45 @@ humanity-memory doctor
 
 逐项检查扩展、FTS、**append-only 触发器是否安装**、schema 维度、embedding 探活、
 信条文件。任何一项失败退出码为 1。
+
+### 客户端里工具只剩 6 个（记忆相关全不见了）
+
+**这不是安装坏了，是拒绝态。** 未接入时 server 只注册
+`memory_bind_status` / `memory_bind_new` / `memory_bind_existing` /
+`memory_bind_adopt` / `memory_bind_decline` / `memory_use_workspace` 这 6 个，
+其余 24 个（读写、检索、复盘）**根本不注册** —— 模型看不到就不会误调，
+也就不会出现"agent 以为写入成功"这类事故。
+
+第一步永远是看 `code`，别猜：
+
+```
+memory_bind_status()            # 看当前会话
+memory_bind_status(workspace="<项目根>")   # 预检任意路径
+```
+
+| `code` | 含义 | 出路 |
+| --- | --- | --- |
+| `no_workspace` | 当前 cwd 不是任何项目 | 传项目根给 `bind_status`，再 `memory_use_workspace(path=…)` |
+| `no_token` | 是项目，但没接入 | `bind adopt` / `bind new` / `bind existing` |
+| `declined` | 该项目明确选了不接入 | 想改主意就 `bind new` / `bind existing` |
+| `library_missing` | 库目录不在（盘没挂载） | 挂载后重试，或 `bind existing` 换库 |
+| `token_*` / `key_*` | 令牌或钥匙对不上 | 重发令牌：`bind adopt` |
+
+**最常见的一种：`no_workspace` + cwd 是应用安装目录。**
+MCP 客户端偶尔会用「应用所在目录」而不是项目目录起一个 boot 实例
+（它的 cwd 与用户看到的会话无关），于是解析不到任何项目。
+这种情况下 server 本身没坏 —— 处理方式：
+
+```
+memory_use_workspace(path="D:/proj/YourProject")
+```
+
+它会**在同一进程内**校验令牌、切换库，并把 24 个工具当场挂上（返回里的
+`tools_registered` 就是挂载数量），不需要重启客户端。
+若客户端只是缓存了旧的 `tools/list`，刷新/重开会话也能好。
+
+判断"到底是不是拒绝态"的可靠办法：能调通 `memory_stats` 就说明完整工具面已注册；
+调不通（报 unknown tool）才是真的只剩 6 个。
 
 ### `logs 表是 append-only：禁止修改已写入的历史内容`
 
@@ -142,11 +221,11 @@ humanity-memory reindex --reset-vectors
 
 想导入别的机器：把 `.ai_memory/` 整个拷过去即可，路径无关。
 
-## 全局知识膨胀
+## 全局经验膨胀
 
-`memory_stats` 里 `global_knowledge_warn: true` 说明全局知识超过阈值（默认 50）。
+`memory_stats` 里 `global_experience_warn: true` 说明全局经验超过阈值（默认 50）。
 
-跨项目知识本该很少。膨胀通常意味着：
+跨项目经验本该很少。膨胀通常意味着：
 
 - 有些规则类内容该搬到 `CORE_RULES.md`（它们需要 100% 命中，不该靠检索）
 - 有些项目细节该留在各自的 workspace 库
@@ -160,3 +239,5 @@ FROM digests ORDER BY at DESC LIMIT 20;
 ```
 
 `digests.meta` 里存了当次处理掉的 log id 列表，可追溯。
+
+> `knowledge_count` 是**历史列名**（列随表名一起没改），现在数的是经验条数。

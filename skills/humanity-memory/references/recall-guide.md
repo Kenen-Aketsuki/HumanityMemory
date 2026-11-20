@@ -32,24 +32,29 @@
 ```json
 {
   "count": 3,
-  "lines": ["[k_abc] (项目知识) 设施存档用总文件…", "[k_def] (项目现状) 项目是 Unity 2022.3…",
-            "[e_ghi] (2026-11-03·案例) 引导不指餐厅 → StockBread…"],
+  "lines": ["[x_abc] (项目经验) 设施存档用总文件…",
+            "[e_def] (2026-11-03·经历) 引导不指餐厅 → StockBread…",
+            "[l_ghi] (日志 2026-11-16) 排查布局错乱…"],
   "results": [
-    {"type": "knowledge", "kind": "knowledge", "id": "k_abc", "score": 0.87,
-     "vector_similarity": 0.79, "lexical_score": 1.0, "db": "workspace"}
+    {"type": "experience", "kind": "experience", "id": "x_abc", "score": 0.87,
+     "confidence": 0.6, "forget_level": 4, "vector_similarity": 0.79,
+     "lexical_score": 1.0, "db": "workspace"}
   ]
 }
 ```
 
 - **`lines`** 是给上下文用的紧凑格式，直接拼进去
-- **`type`** 三种物理来源：`knowledge` / `episode` / `log`；
-  真正要看的是 **`kind`**（一级概念，决定该不该直接当结论用）：
-  - `knowledge` 知识最可信，直接当结论用
-  - `state` 现状直接可用，但要留意 `verified_iso`——越旧越可疑
-  - `case` 案例是「现象→根因→落点」，能复用排查路径，但别当成通用机制
-  - `narrative` 叙述是压缩过的事件，可信但要留意它是"当时的理解"
-  - `log` 原始记录，注意它的时间
-- **`db`**：`workspace` 是当前项目，`global` 是跨项目知识
+- **`type`** / **`kind`** 三种物理来源：`experience` / `episode` / `log`。
+  该不该直接当结论用，看这个：
+  - `experience` 经验：可当结论用，但先看 `confidence`
+  - `episode` 经历：**发生过什么**，带日期。能复用排查路径，但别当成通用机制
+  - `log` 原始记录：注意时间，它多半还没提炼
+- **`confidence`**（仅经验有）决定要不要先验：
+  - `> 0.85` 视为事实，直接用
+  - `0.5~0.85` 可以用，但和现状对照一下
+  - `< 0.5` 返回里会带 `needs_verify` —— **先验证再用**，别直接引用
+- **`forget_level`** 是检索权重倍率，不代表对错。0 级的条目只会在深度回忆里出现
+- **`db`**：`workspace` 是当前项目，`global` 是跨项目经验
 - **`vector_similarity` / `lexical_score`** 看这条是怎么被找到的：
   - 两者都有 → 语义和字面都命中，最可信
   - 只有向量 → 语义相近但用词不同，留意是否跑偏
@@ -65,26 +70,38 @@
 2. **记忆在别的项目里** → 项目之间是物理隔离的，查不到就是没有。
    如果这条确实该跨项目，考虑用 `memory_promote` 提升为全局条目
 3. **条目被取代了** → `include_invalid=true` 看历史
-4. **日志已复盘清空** → 原始日志没了，但压缩后的叙述还在，查 `kinds=["narrative","case"]`
-5. **压根没记过** → `memory_stats` 看总数
-6. **embedding 没生效** → 返回里的 `degraded` 字段会提示，跑 `memory_maintenance`
+4. **日志已复盘清空** → 原始日志没了，但压缩后的经历还在，查 `kinds=["episode"]`
+5. **条目沉到 0 级了** → 它不在常规检索里。`memory_recall` 在常规最高相似度低于
+   `deep_recall_floor`（0.35）时会自动兜一层 `memory_deep_recall`；要强制翻旧账就直接调它。
+   捞到的条目带「已遗忘」标记，经历攒够 2 次命中会自动复活到 1 级
+6. **压根没记过** → `memory_stats` 看总数
+7. **embedding 没生效** → 返回里的 `degraded` 字段会提示，跑 `memory_maintenance`
 
-权重（`HM_W_RETRIEVAL` / `HM_W_IMPORTANCE` / `HM_W_STRENGTH`）是最后才动的旋钮。
+权重（`w_retrieval` / `w_importance` / `w_level`，在 `memory.toml` 的 `[retrieval]`）
+是最后才动的旋钮。
 
-## 强化机制
+## 强化机制：两套，别混
 
-`memory_recall` 会强化命中项（`access_count + 1`），`memory_search` 不会。
+**活跃度（`activity`）**：`memory_recall` 给命中项累加，`memory_search` 不给。
 
-- 要注入上下文 → `memory_recall`，常用记忆会越来越容易被召回
-- 只是查证、不想影响排序 → `memory_search`
+- 要注入上下文 → `memory_recall`，常用记忆会在周期裁定里更容易升级
+- **日常也只有这一条路**：`memory_search` 只在复盘时开放（时间窗内或持终端签发的通行证）。
+  它刻意不改访问强度，所以 `[review]` 那道闸门就是用来防止"拿 search 顶替 recall、
+  把活跃度算成空的"。被拒时不要重试，改用 `recall` 并在 `context` 里写清情境。
 
-强化是"用进废退"的「进」：对数增长，20 次召回后饱和，不会无限放大。
-「退」由时间衰减负责：知识/现状半衰期 3650 天（几乎不忘）、案例与叙述 180 天、日志 14 天。
-现状另有硬门槛：走 1→3→5→7 天的复核梯子，到期后再给一个最长 5 天的宽限，
-宽限也过了才会被归档；**被检索到不算续命**，只有 `memory_review(matched=true)` 算。
+累加的是 `(相似度 - 0.35) ^ 2`，不是次数：**查到了但明显不相关，不给续命**。
+周期末裁定后清零，所以活跃度是"这段时间活得怎么样"，不是终身工龄。
+
+**访问计数（`access_count`）**：两个接口都会 +1。它只用于归档判据
+（"3 年没被碰过、访问 ≤ 1 次"），不影响检索排序。
+
+「退」由等级裁定负责：一个周期内活跃度不够就降一级，降到底就是遗忘层。
+等级同时是排序的第三项（`(level / 最高等级) ^ 1.5`），所以"不重要了"会自己往下沉，
+不靠额外的时间衰减。日志没有等级，这一项恒为满分。
 
 ## 注入上下文时
 
 - 只注入 `lines`，不要塞整段 `results`——后者带一堆打分字段，占 token 还干扰阅读
 - 3~6 条足够，多了反而淹没当前对话
 - 发现某条明显不相关直接忽略，不用特地告诉用户
+- **`needs_verify` 标了的条目要说明"这条待验证"**，别当既成事实转述

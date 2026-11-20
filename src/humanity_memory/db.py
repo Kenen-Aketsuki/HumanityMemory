@@ -5,16 +5,20 @@ from __future__ import annotations
 import itertools
 import re
 import sqlite3
-import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
 from .config import Config
+from .resources import resource
 
-SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+SCHEMA_PATH = resource("schema.sql")
 
-# 主表 → 向量表
+# 当前程序认识的 schema 版本。库里的 meta.schema_version 必须是这个数，
+# 否则拒绝服务 —— 不做任何就地修补（docs/two-tier-memory.md §8.4）。
+EXPECTED_SCHEMA_VERSION = 4
+
+# 主表 → 向量表。两类记忆各一张主表，类型由表承载，没有行级 kind。
 VEC_TABLES: dict[str, str] = {
     "knowledge": "knowledge_vec",
     "episodes": "episodes_vec",
@@ -25,7 +29,7 @@ VEC_TABLES: dict[str, str] = {
 # 记忆库常年只有几十到几百条，默认值会让 db 文件 96% 是空洞，显式调小。
 VEC_CHUNK_SIZE = 64
 
-# 上一代 schema 的主表名 —— 见到它就是 v2 库
+# 上一代 schema 的主表名 —— 只用来**识别** v2 库，绝不据此改名或迁移。
 LEGACY_TABLES = ("facts",)
 
 _DIM_RE = re.compile(r"float\s*\[\s*(\d+)\s*\]", re.IGNORECASE)
@@ -35,21 +39,40 @@ class SchemaError(RuntimeError):
     """schema 与配置不兼容（最典型：embedding 维度变了）。"""
 
 
+class SchemaVersionError(RuntimeError):
+    """库文件的 schema 版本与当前程序不符。
+
+    按 §8.4 的结论，主程序的义务只有「检测 + 拒绝」：改名、补字段、跑 DDL 修补
+    全部禁止。理由是这个函数挂在**每一次打开连接**的路径上——只要它能动手改磁盘，
+    任何一次「只想看一眼」的读操作都会产生不可逆副作用。
+    """
+
+    def __init__(self, path: Path, found: str, expected: int = EXPECTED_SCHEMA_VERSION):
+        self.path = path
+        self.found = found
+        self.expected = expected
+        hint = (
+            f'humanity-memory upgrade "{path}"                    # 先预览会变成什么样\n'
+            f'humanity-memory upgrade "{path}" --out "{path.with_name(path.stem + ".v4.db")}"'
+        )
+        super().__init__(
+            f"库版本不符：{path}\n"
+            f"  库里是 {found}，本程序只认 v{expected}，且不会自动修改库文件。\n"
+            f"  升级命令（源库只读，产物另存，核验后自行替换）：\n{hint}"
+        )
+
+
+
 # ---------------------------------------------------------------- 扩展加载
 
 
-def _candidate_extensions(cfg: Config) -> list[Path]:
-    roots = [
-        Path(__file__).resolve().parents[2] / "tools" / "bin",
-        cfg.home / "bin",
-        Path.cwd() / "tools" / "bin",
-    ]
-    names = ("vec0.dll", "vec0.so", "vec0.dylib")
-    return [root / n for root in roots for n in names if (root / n).is_file()]
+def load_vec_extension(conn: sqlite3.Connection, cfg: Config | None = None) -> str:
+    """加载 sqlite-vec，返回实际生效来源。
 
-
-def load_vec_extension(conn: sqlite3.Connection, cfg: Config) -> str:
-    """加载 sqlite-vec，返回实际生效来源。"""
+    扩展一律从 `sqlite_vec` 包内取（`loadable_path()`），不再猜 `tools/bin` 之类的
+    目录：源码态和冻结态走同一条路，打包时 `--collect-all sqlite_vec` 会把 dll 一起带走。
+    `cfg.vec_extension` 仍是显式覆盖，优先级高于包内自带的那个。
+    """
     try:
         conn.enable_load_extension(True)
     except (AttributeError, sqlite3.OperationalError) as exc:  # pragma: no cover
@@ -63,24 +86,19 @@ def load_vec_extension(conn: sqlite3.Connection, cfg: Config) -> str:
         try:
             import sqlite_vec
 
-            sqlite_vec.load(conn)
-            return "pip:sqlite-vec"
+            path = sqlite_vec.loadable_path()
+            conn.load_extension(path)
+            return f"pip:sqlite-vec ({path})"
         except Exception as exc:  # noqa: BLE001
             errors.append(f"pip 包加载失败: {exc}")
 
-        if cfg.vec_extension:
+        override = getattr(cfg, "vec_extension", None)
+        if override:
             try:
-                conn.load_extension(str(Path(cfg.vec_extension).resolve()))
-                return f"config:{cfg.vec_extension}"
+                conn.load_extension(str(Path(override).resolve()))
+                return f"config:{override}"
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"配置扩展加载失败 ({cfg.vec_extension}): {exc}")
-
-        for path in _candidate_extensions(cfg):
-            try:
-                conn.load_extension(str(path))
-                return f"file:{path}"
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{path} 加载失败: {exc}")
+                errors.append(f"配置扩展加载失败 ({override}): {exc}")
 
         raise RuntimeError("无法加载 sqlite-vec 扩展。尝试过：\n  - " + "\n  - ".join(errors))
     finally:
@@ -125,6 +143,19 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
+def set_meta_if_changed(conn: sqlite3.Connection, key: str, value: str) -> bool:
+    """值没变就不写。
+
+    看起来多余，但这决定了「只读操作会不会落一条 WAL」：`open_db` 每次都要
+    记录 `vec_source`，无脑 UPSERT 会让 `stats`、`starmap` 这类纯读命令
+    也产生写操作 —— 与 §8.4「读操作不该改磁盘」是同一条精神。
+    """
+    if get_meta(conn, key) == value:
+        return False
+    set_meta(conn, key, value)
+    return True
+
+
 def _existing_vec_dim(conn: sqlite3.Connection, table: str) -> int | None:
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE name = ? AND type = 'table'", (table,)
@@ -142,111 +173,91 @@ def _row_count(conn: sqlite3.Connection, table: str) -> int:
         return 0
 
 
-# ---------------------------------------------------------------- schema
+# ---------------------------------------------------------------- 版本探测
 
 
-def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> bool:
-    """幂等加列 —— 让已经建好的老库追上 schema，不用重建。"""
-    try:
-        cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-    except sqlite3.OperationalError:
-        return False
-    if column in cols:
-        return False
-    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-    return True
+def probe_schema_version(path: Path) -> str:
+    """只读探测库文件的 schema 版本，返回 `"absent"` / `"empty"` / `"v2"` / `"v3"` / `"v4"` / `"unknown"`。
 
-
-# 老库补列：新增字段在这里登记即可
-_COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
-    ("knowledge", "kind", "TEXT NOT NULL DEFAULT 'knowledge'"),
-    ("knowledge", "verified_at", "INTEGER"),
-    # 老库里的现状按梯子顶端（7 天）起算：它们已经过了「刚写下来需要当天验证」的阶段
-    ("knowledge", "state_interval_days", "REAL NOT NULL DEFAULT 7.0"),
-    ("knowledge", "archived_at", "INTEGER"),
-    ("episodes", "kind", "TEXT NOT NULL DEFAULT 'narrative'"),
-    ("episodes", "archived_at", "INTEGER"),
-    ("episodes", "compression_level", "INTEGER NOT NULL DEFAULT 0"),
-)
-
-
-def _is_legacy_db(path: Path) -> bool:
-    """判断是不是上一代（facts 表）的库。只读探测，不改任何东西。"""
-    if not path.is_file():
-        return False
+    **绝不修改磁盘**：`mode=ro` 打开，只读 `sqlite_master` 与 `meta`。
+    这是 §8.4 的核心——旧实现在这条路径上 rename 库文件，于是任何一次读操作
+    都会产生不可逆副作用，多进程并发时还会互相撞 `WinError 32`。
+    """
+    if not path.exists():
+        return "absent"
+    if path.stat().st_size == 0:
+        return "empty"
     try:
         conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
     except sqlite3.Error:
-        return False
+        return "unknown"
     try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        ).fetchall()
+        try:
+            rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        except sqlite3.DatabaseError:
+            # 不是 SQLite 文件（比如把 zip 改了后缀）
+            return "unknown"
         names = {str(r[0]) for r in rows}
-    except sqlite3.Error:
-        return False
+        if not names:
+            return "empty"
+        if "meta" in names:
+            try:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key = 'schema_version'"
+                ).fetchone()
+            except sqlite3.DatabaseError:
+                return "unknown"
+            if row and row[0] is not None:
+                return f"v{row[0]}"
+            # 有 meta 但没写版本：早期 v3 库，同样不认
+            return "unknown"
+        if any(t in names for t in LEGACY_TABLES):
+            return "v2"
+        return "unknown"
     finally:
         conn.close()
-    return any(t in names for t in LEGACY_TABLES) and "knowledge" not in names
 
 
-def retire_legacy_db(path: Path) -> Path | None:
-    """把上一代 schema 的库整份改名留档，然后让调用方建一个全新的。
+def _check_version(path: Path, found: str) -> bool:
+    """返回 True 表示需要初始化新库（文件不存在 / 空文件 / 空库）。"""
+    if found in ("absent", "empty"):
+        return True
+    expected = f"v{EXPECTED_SCHEMA_VERSION}"
+    if found == expected:
+        return False
+    raise SchemaVersionError(path, found)
 
-    为什么不就地迁移：v2 的 facts 里混着知识与现状、案例无处安放，
-    kind 的判定只能靠人读内容 —— 那是判断题，不是转换题。
-    与其猜着搬，不如整份留档、新库从零开始（迁移脚本见 docs/migration-schema-v3.md）。
 
-    改名失败（典型：另一个进程正开着这个库）时**不抛异常**：
-    stdio 传输容不得噪音，而且旧表留着也不影响新 schema 建表之后的读写 ——
-    新代码只碰 knowledge / episodes / logs，facts 表会成为一个不再被读的孤儿。
-    等服务停下后删掉那个文件即可。
+# ---------------------------------------------------------------- schema
+
+
+def ensure_schema(conn: sqlite3.Connection, cfg: Config, *, fresh: bool) -> dict[str, object]:
+    """建表（仅 `fresh=True`）并校验向量维度。
+
+    `fresh=False` 时**不跑任何 DDL**：库已由升级器或上一次初始化建好，
+    版本闸门已经确认它是当前版本。主程序在这条路径上只读结构、不补不改
+    （§8.4「建表、补字段、跑 DDL 修补」全部禁止）。
     """
-    if not _is_legacy_db(path):
-        return None
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    target = path.with_suffix(path.suffix + f".v2-{stamp}")
-    try:
-        path.replace(target)
-    except OSError:
-        return None
-    for suffix in ("-wal", "-shm"):
-        side = path.with_suffix(path.suffix + suffix)
-        if side.exists():
-            try:
-                side.replace(target.with_suffix(target.suffix + suffix))
-            except OSError:
-                pass
-    return target
-
-
-def ensure_schema(conn: sqlite3.Connection, cfg: Config) -> dict[str, object]:
-    sql = SCHEMA_PATH.read_text(encoding="utf-8")
     tokenizer = detect_fts_tokenizer(conn)
     if tokenizer == "none":
         raise RuntimeError("当前 SQLite 未启用 FTS5，无法建立关键词索引。")
-    if tokenizer != "trigram":
-        sql = sql.replace("tokenize = 'trigram'", f"tokenize = '{tokenizer}'")
-    conn.executescript(sql)
 
-    migrated = [
-        f"{table}.{column}"
-        for table, column, ddl in _COLUMN_MIGRATIONS
-        if _ensure_column(conn, table, column, ddl)
-    ]
-
-    # 依赖新列的索引必须放在 ALTER TABLE 之后建，
-    # 否则老库里 executescript 会因为「no such column」整段失败
-    for stmt in (
-        "CREATE INDEX IF NOT EXISTS idx_knowledge_archived ON knowledge(archived_at)",
-        "CREATE INDEX IF NOT EXISTS idx_episodes_archived ON episodes(archived_at)",
-    ):
-        conn.execute(stmt)
+    if fresh:
+        try:
+            sql = SCHEMA_PATH.read_text(encoding="utf-8")
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"内置 schema.sql 缺失：{SCHEMA_PATH}。冻结态请检查打包参数是否包含 "
+                '--add-data "src/humanity_memory/schema.sql;humanity_memory"'
+            ) from exc
+        if tokenizer != "trigram":
+            sql = sql.replace("tokenize = 'trigram'", f"tokenize = '{tokenizer}'")
+        conn.executescript(sql)
 
     info: dict[str, object] = {
         "fts_tokenizer": tokenizer,
         "vec_dims": {},
-        "migrated_columns": migrated,
+        "fresh": fresh,
     }
 
     for main_table, vec_table in VEC_TABLES.items():
@@ -279,9 +290,10 @@ def ensure_schema(conn: sqlite3.Connection, cfg: Config) -> dict[str, object]:
         )
         info["vec_dims"][vec_table] = cfg.embed_dim
 
-    set_meta(conn, "embedding_dim", str(cfg.embed_dim))
-    set_meta(conn, "embedding_model", cfg.embed_model)
-    set_meta(conn, "schema_version", "3")
+    set_meta_if_changed(conn, "embedding_dim", str(cfg.embed_dim))
+    set_meta_if_changed(conn, "embedding_model", cfg.embed_model)
+    if fresh:
+        set_meta_if_changed(conn, "schema_version", str(EXPECTED_SCHEMA_VERSION))
     return info
 
 
@@ -289,10 +301,13 @@ def ensure_schema(conn: sqlite3.Connection, cfg: Config) -> dict[str, object]:
 
 
 def open_db(path: Path, cfg: Config) -> sqlite3.Connection:
-    """打开（必要时创建）一个记忆库文件。"""
+    """打开（必要时创建）一个记忆库文件。
+
+    顺序很重要：**先只读探测版本，再决定要不要建立/打开写连接**。
+    版本不符直接抛 `SchemaVersionError` 退出，磁盘一个字节不动。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    # 上一代 schema 的库整份留档后另起一个新库（判定与理由见 retire_legacy_db）
-    retire_legacy_db(path)
+    fresh = _check_version(path, probe_schema_version(path))
     conn = sqlite3.connect(
         str(path), timeout=15.0, isolation_level=None, check_same_thread=False
     )
@@ -302,8 +317,8 @@ def open_db(path: Path, cfg: Config) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 8000")
     source = load_vec_extension(conn, cfg)
-    ensure_schema(conn, cfg)
-    set_meta(conn, "vec_source", source)
+    ensure_schema(conn, cfg, fresh=fresh)
+    set_meta_if_changed(conn, "vec_source", source)
     return conn
 
 

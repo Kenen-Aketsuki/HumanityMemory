@@ -93,3 +93,55 @@ def test_describe_masks_key(tmp_path: Path) -> None:
     masked = cfg.describe()["embedding"]["api_key"]
     assert "abcdefghijkl" not in masked
     assert masked.startswith("sk-abc")
+
+
+# ---------------------------------------------------------------- 共享组库落点
+
+
+def test_libraries_home_honours_explicit_env(tmp_path: Path, monkeypatch) -> None:
+    from humanity_memory import config
+
+    target = tmp_path / "shared-libs"
+    monkeypatch.setenv("HM_LIBRARIES", str(target))
+    assert config.libraries_home() == target
+
+
+def test_libraries_home_never_defaults_to_the_user_directory(monkeypatch) -> None:
+    """库是数据，跟着安装走；配置（registry / 信条 / 诊断）才留在用户目录。
+
+    混在一起最直接的后果就是 C 盘悄悄攒下几十 MB 的库文件 —— 而升级 / 回滚
+    时没人会想到去那儿找。
+    """
+    from humanity_memory import config, paths
+
+    monkeypatch.delenv("HM_LIBRARIES", raising=False)
+    home_libs = paths.global_home() / "libraries"
+    got = config.libraries_home()
+    assert got != home_libs, f"默认落点不该是用户目录：{got}"
+    assert got.name == "libraries"
+
+
+# ---------------------------------------------------------------- 共享组库落点
+
+
+def test_libraries_home_honours_explicit_env(tmp_path: Path, monkeypatch) -> None:
+    from humanity_memory import config
+
+    target = tmp_path / "shared-libs"
+    monkeypatch.setenv("HM_LIBRARIES", str(target))
+    assert config.libraries_home() == target
+
+
+def test_libraries_home_never_defaults_to_the_user_directory(monkeypatch) -> None:
+    """库是数据，跟着安装走；配置（registry / 信条 / 诊断）才留在用户目录。
+
+    混在一起最直接的后果就是 C 盘悄悄攒下几十 MB 的库文件 —— 而升级 / 回滚
+    时没人会想到去那儿找。
+    """
+    from humanity_memory import config, paths
+
+    monkeypatch.delenv("HM_LIBRARIES", raising=False)
+    home_libs = paths.global_home() / "libraries"
+    got = config.libraries_home()
+    assert got != home_libs, f"默认落点不该是用户目录：{got}"
+    assert got.name == "libraries"
