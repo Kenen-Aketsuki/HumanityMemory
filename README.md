@@ -364,7 +364,11 @@ consolidate_apply(experience=[...], episodes=[...], purge=true)
 活跃度只由「真实使用」累加：`memory_recall` 给命中项加，`memory_search` 刻意不加。
 如果日常能随手 search，这些检索就不计入活跃度，遗忘曲线随之失真。
 
-所以 `memory_search` 只在复盘时开放，判据全是**代码能核验的事实**：
+log 是例外：它没有 `activity` 字段，只把「被哪些查询命中过」记进 `retrievals`。
+复盘时工具从这些条件重放算出新条目的起始活跃度；来源映射与继承值也都由工具算，
+模型只负责提炼内容。
+
+所以 `memory_search` 只在复盘时开放。判据全是**代码能核验的事实**，不看模型自觉：
 
 | 途径 | 条件 |
 | --- | --- |

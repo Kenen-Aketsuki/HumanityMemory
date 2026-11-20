@@ -559,6 +559,23 @@ class Config:
         return float(_dig(self.settings, "activity", "curve_power"))
 
     @property
+    def retrievals_cap(self) -> int:
+        """单条 log 保留的不同 query 上限（超出淘汰最旧的）。"""
+        return max(
+            1, int(_optional(self.settings, "activity", "retrievals_cap", default=32))
+        )
+
+    @property
+    def activity_inherit_cap(self) -> float:
+        """复盘继承值的上限：防高频召回给新条目一个离谱的起始活跃度。"""
+        return max(0.0, float(_optional(self.settings, "activity", "inherit_cap", default=1.0)))
+
+    @property
+    def source_match_floor(self) -> float:
+        """复盘来源自动映射的相似度门槛；无命中回落当天全量日志。"""
+        return float(_optional(self.settings, "activity", "source_match_floor", default=0.35))
+
+    @property
     def dedup_floor(self) -> float:
         """经验查重阈值；<=0 表示关闭查重。"""
         return float(_dig(self.settings, "dedup", "dup_floor"))

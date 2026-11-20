@@ -116,8 +116,8 @@ CREATE INDEX IF NOT EXISTS idx_episodes_archived ON episodes(archived_at);
 CREATE INDEX IF NOT EXISTS idx_episodes_forget   ON episodes(forget_level);
 
 -- ------------------------------------------------------------
--- 日志层：当天原始记录。**严格 append-only**。
--- 唯一允许的更新是把 consolidated 从 0 置 1。
+-- 日志层：当天原始记录。**严格 append-only**（内容/时间/日期不可改）。
+-- 允许更新：consolidated、retrievals、access_count、last_accessed_at。
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS logs (
     rowid        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,7 +133,9 @@ CREATE TABLE IF NOT EXISTS logs (
     consolidated INTEGER NOT NULL DEFAULT 0,
     digest_id    TEXT,
     embedded     INTEGER NOT NULL DEFAULT 0,
-    meta         TEXT    NOT NULL DEFAULT '{}'
+    meta         TEXT    NOT NULL DEFAULT '{}',
+    -- 被 recall 命中的检索条件流水 [{q,n,sim,heat,at}]，复盘时派生继承值
+    retrievals   TEXT    NOT NULL DEFAULT '[]'
 );
 
 CREATE INDEX IF NOT EXISTS idx_logs_day      ON logs(day DESC, at);

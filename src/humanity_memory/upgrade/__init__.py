@@ -32,14 +32,15 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import v3_to_v4
+from . import v3_to_v4, v4_to_v5
 
 # 版本号 → 单步转换器。加版本时在这里挂一格即可，不要写 N×N 的两两转换。
 CHAIN: dict[int, Any] = {
     3: v3_to_v4,
+    4: v4_to_v5,
 }
 
-LATEST_VERSION = v3_to_v4.TARGET_VERSION
+LATEST_VERSION = v4_to_v5.TARGET_VERSION
 
 # 识别源库结构的表名（与 db.LEGACY_TABLES 是同一份知识，但故意各写一份：
 # 升级器不认识主程序的常量，主程序也不认识升级器的）

@@ -16,7 +16,7 @@ SCHEMA_PATH = resource("schema.sql")
 
 # 当前程序认识的 schema 版本。库里的 meta.schema_version 必须是这个数，
 # 否则拒绝服务 —— 不做任何就地修补（docs/two-tier-memory.md §8.4）。
-EXPECTED_SCHEMA_VERSION = 4
+EXPECTED_SCHEMA_VERSION = 5
 
 # 主表 → 向量表。两类记忆各一张主表，类型由表承载，没有行级 kind。
 VEC_TABLES: dict[str, str] = {
@@ -53,7 +53,7 @@ class SchemaVersionError(RuntimeError):
         self.expected = expected
         hint = (
             f'humanity-memory upgrade "{path}"                    # 先预览会变成什么样\n'
-            f'humanity-memory upgrade "{path}" --out "{path.with_name(path.stem + ".v4.db")}"'
+            f'humanity-memory upgrade "{path}" --out "{path.with_name(path.stem + ".v5.db")}"'
         )
         super().__init__(
             f"库版本不符：{path}\n"

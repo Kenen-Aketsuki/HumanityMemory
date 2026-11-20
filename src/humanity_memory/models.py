@@ -317,6 +317,7 @@ class LogEntry:
     consolidated: bool
     digest_id: str | None
     embedded: bool
+    retrievals: list[dict[str, Any]] = field(default_factory=list)
     meta: dict[str, Any] = field(default_factory=dict)
     db: str = "workspace"
 
@@ -336,6 +337,7 @@ class LogEntry:
             consolidated=bool(row["consolidated"]),
             digest_id=row["digest_id"],
             embedded=bool(row["embedded"]),
+            retrievals=_loads(row["retrievals"] if "retrievals" in row.keys() else "[]", []),
             meta=_loads(row["meta"], {}),
             db=db,
         )
