@@ -94,6 +94,9 @@ h2{font-size:12px;font-weight:500;color:var(--muted);margin:0;padding:10px 14px 
 .q{color:var(--text);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .t{color:var(--dim);font-size:11px;margin-top:3px;display:flex;gap:8px}
 .tag{color:var(--warn)}
+.mode-strict{color:var(--up)}      /* 严格阈值命中 */
+.mode-fallback{color:var(--warn)}  /* 宽泛层兜底：只是沾边，精度低 */
+.mode-unknown{color:var(--dim)}    /* 旧格式记录，未记 mode */
 .row{padding:10px 16px}
 pre.q{white-space:pre-wrap;word-break:break-word;background:var(--panel);border:1px solid var(--line);
   border-radius:8px;padding:10px 12px;margin:0 0 10px;font:13px/1.5 inherit;color:#e7f0fb}
@@ -259,6 +262,14 @@ function shown(){
   recs.forEach((r,i)=>{if(matchRec(r))out.push({r,i});});
   return out;
 }
+/* 检索模式标签：strict=严格阈值命中；fallback=宽泛层兜底（精度低）；
+   旧记录没有 mode 字段，显示"未记录"而不是瞎猜。 */
+function modeTag(r){
+  const m=r.mode;
+  if(m==='strict')   return '<span class="mode-strict" title="严格阈值命中">严格</span>';
+  if(m==='fallback') return '<span class="mode-fallback" title="严格层没捞到，宽泛层兜底召回，精度较低">宽松兜底</span>';
+  return '<span class="mode-unknown" title="旧格式记录，未记录检索模式">模式未记录</span>';
+}
 function list(sel){
   const el=document.getElementById('list');
   const rows=shown();
@@ -280,6 +291,7 @@ function list(sel){
       '<div class="q">'+esc(x.r.query||'（空查询）')+'</div>'+
       '<div class="t"><span>'+ts(x.r.at)+'</span><span>'+
       (x.r.hit_count||(x.r.hits||[]).length)+' 命中</span>'+
+      modeTag(x.r)+
       (x.r.deep?'<span class="tag">深度</span>':'')+'</div>'+
     '</div>').join('');
   el.querySelectorAll('.item').forEach(node=>{
@@ -330,7 +342,8 @@ function detail(i){
       '<td>'+(h.rank||'')+'</td>'+
       '<td><span class="k" style="background:'+(C[h.kind]||'#8898ad')+'"></span>'+
         esc(NAMES[h.kind]||h.kind)+'</td>'+
-      '<td class="id">'+esc(h.id)+(h.forgotten?' <span class="tag">遗忘层</span>':'')+'</td>'+
+      '<td class="id">'+esc(h.id)+(h.forgotten?' <span class="tag">遗忘层</span>':'')+
+        (h.fallback?' <span class="mode-fallback" title="宽泛层兜底召回">宽松</span>':'')+'</td>'+
       '<td>L'+(h.level==null?'—':h.level)+'</td>'+
       '<td>'+num(h.score,3)+'</td>'+
       '<td class="id">'+num(h.vec_sim,3)+' / '+num(h.lex,2)+'</td>'+
@@ -346,6 +359,7 @@ function detail(i){
         '<span>时间 <b>'+ts(r.at)+'</b></span>'+
         '<span>命中 <b>'+hits.length+'</b></span>'+
         '<span>耗时 <b>'+num(r.elapsed_ms,1)+' ms</b></span>'+
+        '<span>检索模式 '+modeTag(r)+'</span>'+
         '<span>深度回忆 <b>'+(r.deep?'是':'否')+'</b></span>'+
       '</div>'+
       (hits.length?'<table><thead><tr>'+

@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>记忆观测台 · HumanityMemory</title>
+<style>
+:root{
+  --bg:#0b0f16; --panel:#121821; --line:#1f2937; --hover:#17202d;
+  --text:#d6e2f0; --muted:#7d8ea3; --dim:#54637a;
+  --exp:#6fb6ff; --epi:#b9a5ff; --log:#8898ad;
+  --up:#5fd6a0; --warn:#ffc46b; --bad:#f08a8a; --ok:#5fd6a0;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:13px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;}
+header{display:flex;align-items:center;gap:14px;padding:10px 18px;border-bottom:1px solid var(--line)}
+h1{font-size:15px;font-weight:500;margin:0}
+.sub{color:var(--muted);font-size:12px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--ok);display:inline-block;margin-right:5px}
+nav{display:flex;gap:2px;padding:0 12px;border-bottom:1px solid var(--line);background:var(--bg);
+  position:sticky;top:0;z-index:5}
+nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);
+  padding:9px 15px;font:13px/1.4 inherit;cursor:pointer}
+nav button:hover{color:var(--text)}
+nav button.on{color:var(--text);border-bottom-color:var(--exp)}
+main{padding:16px 18px;min-height:calc(100vh - 100px)}
+.view{display:none}
+.view.on{display:block}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin-bottom:14px}
+.row{display:flex;gap:18px;flex-wrap:wrap}
+.kv{color:var(--muted);font-size:12px}
+.kv b{color:var(--text);font-weight:500}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{color:var(--muted);font-weight:500;text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);
+  position:sticky;top:0;background:var(--panel)}
+td{padding:7px 9px;border-bottom:1px solid #161d27;vertical-align:top}
+.id{font-family:ui-monospace,Consolas,monospace;color:var(--muted);font-size:11px}
+.empty{padding:36px 16px;color:var(--dim);text-align:center}
+/* 侧栏可点列表项（复盘记录左侧时间轴 / recall 记录列表）的选中态 */
+.item{cursor:pointer}
+.item:hover{background:var(--hover)}
+.item.on{background:var(--hover);box-shadow:inset 3px 0 0 var(--exp);color:var(--text)}
+.item.on .kv{color:var(--text)}
+.note{color:var(--warn);font-size:12px}
+.k{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:6px;vertical-align:1px}
+.up{color:var(--up)} .down{color:var(--bad)} .warn{color:var(--warn)}
+input,select,button.act{background:#151d28;border:1px solid var(--line);border-radius:6px;
+  color:var(--text);font:12px/1.5 inherit;padding:5px 9px;outline:none}
+input:focus,select:focus{border-color:var(--exp)}
+button.act{cursor:pointer}
+button.act:hover{border-color:var(--exp)}
+button.act:disabled{opacity:.5;cursor:default}
+footer{position:fixed;bottom:0;left:0;right:0;padding:5px 18px;background:var(--bg);
+  border-top:1px solid var(--line);color:var(--dim);font-size:11px;display:flex;justify-content:space-between}
+.scroll{max-height:calc(100vh - 210px);overflow:auto}
+/* 星图 / 检索：嵌入老工具的完整渲染页，占满主区域。
+   main 有 16px padding，负边距让 iframe 铺到边，视觉上跟老工具一致。 */
+iframe.embed{width:100%;height:calc(100vh - 108px);border:0;background:#070b14;
+  border-radius:8px;display:block}
+</style>
+</head>
+<body>
+<header>
+  <h1>🐋 记忆观测台</h1>
+  <span class="sub"><span class="dot" id="dot"></span><span id="meta">连接中…</span></span>
+</header>
+<nav id="nav">
+  <button data-v="starmap" class="on">星图</button>
+  <button data-v="recall">recall 历史</button>
+  <button data-v="review">复盘记录</button>
+  <button data-v="memory">记忆现状</button>
+  <button data-v="search">检索测试</button>
+</nav>
+<main>
+  <section class="view on" id="v-starmap"><iframe class="embed" id="f-starmap" title="星图"></iframe></section>
+  <section class="view" id="v-recall"><iframe class="embed" id="f-recall" title="检索分析"></iframe></section>
+  <section class="view" id="v-review"><div class="empty">复盘记录接入中…</div></section>
+  <section class="view" id="v-memory"><div class="empty">记忆现状接入中…</div></section>
+  <section class="view" id="v-search"><div class="empty">检索测试接入中…</div></section>
+</main>
+<footer>
+  <span id="status">就绪</span>
+  <span id="heartbeat">心跳连接中…</span>
+  <span id="refresh">最后刷新：—</span>
+</footer>
+<script>
+const SIG={starmap:'',recall:'',review:'',memory:''};
+const VIEW_LABEL={starmap:'星图',recall:'recall历史',review:'复盘记录',memory:'记忆现状',search:'检索测试'};
+let cur='starmap', metaLoaded=false;
+
+async function api(path,opts){
+  // 超时兜底：后端偶发卡住（首次加载模型等）时也要让调用方拿到错误、复位按钮，
+  // 否则界面会永久停在"检索中…"。AbortController 能真正中止请求。
+  const ctl=(typeof AbortController!=='undefined')?new AbortController():null;
+  const timer=ctl?setTimeout(()=>ctl.abort(),25000):null;
+  try{
+    const r=await fetch(path,ctl?Object.assign({},opts||{},{signal:ctl.signal}):opts);
+    let d; try{d=await r.json();}catch(e){throw new Error('HTTP '+r.status);}
+    if(d&&d.ok===false&&d.code!=='not_ready') throw new Error(d.message||d.code);
+    return d;
+  }catch(e){
+    if(e&&e.name==='AbortError') throw new Error('请求超时（25s），后端可能正在加载模型，请重试');
+    throw e;
+  }finally{ if(timer)clearTimeout(timer); }
+}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function fmtTime(ms){const d=new Date(ms);const p=n=>String(n).padStart(2,'0');
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());}
+
+// tab 切换
+document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('#nav button').forEach(x=>x.classList.remove('on'));
+  document.querySelectorAll('.view').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on'); cur=b.dataset.v;
+  document.getElementById('v-'+cur).classList.add('on');
+  refreshView(cur,true);
+});
+
+// 会话信息
+async function loadMeta(){
+  try{
+    const d=await api('/api/session');
+    document.getElementById('meta').textContent=
+      d.db.split(/[\\/]/).pop()+' · schema v'+d.schema_version+' · '+d.node_count+' 条记忆';
+    document.getElementById('dot').style.background='var(--ok)';
+    metaLoaded=true;
+  }catch(e){
+    document.getElementById('meta').textContent='连接失败：'+e.message;
+    document.getElementById('dot').style.background='var(--bad)';
+  }
+}
+
+// 视图刷新分发：星图 / recall 由 iframe 内的老工具页自取数；其余走 views.js
+const EMBED_SRC={starmap:'/starmap.html',recall:'/recall.html'};
+function loadEmbed(name,force){
+  const f=document.getElementById('f-'+name); if(!f)return;
+  // 懒加载：首次显示才设 src；force（签名变化/切 tab）时重载以取最新数据
+  if(!f.src || force){ f.src=EMBED_SRC[name]+(force?'?t='+Date.now():''); }
+}
+async function refreshView(name,force){
+  // 检索测试是手动发起：poll 的循环里不含 search，已经保证不自动刷。
+  // 这里绝不能提前 return —— 否则切到该 tab 时表单永远不会初始化，看起来像卡在"接入中"。
+  if(EMBED_SRC[name]){ loadEmbed(name,force); return; }
+  if(typeof window['render_'+name]!=='function') return;
+  try{ await window['render_'+name](force); }
+  catch(e){ document.getElementById('v-'+name).innerHTML=
+    '<div class="card note">加载失败：'+esc(e.message)+'</div>'; }
+}
+
+// 轮询签名：谁变只重拉谁
+async function poll(){
+  try{
+    const s=await api('/api/status');
+    for(const k of ['starmap','recall','review','memory']){
+      if(SIG[k]!==s[k]){ SIG[k]=s[k]; if(cur===k) refreshView(k,true); }
+    }
+    document.getElementById('refresh').textContent='最后刷新：'+fmtTime(s.now);
+    document.getElementById('dot').style.background='var(--ok)';
+  }catch(e){
+    document.getElementById('dot').style.background='var(--bad)';
+    document.getElementById('status').textContent='轮询失败：'+e.message;
+  }
+}
+
+// ---- 心跳探活 ----
+// 后端按租约计时：可见页超时会自动结束进程，避免关掉页面后留下僵尸后端。
+// 切到后台时立刻补发一次，让后端把租约放宽（浏览器会节流后台定时器）。
+// 心跳失败（前端失联）时启动倒计时：距退出 >5s 每 5s 跳一次，≤5s 每 1s 跳一次。
+let hbTimer=null, hbInterval=3000, hbDeadline=0;
+let hbEnabled=true, hbLost=false, hbLostTimer=null;
+
+function stopLostCountdown(){
+  if(hbLostTimer){clearTimeout(hbLostTimer);hbLostTimer=null;}
+  hbLost=false;
+}
+function renderLostCountdown(){
+  if(!hbLost) return;
+  const label=document.getElementById('heartbeat');
+  const left=Math.max(0,Math.ceil((hbDeadline-Date.now())/1000));
+  if(label){
+    label.textContent = left>0 ? '前端失联 · 后端将在 '+left+'s 后退出' : '后端已退出';
+    label.style.color = left<=5 ? 'var(--warn)' : '';
+  }
+  if(left<=0){hbLostTimer=null;return;}          // 已经到底，不再空跳
+  hbLostTimer=setTimeout(renderLostCountdown, left>5?5000:1000);
+}
+
+async function heartbeat(){
+  const visible=document.visibilityState==='visible'?1:0;
+  try{
+    const r=await fetch('/api/heartbeat?visible='+visible,{cache:'no-store'});
+    const d=await r.json();
+    if(!d||!d.ok) throw new Error('bad heartbeat');
+    hbEnabled=d.timeout>0;
+    hbDeadline=Date.now()+Number(d.remaining||0)*1000;  // 后端租约换算成本地截止时间
+    if(hbLost) stopLostCountdown();                      // 心跳恢复 → 撤销失联倒计时
+    const label=document.getElementById('heartbeat');
+    if(label){
+      label.style.color='';
+      label.textContent = hbEnabled
+        ? '心跳正常 · '+(visible?'前台':'后台')+' · 宽限 '+d.timeout+'s'
+        : '心跳探活已关闭';
+    }
+    if(d.interval_ms && d.interval_ms!==hbInterval){
+      hbInterval=d.interval_ms;
+      if(hbTimer){clearInterval(hbTimer);hbTimer=setInterval(heartbeat,hbInterval);}
+    }
+  }catch(e){
+    if(!hbEnabled || hbLost) return;   // 探活已关 / 倒计时已在跑，别重复起定时器
+    hbLost=true;
+    renderLostCountdown();
+  }
+}
+
+loadMeta();
+setTimeout(async()=>{const s=await api('/api/status').catch(()=>null);
+  if(s){for(const k of ['starmap','recall','review','memory'])SIG[k]=s[k];}
+  refreshView(cur,true); // 首屏渲染（views.js 已在上方同步加载完）
+},100);
+setInterval(poll,4000);
+heartbeat();
+hbTimer=setInterval(heartbeat,hbInterval);
+document.addEventListener('visibilitychange',()=>{heartbeat();});
+</script>
+<script src="views.js"></script>
+</body>
+</html>

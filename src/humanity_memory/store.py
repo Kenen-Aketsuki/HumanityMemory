@@ -1714,8 +1714,12 @@ class MemoryStore:
                     "delta": None if prior is None else round(after - prior, 4),
                     "activity_after": round(after, 4),
                     "forgotten": bool(getattr(hit, "forgotten", False)),
+                    # 这条是否由宽泛层（RRF / maxpool）兜底召回；precision 低于严格命中
+                    "fallback": bool(getattr(hit, "fallback", False)),
                 }
             )
+        # mode 语义与 mcp_server.py 的 search 返回一致：只要有一条来自宽泛层就算 fallback。
+        # 与 deep（遗忘层回忆）是两个独立维度——deep 是"去哪找"，mode 是"怎么找/多严格"。
         append_retrieval(
             self.layout.workspace_dir,
             self.cfg,
@@ -1723,6 +1727,7 @@ class MemoryStore:
                 "at": moment,
                 "query": query,
                 "deep": deep_used,
+                "mode": "fallback" if any(r["fallback"] for r in rows) else "strict",
                 "elapsed_ms": round(elapsed_ms, 1),
                 "hit_count": len(rows),
                 "hits": rows,

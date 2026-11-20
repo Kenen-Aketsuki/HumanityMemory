@@ -1215,6 +1215,27 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_analyze(args: argparse.Namespace) -> int:
+    """启动本地可视化分析工具（HTTP 后端 + 浏览器前端，全程只读）。"""
+    from .webtool import serve
+    from .webtool.datasource import SourceError
+
+    try:
+        return serve(
+            args.target,
+            port=args.port,
+            open_browser=not args.no_browser,
+            heartbeat_timeout=args.heartbeat_timeout,
+            hidden_grace=args.hidden_grace,
+            startup_grace=args.startup_grace,
+        )
+    except SourceError as exc:
+        print(f"无法启动观测台：{exc.message}", file=sys.stderr)
+        for line in exc.checklist:
+            print(f"  - {line}", file=sys.stderr)
+        return 2
+
+
 def cmd_starmap(args: argparse.Namespace) -> int:
     """CLI 专用的只读星图；延迟 import，未调用时零开销、零副作用。"""
     from .starmap import run
@@ -1591,6 +1612,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_star.set_defaults(func=cmd_starmap)
+
+    p_an = sub.add_parser(
+        "analyze", help="本地可视化分析工具：HTTP 后端 + 浏览器前端（只读）"
+    )
+    p_an.add_argument("target", help="库根目录 / token 文件 / 项目根 / workspace.db")
+    p_an.add_argument("--port", type=int, default=8765, help="监听端口（默认 8765）")
+    p_an.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    # 默认值与 webtool.server 的 DEFAULT_* 常量一致；0 可关闭自动退出（长时调试用）
+    p_an.add_argument(
+        "--heartbeat-timeout", type=float, default=10.0,
+        help="可见页多久没心跳就自动退出，秒（默认 10；0 = 关闭探活）",
+    )
+    p_an.add_argument(
+        "--hidden-grace", type=float, default=60.0,
+        help="页面在后台时的心跳宽限，秒（默认 60，避免浏览器节流误杀）",
+    )
+    p_an.add_argument(
+        "--startup-grace", type=float, default=60.0,
+        help="启动后等待浏览器打开的宽限，秒（默认 60）",
+    )
+    p_an.set_defaults(func=cmd_analyze)
 
     p_up = sub.add_parser(
         "upgrade",

@@ -498,13 +498,43 @@ type_weight: experience 1.00 / episode 0.96 / log 0.90
 
 ## 只读视图
 
-数据库是唯一事实源。下面三样都是**只读派生**，不写库、不进记忆：
+数据库是唯一事实源。下面这些产物都是**只读派生**，不写库、不进记忆：
 
 | 产物 | 命令 | 内容 |
 | --- | --- | --- |
 | Markdown 导出 | `export --out <目录>` | `知识现状.md`、`经历/YYYY-MM-DD-<摘要>.md`、`日志/YYYY-MM-DD.md` |
 | 星图 | `starmap <目录> --out <HTML>` | 单文件 HTML，节点 = 条目，边 = 语义相似，辉光 = 活跃度 |
 | 检索报告 | `retrieval-report` | 单文件 HTML，含阈值诊断，调参看这个 |
+| **记忆观测台** | `analyze <目录> [--port 8765]` | 本地 HTTP 后端 + 浏览器前端，五个视图合一（见下） |
+
+### 记忆观测台（analyze）
+
+一个把只读视图整合起来的 Web 工具：起一个只监听 `127.0.0.1` 的本地后端，浏览器打开
+`http://127.0.0.1:8765` 即可。双击 `tools/analyze.bat` 或把库目录拖上去也能启动。
+
+```
+humanity-memory analyze "D:/.../libraries/lilith"   # 库目录
+humanity-memory analyze "<项目根>"                   # 按 .ai_memory/token.json 解析库
+humanity-memory analyze workspace.db --port 9999     # 换端口
+```
+
+五个 tab：
+
+| 视图 | 内容 |
+| --- | --- |
+| 星图 | 力导向图，节点 = 条目，边 = 语义相似，辉光 = 活跃度 |
+| recall 历史 | 检索记录 + 热度榜 + 阈值诊断 |
+| 复盘记录 | 按天：遗忘等级变动、活跃度较前一天 diff、新增/顶替/合并明细、md 原文 |
+| 记忆现状 | 当前活跃度 / 遗忘等级 / 距下次裁定倒计时（实时） |
+| 检索测试 | 手输查询跑一次检索，展示分数与**模拟**活跃度增量 |
+
+**全程只读**：`analyze` 不写库、不改活跃度、不写检索日志。特别是「检索测试」——
+它走 `search()`（纯只读）而非 `recall()`，模拟增量只是算出来展示，绝不落库；
+也不会像深度回忆那样复活遗忘层。前端每 4 秒轮询数据源签名，库或报告一变就增量重拉对应视图。
+
+> 观测台是新代码，旧发布版 exe 里没有。`tools/analyze.bat` 默认走源码 `.venv`；
+> 只有重新 `build_release --publish` 之后，才可设 `HM_ANALYZE_USE_PUBLISHED=1` 走发布版。
+> Windows 下可直接用 `python -m humanity_memory.cli analyze <目录>` 免装 exe。
 
 `export` 的 `--out` 必填，没有默认落点：一旦允许自动推导目录，就等于给了它一条
 「悄悄往项目记忆目录写文件」的路径，手写笔记与渲染产物会混在同一层。
@@ -583,6 +613,7 @@ bat 第二行会打印 `Using: published (...)` 或 `source (...)`。
 
 - `docs/two-tier-memory.md` — 两类记忆、等级阶梯、打分与闸门的取舍
 - `docs/workspace-binding-and-token.md` — 工作区绑定、令牌与 registry 的准入语义
+- `docs/external-visualization-tool.md` — 记忆观测台（HTTP 后端 + Web 前端）的设计与只读口径
 
 ## 许可
 
