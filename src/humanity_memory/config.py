@@ -38,6 +38,10 @@ DEFAULT_HOME = Path.home() / ".humanity-memory"
 DEFAULT_CONFIG_NAME = "memory.default.toml"
 OVERRIDE_CONFIG_NAME = "memory.toml"
 
+# 复盘闸门的时间窗缺省值。**单一真值**：gate.py 与这里共用，
+# 别在别处再抄一份 —— 抄两份就会出现"代码说 00:00、文档说 22:30"的漂移。
+DEFAULT_REVIEW_WINDOW = "00:00-08:00"
+
 # 项目里的记忆目录名（与 paths.WORKSPACE_DIR 一致；此处不 import 以免循环依赖）
 _WORKSPACE_DIR = ".ai_memory"
 
@@ -623,6 +627,50 @@ class Config:
     def confidence_settings(self) -> dict[str, Any]:
         """`[confidence]` 段：两条阈值 + 加分/扣分曲线 + 证据级别权重。"""
         return _optional(self.settings, "confidence", default={}) or {}
+
+    @property
+    def review_settings(self) -> dict[str, Any]:
+        """`[review]` 段：复盘闸门 —— 决定 `memory_search` 什么时候放行。
+
+        一律走 `_optional` 而非 `_dig`：库级 memory.toml 可能是这个机制之前
+        写的，缺 `[review]` 段只该退化成默认值，不该让 server 起不来
+        （与 `[forget]` 段同一处理方式）。
+        """
+        return _optional(self.settings, "review", default={}) or {}
+
+    @property
+    def review_window(self) -> str:
+        """允许 search 的时间窗，`HH:MM-HH:MM`（可跨午夜）。空串 = 只认手签 flag。"""
+        return str(self.review_settings.get("window", DEFAULT_REVIEW_WINDOW))
+
+    @property
+    def review_flag_minutes(self) -> int:
+        """`review begin` 默认签发多少分钟的通行证。"""
+        return max(1, int(self.review_settings.get("flag_minutes", 30)))
+
+    @property
+    def review_require_tty(self) -> bool:
+        """签发通行证是否必须在真终端（默认开）。
+
+        注意：这一条只是**弱信号**。`isatty()` 在带伪终端（ConPTY）的环境里
+        会偶发返回 True —— 实测在同一台机器上出现过一次误判。它能挡住
+        「顺手调一次」，挡不住蓄意。真正的硬约束是时间窗与配额。
+        """
+        return bool(self.review_settings.get("require_tty", True))
+
+    @property
+    def review_allow_flag(self) -> bool:
+        """是否开放「手签通行证」这条通道。
+
+        设 false 就只剩时间窗 —— 那是完全由代码保证、不依赖「谁在调」的硬约束。
+        白天一次都搜不了，要补复盘就改 window（一次显式配置修改，看得见）。
+        """
+        return bool(self.review_settings.get("allow_flag", True))
+
+    @property
+    def review_daily_limit(self) -> int:
+        """每天最多签发几张通行证。封的是「就算绕过 TTY 也滥用不了」的天花板。"""
+        return max(1, int(self.review_settings.get("daily_flag_limit", 2)))
 
     def ensure_home(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

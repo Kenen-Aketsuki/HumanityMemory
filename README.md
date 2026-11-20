@@ -83,8 +83,11 @@ humanity-memory log add "今天排查了 XXX，根因是 YYY"
 humanity-memory memory add "ResolveTask 末尾的兜底会被短路" --kind experience --confidence 0.8
 humanity-memory memory add "项目是 Unity 2022.3.62f1" --confidence 0.3 --source ProjectVersion.txt
 humanity-memory memory add "Bug #10805 引导不指餐厅：三条静默出口" --kind episode
-humanity-memory search "引导为什么不触发"
+humanity-memory search "引导为什么不触发" --recall
 ```
+
+> `search` 不加 `--recall` 是**复盘专用**的（只在时间窗内或持通行证时可用），
+> 日常请走 `--recall`：它才会把命中项计入活跃度。见「复盘闸门」。
 
 ## 配置
 
@@ -333,6 +336,47 @@ consolidate_apply(experience=[...], episodes=[...], purge=true)
 直接抄 `skills/humanity-memory/references/consolidate-task.md` 的模板，
 把两处 `{{占位}}` 换成这个项目的情况，其余别改 —— 每项目全篇改一遍会漂成七八个版本。
 不想清空原始日志就传 `purge=false`。
+
+### 复盘闸门：`memory_search` 为什么默认关着
+
+活跃度只由「真实使用」累加：`memory_recall` 给命中项加，`memory_search` 刻意不加。
+如果日常能随手 search，这些检索就不计入活跃度，遗忘曲线随之失真 ——
+记忆不老化，或者老化了但不是因为它真的没被用。
+
+所以 `memory_search` 只在复盘时开放。判据全是**代码能核验的事实**，不看模型自觉：
+
+| 途径 | 条件 |
+| --- | --- |
+| 时间窗 | 本地时间落在 `[review].window`（默认 `00:00-08:00`，可跨午夜）。定时复盘天然落在这里，无需人工动作 |
+| 手签通行证 | 在**真终端**跑 `review begin`，默认 30 分钟，到期自动失效 |
+
+```bash
+humanity-memory review status                 # 现在能不能搜、下次什么时候开
+humanity-memory review begin                  # 签 30 分钟（--minutes 2h / --reason "补复盘"）
+humanity-memory review end                    # 提前收回
+```
+
+`review begin` 会检查 stdin 是不是 TTY（终端是 TTY，脚本和 agent 的管道不是），
+用来挡住「agent 在管道里顺手调一次」。但这是**弱信号**：实测带伪终端（ConPTY）
+的环境里，`isatty()` 会偶发误判成 True。
+
+所以真正兜底的是三条不关心「谁在调」的约束：
+
+| 约束 | 强度 |
+| --- | --- |
+| 时间窗 | 硬 —— 白天就是搜不了，除非改配置 |
+| 每日配额（默认 2 张） | 硬 —— 就算绕过 TTY，也只有这么多分钟 |
+| 审计（pid / ppid / 时间 / 查询） | 事后可查 |
+
+被拒时返回 `code=REVIEW_REQUIRED`（CLI 退出码 4），并记一笔到
+`~/.humanity-memory/diagnostics/review.log`（只追加）。
+
+**要绝对硬就关掉整条手签通道**：`[review].allow_flag = false`。之后只剩时间窗，
+白天一次都搜不了；要补复盘就改 `window` —— 一次显式配置修改，看得见。
+
+这层挡的是「顺手就搜」，不挡蓄意对抗（伪终端、改配置、直读 sqlite）。
+没有任何纯软件手段能区分「用户按的回车」和「agent 调用同一个 exe」——
+前两者会留在 diff 与审计里，后者靠事后核对。
 
 ## 数据模型
 

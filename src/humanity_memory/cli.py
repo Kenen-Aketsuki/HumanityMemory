@@ -96,6 +96,19 @@ def _open_readonly(args: argparse.Namespace | None = None) -> MemoryStore:
     return MemoryStore(Config.load(library_dir=layout.library_dir), layout)
 
 
+def _review_gate(args: argparse.Namespace) -> tuple[Config, Any]:
+    """CLI 检索入口的闸门：(cfg, gate.State)。
+
+    与 MCP 侧共用 `gate.state` —— 两边判据必须同一份，否则终端能搜、
+    agent 搜不了（或反过来），活跃度照样算不准。
+    """
+    from . import gate
+
+    layout = _layout(args)
+    cfg = Config.load(library_dir=layout.workspace_dir)
+    return cfg, gate.state(cfg)
+
+
 # ---------------------------------------------------------------- 命令
 
 
@@ -272,6 +285,30 @@ def cmd_log(args: argparse.Namespace) -> int:
 
 
 def cmd_search(args: argparse.Namespace) -> int:
+    # recall / deep 是「使用记忆」（会强化命中项 / 累计 revive_hits），不受闸门限制。
+    # 裸 search 刻意不改访问强度 —— 日常拿它顶替 recall，活跃度就会算成空的。
+    if not (args.recall or args.deep):
+        from . import gate
+
+        cfg, gate_state = _review_gate(args)
+        if not gate_state.open:
+            gate.audit(
+                cfg.home,
+                "search_blocked",
+                source=gate_state.source,
+                window=gate_state.window,
+                next_open=gate_state.next_open,
+                query=args.query[:80],
+                entry="cli",
+            )
+            if args.json:
+                _dump({"ok": False, "code": "REVIEW_REQUIRED", **gate_state.to_dict()})
+            else:
+                print(f"[REVIEW_REQUIRED] {gate_state.message()}", file=sys.stderr)
+                print("  复盘需在真终端签发通行证：humanity-memory review begin", file=sys.stderr)
+                print("  日常检索改用：humanity-memory search <query> --recall", file=sys.stderr)
+            return 4
+
     with _open(args) as store:
         if args.deep:
             result = store.deep_recall(args.query, limit=args.limit)
@@ -303,6 +340,98 @@ def cmd_search(args: argparse.Namespace) -> int:
             item = hit.item
             kind = _KIND_LABEL.get(item.kind, item.kind)
             print(f"{rank:2d}. [{item.id}] score={hit.score:.3f} ({kind}) {_short(item.content)}")
+    return 0
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    """复盘闸门：查看状态 / 签发通行证 / 提前收回。
+
+    通行证由**人**签发，不由 agent 签发 —— `begin` 要求 stdin 是 TTY。
+    这条限制是整件事的地基：终端是 TTY，agent 的 Bash 管道不是。
+    """
+    from . import gate
+
+    layout = _layout(args)
+    cfg = Config.load(library_dir=layout.workspace_dir)
+    action = getattr(args, "action", None) or "status"
+
+    if action == "status":
+        state = gate.state(cfg)
+        if args.json:
+            _dump({**state.to_dict(), "flag": str(gate.flag_path(cfg.home))})
+            return 0
+        print(f"search 放行：{'是' if state.open else '否'}（来源 {state.source}）")
+        print(f"  窗口    ：{state.window or '未启用'}")
+        if state.expires_at:
+            print(f"  到期    ：{state.expires_at}")
+        if not state.open and state.next_open:
+            print(f"  下次开放：{state.next_open}")
+        print(f"  flag    ：{gate.flag_path(cfg.home)}")
+        print(f"  签发时长：{cfg.review_flag_minutes} 分钟（默认）")
+        if cfg.review_allow_flag:
+            print(
+                f"  手签通道：开（今日已签 {gate.count_flag_today(cfg.home)}"
+                f" / {cfg.review_daily_limit}）"
+            )
+        else:
+            print("  手签通道：已关闭（只认时间窗）")
+        return 0
+
+    if action == "end":
+        gate.close_flag(cfg.home)
+        gate.audit(cfg.home, "review_end")
+        print("通行证已收回。search 回到「只认时间窗」。")
+        return 0
+
+    # ---- begin ----
+    if not cfg.review_allow_flag:
+        gate.audit(cfg.home, "review_begin_denied", reason="flag-disabled")
+        print(
+            "[REVIEW_DENIED] 手签通道已关闭（[review].allow_flag = false）。\n"
+            "  现在只认时间窗；要临时开放请改 [review].window。",
+            file=sys.stderr,
+        )
+        return 4
+
+    used = gate.count_flag_today(cfg.home)
+    if used >= cfg.review_daily_limit:
+        gate.audit(cfg.home, "review_begin_denied", reason="daily-limit", used=used)
+        print(
+            f"[REVIEW_DENIED] 今天已签发 {used} 张通行证（上限 {cfg.review_daily_limit}）。\n"
+            "  配额是天花板：就算绕过了 TTY 判断，也滥用不了。",
+            file=sys.stderr,
+        )
+        return 4
+
+    if cfg.review_require_tty and not gate.is_interactive():
+        gate.audit(cfg.home, "review_begin_denied", reason="no-tty")
+        print(
+            "[REVIEW_DENIED] review begin 必须在交互终端里执行。\n"
+            "  原因：通行证由人签发；管道 stdin（脚本 / agent / 定时任务）没有这个资格。",
+            file=sys.stderr,
+        )
+        return 4
+
+    try:
+        minutes = gate.parse_minutes(
+            getattr(args, "minutes", None), cfg.review_flag_minutes
+        )
+    except gate.GateError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    payload = gate.open_flag(
+        cfg.home, minutes, reason=getattr(args, "reason", None)
+    )
+    gate.audit(
+        cfg.home,
+        "review_begin",
+        minutes=minutes,
+        expires_at=payload["expires_at"],
+        reason=payload.get("reason") or "",
+    )
+    print(f"复盘通行证已签发：{payload['expires_at']} 前 memory_search 可用（{minutes} 分钟）。")
+    print("  到期自动失效；提前收回：humanity-memory review end")
     return 0
 
 
@@ -1290,6 +1419,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_search.add_argument("--json", action="store_true")
     p_search.set_defaults(func=cmd_search)
+
+    p_review = sub.add_parser(
+        "review", help="复盘闸门：签发 / 查看 / 收回 memory_search 通行证"
+    )
+    p_review.add_argument(
+        "action", nargs="?", default="status", choices=["status", "begin", "end"]
+    )
+    p_review.add_argument(
+        "--minutes", default=None, help="通行证时长：30 / 30m / 2h（默认取配置）"
+    )
+    p_review.add_argument("--reason", default=None, help="写进审计的原因")
+    p_review.add_argument("--json", action="store_true")
+    p_review.set_defaults(func=cmd_review)
 
     p_cons = sub.add_parser("consolidate", help="复盘")
     p_cons.add_argument("action", choices=["preview", "apply"])

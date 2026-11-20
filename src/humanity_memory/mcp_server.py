@@ -16,7 +16,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from . import __version__, bindings, keys, rules
+from . import __version__, bindings, gate, keys, rules
 from .config import NO_LIBRARY, Config
 from .paths import (
     WORKSPACE_DIR,
@@ -44,6 +44,13 @@ INSTRUCTIONS_TAIL = """\
 - 一个 server 可以服务多个项目：如果在某个具体项目里工作，而 memory_stats 显示的工作区
   不是你预期的那个，先调用 memory_use_workspace 传入项目根目录再继续。
 
+检索纪律：
+- 日常找记忆**一律 memory_recall(context=当前在做什么)**：它按当前话题召回并强化命中项，
+  会计入活跃度，遗忘曲线才反映真实使用。
+- memory_search 是**复盘专用**：只在复盘时间窗内、或持终端手签的通行证时可用。
+  日常调用会返回 code=REVIEW_REQUIRED。**被拒就不要再试**，也不要绕道用
+  memory_list / export 去翻全量（那只翻不算用，活跃度一样是空的），改用 recall。
+
 绑定纪律（未接入时）：
 - 先调用 memory_bind_status 看 code。code 不为 null 时**先向用户提问**：
   新建独立库 / 并入已有库 / 沿用本目录已有的库 / 本次不接入。
@@ -69,6 +76,11 @@ def _as_list(kinds: list[str] | str | None) -> list[str]:
 
 def _err(message: str) -> dict[str, Any]:
     return {"ok": False, "error": message}
+
+
+def _err_code(code: str, message: str, **extra: Any) -> dict[str, Any]:
+    """带机器可读 code 的拒绝。模型读得懂原因，就不会原地重试。"""
+    return {"ok": False, "code": code, "error": message, **extra}
 
 
 def build_server(
@@ -571,8 +583,10 @@ def build_server(
     @tool(
         name="memory_search",
         description=(
-            "混合检索（经验 + 经历 + 日志，自动含全局库）。"
-            "不改访问强度；要落证据请用 memory_verify。"
+            "复盘专用检索（经验 + 经历 + 日志，自动含全局库）。"
+            "只在复盘时间窗内、或持手签通行证时可用；日常调用会被拒。"
+            "日常找东西请用 memory_recall —— 它按当前话题召回并强化命中项，"
+            "会计入活跃度；search 刻意不改访问强度，拿它顶替 recall 会让活跃度失真。"
         ),
     )
     def memory_search(
@@ -591,6 +605,27 @@ def build_server(
             include_invalid: 是否包含已失效条目（查历史用）。
             format: lines（默认，一行一条，省 token）| full（带分数与元数据）。
         """
+        # 闸门先于一切：不满足就硬拒，别把「模型试出来能搜」变成一个可选项。
+        # 判据全在 gate 里（时间窗 / 手签 flag），不经模型自述。
+        gate_state = gate.state(cfg)
+        if not gate_state.open:
+            gate.audit(
+                cfg.home,
+                "search_blocked",
+                source=gate_state.source,
+                window=gate_state.window,
+                next_open=gate_state.next_open,
+                query=query[:80],
+            )
+            return _err_code(
+                "REVIEW_REQUIRED",
+                gate_state.message(),
+                gate=gate_state.to_dict(),
+                hint=(
+                    "日常用 memory_recall(context=当前在做什么)：按话题召回并强化命中项，"
+                    "会计入活跃度。复盘需在终端跑 `humanity-memory review begin` 签发通行证。"
+                ),
+            )
         try:
             hits = _st().search(
                 query,

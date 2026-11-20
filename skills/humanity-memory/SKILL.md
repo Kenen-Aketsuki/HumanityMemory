@@ -86,8 +86,9 @@ description: 仿生记忆库的读写规范。需要跨会话记住用户偏好�
 > 所以要查精确的报错栈、完整时间线、当时的原始措辞，**必须在复盘前**查。
 > 如果某天的原始记录很重要，复盘时改传 `purge=false` —— 日志会保留并标记为已复盘。
 >
-> 检索很便宜，别吝啬：`memory_search(..., kinds=["log"])` 只查日志层，
-> `log_list(day="today")` 按天列原文，`kinds` 不传才是全部。
+> 检索很便宜，别吝啬：`log_list(day="today")` 按天列原文，`memory_recall(...)` 按话题召回。
+> **`memory_search` 只在复盘时开放**（见「检索：日常 recall」一节），白天调用会被
+> `REVIEW_REQUIRED` 挡回来 —— 那不是故障，是设计。
 
 ## 可信度：证据决定，不是感觉决定
 
@@ -234,15 +235,25 @@ memory_deep_recall("那次彻底失联的排查")     # 只翻 0 级，命中带
 
 0 级待满 `level0_purge_days`（180 天）还没攒够复活次数，就进删除候选 —— 只报告，删不删你说。
 
-## 检索：别只查一次
+## 检索：日常 recall，search 留给复盘
 
 ```
-memory_search("引导 不触发", kinds=["experience"], limit=6)   # 只查经验
 memory_recall("当前在做的事")                                  # 按话题召回 + 给命中项记活跃度
+memory_search("引导 不触发", kinds=["experience"], limit=6)   # 仅复盘：时间窗内或持通行证
 ```
 
-**`memory_search` 只查不改**（除访问计数），`memory_recall` 会强化命中项——日常用 recall，
-单纯核对用 search。**两者都不看遗忘层**，要翻旧账用 `memory_deep_recall`。
+**日常一律用 `memory_recall`**：它会强化命中项、计入活跃度，遗忘曲线才反映真实使用。
+
+**`memory_search` 刻意不改访问强度，因此只在复盘时开放** —— 本地时间落在
+`[review].window`（默认 00:00–08:00）内，或在真终端跑 `humanity-memory review begin`
+签发一张限时通行证。日常调用返回 `code=REVIEW_REQUIRED`：
+
+- **别重试**，它不会因为多试几次就放开；
+- **别绕道**用 `memory_list` / `export` 翻全量 —— 那只翻不算用，活跃度一样是空的；
+- 该做的是改用 `memory_recall`，把「我在找什么」写进 `context`。
+
+**两者都不看遗忘层**，要翻旧账用 `memory_deep_recall`。日常临时需要盘点可以请人
+在终端签一张 30 分钟的通行证，而不是自己想办法绕过。
 
 **要查历史别忘开两个开关**：`include_archived=true`（归档区）、`include_invalid=true`（已失效）。
 默认都关着，因为大部分时候你不想要三年前的噪音；但排查"这条为什么变了"的时候，
@@ -262,7 +273,7 @@ memory_recall("当前在做的事")                                  # 按话题
 | `memory_list` | 列条目；`kinds` 不传即全部 |
 | `log_list` | 按日期列日志 |
 | `memory_recall` | 按当前话题召回 + 强化命中项 |
-| `memory_search` | 只查不改；`format="full"` 取全文 |
+| `memory_search` | **复盘专用**（时间窗内或持终端通行证）；不改访问强度 |
 | `memory_deep_recall` | 只翻遗忘层（0 级）；命中的经历累计复活次数 |
 | `memory_judge` | 跑到期裁定：按周期活跃度升降等级；没到期什么都不写 |
 | `consolidate_preview` | 取当天待复盘日志 |
