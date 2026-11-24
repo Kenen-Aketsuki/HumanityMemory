@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,13 +17,6 @@ from urllib.parse import parse_qs, urlparse
 from .datasource import SourceError, WebSource
 
 _STATIC_DIR = Path(__file__).parent / "static"
-
-# 心跳默认值（秒）。可见页 3s 发一次、10s 无心跳就退出；后台标签页被浏览器
-# 节流到分钟级，放宽到 60s；启动宽限 60s 等浏览器打开，避免刚启动就被杀。
-DEFAULT_HEARTBEAT_TIMEOUT = 10.0
-DEFAULT_HIDDEN_GRACE = 60.0
-DEFAULT_STARTUP_GRACE = 60.0
-_HEARTBEAT_INTERVAL_MS = 3000
 
 
 class APIError(Exception):
@@ -75,8 +67,8 @@ class Handler(BaseHTTPRequestHandler):
             )
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        # 精简访问日志：4s 签名轮询 + 3s 心跳不该刷屏
-        if "/api/status" in (self.path or "") or "/api/heartbeat" in (self.path or ""):
+        # 精简访问日志：4s 签名轮询不该刷屏
+        if "/api/status" in (self.path or ""):
             return
         super().log_message(fmt, *args)
 
@@ -105,8 +97,6 @@ class Handler(BaseHTTPRequestHandler):
             routes: dict[str, Callable[[dict[str, list[str]]], Any]] = {
                 "/api/session": lambda q: self.source.session(),
                 "/api/status": lambda q: {**self.source.signatures(), "now": int(time.time() * 1000)},
-                # 心跳只 touch 时间戳，不碰库、不算签名 —— 每 3s 调用也要足够轻
-                "/api/heartbeat": lambda q: self._heartbeat(q),
             }
             # 延迟导入：各视图模块到对应阶段才建，未建时返回明确错误
             extra = self._view_routes()
@@ -135,15 +125,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "code": "not_found", "message": f"未知端点：{path}"}, 404)
         except Exception as exc:  # noqa: BLE001
             self._error(exc)
-
-    def _heartbeat(self, qs: dict[str, list[str]]) -> dict[str, Any]:
-        """前端心跳：刷新存活时间戳，并回传当前宽限窗口供 UI 显示。
-
-        `visible=0` 表示页面在后台（浏览器会节流定时器），后端改用更长的宽限期。
-        只有这个端点会 touch —— 状态轮询 / 检索请求失败时，心跳仍独立生效。
-        """
-        visible = (qs.get("visible") or ["1"])[0] != "0"
-        return self.server.touch(visible=visible)  # type: ignore[attr-defined]
 
     def _view_routes(self) -> dict[str, Callable[[Any], Any]]:
         """各阶段视图路由；模块不存在时给出明确提示而不是 500。"""
@@ -179,9 +160,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class WebServer(ThreadingHTTPServer):
-    """带心跳租约的本地服务：前端断线后自动 shutdown，不留僵尸进程。
-
-    租约状态只在内存里，不落盘、不进库 —— 观测台对记忆库仍是纯只读。
+    """本地只读服务：进程生命周期由用户掌控（Ctrl+C 退出），无自动探活。
     """
 
     daemon_threads = True
@@ -191,69 +170,9 @@ class WebServer(ThreadingHTTPServer):
         self,
         addr: tuple[str, int],
         source: WebSource,
-        *,
-        heartbeat_timeout: float = DEFAULT_HEARTBEAT_TIMEOUT,
-        hidden_grace: float = DEFAULT_HIDDEN_GRACE,
-        startup_grace: float = DEFAULT_STARTUP_GRACE,
     ) -> None:
         self.source = source
-        # timeout <= 0 表示关闭自动退出（调试用）；watchdog 不会启动
-        self.heartbeat_timeout = float(heartbeat_timeout)
-        self.hidden_grace = max(float(hidden_grace), self.heartbeat_timeout)
-        self.startup_grace = max(float(startup_grace), 1.0)
-        self._hb_lock = threading.Lock()
-        self._last_seen = time.monotonic()
-        # 启动期先用宽限期当租约：浏览器还没打开时不能按 10s 判死
-        self._lease = self.startup_grace
-        self._activated = False
         super().__init__(addr, Handler)
-
-    def touch(self, *, visible: bool) -> dict[str, Any]:
-        """收到一次心跳：刷新最后存活时间与本次租约长度。"""
-        with self._hb_lock:
-            self._last_seen = time.monotonic()
-            self._lease = self.heartbeat_timeout if visible else self.hidden_grace
-            self._activated = True
-            remaining = max(0.0, self._last_seen + self._lease - time.monotonic())
-            return {
-                "ok": True,
-                "now": int(time.time() * 1000),
-                "interval_ms": _HEARTBEAT_INTERVAL_MS,
-                "timeout": round(self._lease, 1),
-                "remaining": round(remaining, 1),
-            }
-
-    def heartbeat_status(self) -> dict[str, Any]:
-        """只读快照，便于测试与排查（不改变 last_seen）。"""
-        with self._hb_lock:
-            remaining = max(0.0, self._last_seen + self._lease - time.monotonic())
-            return {
-                "activated": self._activated,
-                "timeout": self._lease,
-                "remaining": round(remaining, 2),
-            }
-
-    def start_watchdog(self) -> threading.Thread | None:
-        """起守护线程盯租约；超时后从线程里调 shutdown()（不能在主线程自shutdown）。"""
-        if self.heartbeat_timeout <= 0:
-            return None
-
-        def loop() -> None:
-            while True:
-                time.sleep(0.25)
-                with self._hb_lock:
-                    # 启动期的 lease 就是 startup_grace，第一个心跳会把它换成正式超时，
-                    # 不需要额外分支 —— 否则浏览器一直没打开时反而永远不退出。
-                    idle = time.monotonic() - self._last_seen
-                    lease = self._lease
-                if idle > lease:
-                    print(f"\n前端心跳中断超过 {lease:g}s，观测台自动退出。", flush=True)
-                    self.shutdown()
-                    return
-
-        thread = threading.Thread(target=loop, name="hm-heartbeat-watchdog", daemon=True)
-        thread.start()
-        return thread
 
 
 def serve(
@@ -261,20 +180,11 @@ def serve(
     *,
     port: int = 8765,
     open_browser: bool = True,
-    heartbeat_timeout: float = DEFAULT_HEARTBEAT_TIMEOUT,
-    hidden_grace: float = DEFAULT_HIDDEN_GRACE,
-    startup_grace: float = DEFAULT_STARTUP_GRACE,
 ) -> int:
-    """启动本地服务：Ctrl+C 或前端心跳超时都会优雅退出。返回进程退出码。"""
+    """启动本地服务：Ctrl+C 优雅退出。返回进程退出码。"""
     source = WebSource(target)
     try:
-        server = WebServer(
-            ("127.0.0.1", port),
-            source,
-            heartbeat_timeout=heartbeat_timeout,
-            hidden_grace=hidden_grace,
-            startup_grace=startup_grace,
-        )
+        server = WebServer(("127.0.0.1", port), source)
     except OSError as exc:
         raise SourceError("port_busy", f"端口 {port} 被占用：{exc}\n换一个：--port <其它>") from exc
 
@@ -285,13 +195,6 @@ def serve(
     if source.cfg_error:
         print(f"  配置提示：{source.cfg_error}（已退回默认参数）")
     print("  只读模式：不写库、不改活跃度、不写检索日志")
-    if server.heartbeat_timeout > 0:
-        print(
-            f"  心跳探活：可见页 {server.heartbeat_timeout:g}s / 后台页 "
-            f"{server.hidden_grace:g}s 无心跳自动退出；启动宽限 {server.startup_grace:g}s"
-        )
-    else:
-        print("  心跳探活：已关闭（--heartbeat-timeout 0）")
     print("  按 Ctrl+C 退出")
     if open_browser:
         try:
@@ -299,7 +202,6 @@ def serve(
         except Exception:  # noqa: BLE001 - 打不开浏览器不影响服务
             pass
 
-    server.start_watchdog()
     try:
         server.serve_forever(poll_interval=0.3)
     except KeyboardInterrupt:

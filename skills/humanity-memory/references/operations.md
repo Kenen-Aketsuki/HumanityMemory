@@ -122,13 +122,12 @@ humanity-memory doctor
 逐项检查扩展、FTS、**append-only 触发器是否安装**、schema 维度、embedding 探活、
 信条文件。任何一项失败退出码为 1。
 
-### 客户端里工具只剩 6 个（记忆相关全不见了）
+### 调读写工具返回「拒绝 + checklist」
 
-**这不是安装坏了，是拒绝态。** 未接入时 server 只注册
-`memory_bind_status` / `memory_bind_new` / `memory_bind_existing` /
-`memory_bind_adopt` / `memory_bind_decline` / `memory_use_workspace` 这 6 个，
-其余 24 个（读写、检索、复盘）**根本不注册** —— 模型看不到就不会误调，
-也就不会出现"agent 以为写入成功"这类事故。
+**这不是安装坏了，是拒绝态。** 2026-11-24 起工具面**始终全量注册**（不再裁剪）：
+未接入时所有记忆工具都可见，但读写、检索、复盘类调用一律返回
+`ok:false` + `code` + `checklist`。`memory_bind_status` / `memory_bind_*` /
+`memory_use_workspace` 不在拒绝范围内，未接入时照常可用。
 
 第一步永远是看 `code`，别猜：
 
@@ -154,12 +153,14 @@ MCP 客户端偶尔会用「应用所在目录」而不是项目目录起一个 
 memory_use_workspace(path="D:/proj/YourProject")
 ```
 
-它会**在同一进程内**校验令牌、切换库，并把 24 个工具当场挂上（返回里的
-`tools_registered` 就是挂载数量），不需要重启客户端。
-若客户端只是缓存了旧的 `tools/list`，刷新/重开会话也能好。
+它会**在同一进程内**校验令牌、切换库；工具本来就全部在线，切换后读写
+守卫自动放行，不需要重启客户端、也不需要重新挂载工具。
+若客户端只是缓存了旧的会话状态，刷新/重开会话也能好。
 
-判断"到底是不是拒绝态"的可靠办法：能调通 `memory_stats` 就说明完整工具面已注册；
-调不通（报 unknown tool）才是真的只剩 6 个。
+判断"到底是不是拒绝态"的可靠办法：`memory_stats` 返回 `ok:false` + `code`
+就是拒绝态（工具可见但未接入）；能返回统计数字就说明已接入。
+工具现在始终全量注册，不存在"调不通（unknown tool）"的情况 ——
+遇到 unknown tool 是客户端没连上 server，不是拒绝态。
 
 ### `logs 表是 append-only：禁止修改已写入的历史内容`
 

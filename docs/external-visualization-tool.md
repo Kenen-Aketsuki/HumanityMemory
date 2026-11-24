@@ -16,11 +16,11 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 启动方式 | `humanity-memory analyze <token路径 或 库根目录> [--port] [--no-browser] [--heartbeat-timeout] [--hidden-grace] [--startup-grace]` |
+| 启动方式 | `humanity-memory analyze <token路径 或 库根目录> [--port] [--no-browser]` |
 | 后端 | Python 标准库 `http.server`，只监听 `127.0.0.1`，全程只读 |
 | 前端 | 单页 HTML（统一外壳 + 5 个视图），无 CDN、无外部依赖、断网可用 |
 | 实时性 | 前端轮询数据源签名，库/报告一变就重新拉对应视图，不缓存陈旧快照 |
-| 进程生命周期 | 前端每 3s 报心跳；可见页 10s / 后台页 60s 无心跳则后端自动退出，不留僵尸进程（§8.1） |
+| 进程生命周期 | 用户掌控：Ctrl+C 优雅退出（心跳探活已移除，避免前端切后台被节流导致后端误杀） |
 | 五大视图 | ① 星图可视化（现有）② recall 历史分析（现有）③ **复盘记录**（按天，原 judge 历史扩展）④ **记忆现状**（实时，新）⑤ 检索测试（全新） |
 
 **明确不做**：不改记忆本体、不写活跃度、不写检索日志、不触发裁定、不接外部服务。
@@ -147,7 +147,6 @@
 
 ```
 humanity-memory analyze <target> [--port 8765] [--no-browser]
-    [--heartbeat-timeout 10] [--hidden-grace 60] [--startup-grace 60]
 ```
 
 `--target` 接受（与 `starmap` / 只读工具一致）：
@@ -164,12 +163,11 @@ humanity-memory analyze <target> [--port 8765] [--no-browser]
 
 1. 解析 target → layout，校验 `workspace.db` 存在且 schema 可读；
 2. 探测 `retrieval/`、`reports/judge/` 是否存在（缺失记为"暂无数据"，非致命）；
-3. 起 `ThreadingHTTPServer(("127.0.0.1", port), Handler)`，租约初始为启动宽限期；
-4. 打印 `http://127.0.0.1:<port>` 与心跳策略；`--no-browser` 之外则调默认浏览器打开；
-5. 起 watchdog 守护线程；Ctrl+C / 心跳超时都会走 `shutdown()` 优雅退出，无临时文件残留。
+3. 起 `ThreadingHTTPServer(("127.0.0.1", port), Handler)`；
+4. 打印 `http://127.0.0.1:<port>`；`--no-browser` 之外则调默认浏览器打开；
+5. Ctrl+C 走 `shutdown()` 优雅退出，无临时文件残留。
 
 > 端口被占：默认 8765，失败时提示 `--port <其它>`，不静默换端口。
-> `--heartbeat-timeout 0` 关闭自动退出（长时调试用），此时 watchdog 不启动。
 
 ---
 
@@ -187,7 +185,6 @@ humanity-memory analyze <target> [--port 8765] [--no-browser]
 | `/api/memory` | GET | `{nodes:[{id,kind,level,activity,next_judge_ms,due,...}], meta:{levels,now}}`，实时算倒计时 | 只读扫 `knowledge`/`episodes` + `LevelTable.period_ms()`；字段见 §6.2 |
 | `/api/search-test` | POST | `{hits:[...], simulated:[...], took_ms, note}` | 见 §7 |
 | `/api/status` | GET | `{starmap:"<sig>", recall:"<sig>", review:"<sig>", memory:"<sig>", now}` | 见 §8 |
-| `/api/heartbeat?visible=1\|0` | GET | `{ok, now, interval_ms, timeout, remaining}`；**只 touch 租约，不读库、不算签名** | 见 §8.1 |
 
 **重构要求**：`starmap.run()` 目前把「取数 + 等级/活跃度 + 组装 graph + 写文件 + 打印」揉在一起。
 需抽出 `build_graph_payload(db, args) -> dict`（纯取数，不写文件），CLI 的 `run()` 与后端
@@ -370,33 +367,12 @@ POST /api/search-test  {"query": "...", "limit": 8, "kinds": null}
   `tests/test_webtool.py::test_signature_stable_across_reads`。同理，只读断言的快照
   也只比 `.db` 的 `(mtime, size)` 与 WAL 字节数，不把 `-shm` 算进去。
 
-### 8.1 心跳探活与自动退出
+### 8.1 心跳探活与自动退出（已移除）
 
-轮询只证明"后端还活着"，不能证明"前端还在看"。之前关掉页面后后端会一直挂在端口上，
-所以补一条反向契约：**前端报活、后端按租约自杀**。
-
-| 项 | 值 | 理由 |
-| --- | --- | --- |
-| 前端心跳间隔 | 3s（由 `/api/heartbeat` 的 `interval_ms` 回传，前端据此设定时器） | 远小于最短超时，容忍偶发抖动 |
-| 可见页超时 | 10s（`--heartbeat-timeout`） | 用户关页面 / 前端崩溃后快速回收端口 |
-| 后台页宽限 | 60s（`--hidden-grace`） | 浏览器把后台 `setInterval` 节流到分钟级，按 10s 判会误杀 |
-| 启动宽限 | 60s（`--startup-grace`） | 给浏览器启动留时间；期间不按正式超时判死 |
-| 可见性切换 | `visibilitychange` 时立即补发一次 | 让后端尽早从 10s 租约切到 60s 租约 |
-
-**前端失联倒计时**：心跳失败时，底部状态从「心跳正常 · …」切成
-「前端失联 · 后端将在 Ns 后退出」。N 由最后一次成功心跳回传的 `remaining` 换算成本地截止时间；
-**距退出 >5s 每 5s 跳一次，≤5s 每 1s 跳一次**并转警告色，归零显示「后端已退出」且停止定时器。
-心跳一恢复就撤销倒计时、复原状态。正常运行时不显示倒计时——否则 3s 一次的心跳会把数字
-反复刷回 10s，只剩无意义闪动。
-
-实现位于 `WebServer`：`touch(visible)` 在锁内更新 `_last_seen` 与 `_lease`；
-`start_watchdog()` 每 0.25s 比对 `monotonic() - _last_seen > _lease`，超时就从**守护线程**
-调 `shutdown()`（`serve_forever` 在主线程，自己 shutdown 自己会死锁）。租约只在内存里，
-不落盘、不进库 —— 观测台的只读承诺不变。
-
-只有 `/api/heartbeat` 会 touch；状态轮询和检索请求都不算报活，否则一次慢查询期间
-前端看似"还在通信"却实则已失联。心跳是裸 `fetch`，不走带 25s 超时的 `api()`，
-避免慢请求把心跳也拖死。设 `--heartbeat-timeout 0` 可整条关掉。
+> **2026-11-24 移除**：前端切后台后浏览器把定时器节流到分钟级，后端收不到心跳就自杀，
+> 导致"页面还在但后端已退出"。自动退出带来的僵尸进程风险远小于误杀成本，整条机制
+> （`/api/heartbeat` 端点、`WebServer` 租约/watchdog、CLI 三个宽限参数、前端心跳
+> UI 与失联倒计时）已删除；进程生命周期改为用户掌控：Ctrl+C 优雅退出。
 
 ---
 
@@ -453,9 +429,7 @@ POST /api/search-test  {"query": "...", "limit": 8, "kinds": null}
    ⑤ `invalidated_by` 进"顶替"块、`event='dedup'` 进"合并"块，两者不混（island 实测 5 / 9 条）。
 7. **记忆现状倒计时（§6.2）**：断言 `next_ms = period_start + LevelTable.period_ms(level, dimension)`
    与 `lifecycle.is_due` 同判据；level≤0→遗忘层、`period_start` 空→未计时、remain≤0→已到期。
-8. **心跳探活（§8.1）**：心跳端点按 visible 返回不同租约；不发心跳时 watchdog 真的让
-   `serve_forever` 线程退出；持续心跳期间不被误杀；`timeout=0` 不启动 watchdog；
-   前端 HTML 必须含 periodic 心跳 + `visibilitychange` 补发。
+8. ~~**心跳探活（§8.1）**~~：已随 §8.1 一并移除（机制删除，不再验收）。
 
 ---
 

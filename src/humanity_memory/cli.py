@@ -1225,9 +1225,6 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             args.target,
             port=args.port,
             open_browser=not args.no_browser,
-            heartbeat_timeout=args.heartbeat_timeout,
-            hidden_grace=args.hidden_grace,
-            startup_grace=args.startup_grace,
         )
     except SourceError as exc:
         print(f"无法启动观测台：{exc.message}", file=sys.stderr)
@@ -1619,19 +1616,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_an.add_argument("target", help="库根目录 / token 文件 / 项目根 / workspace.db")
     p_an.add_argument("--port", type=int, default=8765, help="监听端口（默认 8765）")
     p_an.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
-    # 默认值与 webtool.server 的 DEFAULT_* 常量一致；0 可关闭自动退出（长时调试用）
-    p_an.add_argument(
-        "--heartbeat-timeout", type=float, default=10.0,
-        help="可见页多久没心跳就自动退出，秒（默认 10；0 = 关闭探活）",
-    )
-    p_an.add_argument(
-        "--hidden-grace", type=float, default=60.0,
-        help="页面在后台时的心跳宽限，秒（默认 60，避免浏览器节流误杀）",
-    )
-    p_an.add_argument(
-        "--startup-grace", type=float, default=60.0,
-        help="启动后等待浏览器打开的宽限，秒（默认 60）",
-    )
     p_an.set_defaults(func=cmd_analyze)
 
     p_up = sub.add_parser(

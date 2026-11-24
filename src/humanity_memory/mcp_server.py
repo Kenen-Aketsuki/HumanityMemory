@@ -5,6 +5,7 @@ stdio 传输对 stdout 极敏感，任何多余输出都会破坏协议帧。
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -52,6 +53,8 @@ INSTRUCTIONS_TAIL = """\
   memory_list / export 去翻全量（那只翻不算用，活跃度一样是空的），改用 recall。
 
 绑定纪律（未接入时）：
+- 记忆工具始终注册、始终可见；未接入时**读写调用一律返回拒绝结果**
+  （code + checklist），这是正常形态不是故障。**不要重试写入**，不要绕路翻数据。
 - 先调用 memory_bind_status 看 code。code 不为 null 时**先向用户提问**：
   新建独立库 / 并入已有库 / 沿用本目录已有的库 / 本次不接入。
 - 拿到答复再调对应的 memory_bind_new / memory_bind_existing / memory_bind_adopt /
@@ -91,11 +94,11 @@ def build_server(
 ) -> MCPServer:
     """装配 MCP server。
 
-    `session` 决定工具面：接进去了就全量注册；没接进去（拒绝态）**只注册
-    `bind_*` 与 `memory_use_workspace`**，其余 24 个工具一个都不注册。
-
-    为什么是"不注册"而不是"注册后报错"：模型看不到工具就不会调，
-    也就不会出现"agent 以为写入成功"这类事故（§6.4）。
+    工具面**始终全量注册**。2026-11-24 起废除「拒绝态工具裁剪」：原设计是
+    未接入时不注册读写工具（模型看不到就不会调），但各宿主对运行中增删
+    工具的机制不一样，在 DSH 等地方效果不佳。改为：未接入时**所有**记忆
+    读写工具照常可见，调用即返回 §6 拒绝契约载荷（code + checklist）；
+    `bind_*` 与 `memory_use_workspace` 不在拒绝范围内，自救通道始终可用。
     """
     # 先定布局再装配置：库级 memory.toml 挂在库目录（自有库 = .ai_memory/）下，
     # 反过来就永远读不到库级覆盖。
@@ -132,7 +135,7 @@ def build_server(
 
     def _st() -> MemoryStore:
         current = state["store"]
-        if current is None:  # 拒绝态不会走到这里：那 24 个工具没注册
+        if current is None:  # 拒绝态走不到这里：读写工具会被 _refusal 拦下，这是最后防线
             raise RuntimeError("未接入记忆库：当前会话没有可用的 store")
         return current
 
@@ -202,7 +205,7 @@ def build_server(
         """把 `bindings.bind_*` 的返回值落到当前会话上。"""
         if isinstance(result, dict):  # 已经是拒绝载荷
             return result
-        if not result.ok:  # decline：合法的"不接入"，不挂工具
+        if not result.ok:  # decline：合法的「不接入」，store 清空后读写工具进入拒绝应答
             _unbind(result.workspace_root)
             payload = result.to_json()
             payload["note"] = note
@@ -210,14 +213,12 @@ def build_server(
         error = _rebind(result)
         if error is not None:
             return _err(error)
-        payload = _ok(
+        return _ok(
             note=note,
             workspace_root=str(result.workspace_root),
             library=result.record.library if result.record else None,
             library_dir=str(result.library_dir),
         )
-        payload["tools_registered"] = activate()
-        return payload
 
     def _candidate_libraries() -> list[dict[str, Any]] | dict[str, str]:
         try:
@@ -265,37 +266,43 @@ def build_server(
         instructions=instructions,
     )
 
-    bound_flag = {"on": bound}
-    deferred: list[tuple[Any, dict[str, Any]]] = []
+    def _refusal() -> dict[str, Any] | None:
+        """拒绝态守卫：store 不在时给出 §6 拒绝载荷（code + checklist）。
+
+        只包在读写工具上；`bind_*` 与 `memory_use_workspace` 不经此守卫，
+        未接入时照样可调 —— 自救通道不能被拒绝态自己堵死。
+        """
+        if state["store"] is not None:
+            return None
+        session = state["session"]
+        if session is not None and not session.ok:
+            return session.to_json()
+        return _err_code(
+            "no_library",
+            "未接入记忆库：当前会话没有可用的 store。",
+            checklist=["① 调 memory_bind_status 看当前状态与出路清单"],
+        )
 
     def tool(**kwargs: Any):
-        """条件注册：未接入时把装饰器换成「先记账、晚点注册」。
+        """读写工具注册器：始终注册、始终可见（2026-11-24 起不再裁剪工具面）。
 
-        记账而不是丢弃，是为了 R-11：boot 实例的 cwd 可能落在
-        `~/.humanity-memory`，那时整个会话是拒绝态；等 agent 用
-        `memory_bind_*` / `memory_use_workspace` 接进去之后，这些工具要
-        **当场出现**，而不是让用户重启客户端。工具名单只有这一份 ——
-        写在别处迟早会和实现漂移。
+        原设计是「拒绝态不注册，模型看不到就不会调」；各家宿主对运行中
+        增删工具的机制不一样（DSH 等），该假设不成立。改为未接入时调用
+        即返回拒绝结果 + checklist（§6.1），agent 照清单自救；接入成功后
+        store 就位，守卫放行，无需重启客户端、也无需重新挂载工具。
         """
-        if bound_flag["on"]:
-            return app.tool(**kwargs)
+        def deco(fn: Any) -> Any:
+            @functools.wraps(fn)
+            def wrapper(*args: Any, **kw: Any) -> Any:
+                refusal = _refusal()
+                if refusal is not None:
+                    return refusal
+                return fn(*args, **kw)
 
-        def _defer(fn: Any) -> Any:
-            deferred.append((fn, kwargs))
-            return fn
+            app.add_tool(wrapper, **kwargs)
+            return wrapper
 
-        return _defer
-
-    def activate() -> int:
-        """把延迟注册的工具一次性挂上（切库 / 绑定成功后调用）。"""
-        if bound_flag["on"]:
-            return 0
-        for fn, kwargs in deferred:
-            app.add_tool(fn, **kwargs)
-        count = len(deferred)
-        deferred.clear()
-        bound_flag["on"] = True
-        return count
+        return deco
 
     # ------------------------------------------------------------- 信条
 
@@ -834,7 +841,6 @@ def build_server(
                 else None
             ),
             persisted=False,
-            tools_registered=activate(),
         )
 
     # ------------------------------------------------------------- 绑定（§6.4）
@@ -924,9 +930,8 @@ def build_server(
             refusal = bindings.bind_decline(root)
         except bindings.BindingError as exc:
             return exc.to_json()
-        # 拒绝态要把记忆工具收回去：这次是「决定不接入」，不是「暂时没接」
+        # 这次是「决定不接入」，不是「暂时没接」：清 store，读写工具进入拒绝应答
         _unbind(root)
-        payload = refusal.to_json()
         payload = refusal.to_json()
         payload["note"] = "已记住这个决定；想改主意随时 memory_bind_new / memory_bind_existing。"
         return payload

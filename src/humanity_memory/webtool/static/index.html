@@ -81,7 +81,6 @@ iframe.embed{width:100%;height:calc(100vh - 108px);border:0;background:#070b14;
 </main>
 <footer>
   <span id="status">就绪</span>
-  <span id="heartbeat">心跳连接中…</span>
   <span id="refresh">最后刷新：—</span>
 </footer>
 <script>
@@ -163,65 +162,12 @@ async function poll(){
   }
 }
 
-// ---- 心跳探活 ----
-// 后端按租约计时：可见页超时会自动结束进程，避免关掉页面后留下僵尸后端。
-// 切到后台时立刻补发一次，让后端把租约放宽（浏览器会节流后台定时器）。
-// 心跳失败（前端失联）时启动倒计时：距退出 >5s 每 5s 跳一次，≤5s 每 1s 跳一次。
-let hbTimer=null, hbInterval=3000, hbDeadline=0;
-let hbEnabled=true, hbLost=false, hbLostTimer=null;
-
-function stopLostCountdown(){
-  if(hbLostTimer){clearTimeout(hbLostTimer);hbLostTimer=null;}
-  hbLost=false;
-}
-function renderLostCountdown(){
-  if(!hbLost) return;
-  const label=document.getElementById('heartbeat');
-  const left=Math.max(0,Math.ceil((hbDeadline-Date.now())/1000));
-  if(label){
-    label.textContent = left>0 ? '前端失联 · 后端将在 '+left+'s 后退出' : '后端已退出';
-    label.style.color = left<=5 ? 'var(--warn)' : '';
-  }
-  if(left<=0){hbLostTimer=null;return;}          // 已经到底，不再空跳
-  hbLostTimer=setTimeout(renderLostCountdown, left>5?5000:1000);
-}
-
-async function heartbeat(){
-  const visible=document.visibilityState==='visible'?1:0;
-  try{
-    const r=await fetch('/api/heartbeat?visible='+visible,{cache:'no-store'});
-    const d=await r.json();
-    if(!d||!d.ok) throw new Error('bad heartbeat');
-    hbEnabled=d.timeout>0;
-    hbDeadline=Date.now()+Number(d.remaining||0)*1000;  // 后端租约换算成本地截止时间
-    if(hbLost) stopLostCountdown();                      // 心跳恢复 → 撤销失联倒计时
-    const label=document.getElementById('heartbeat');
-    if(label){
-      label.style.color='';
-      label.textContent = hbEnabled
-        ? '心跳正常 · '+(visible?'前台':'后台')+' · 宽限 '+d.timeout+'s'
-        : '心跳探活已关闭';
-    }
-    if(d.interval_ms && d.interval_ms!==hbInterval){
-      hbInterval=d.interval_ms;
-      if(hbTimer){clearInterval(hbTimer);hbTimer=setInterval(heartbeat,hbInterval);}
-    }
-  }catch(e){
-    if(!hbEnabled || hbLost) return;   // 探活已关 / 倒计时已在跑，别重复起定时器
-    hbLost=true;
-    renderLostCountdown();
-  }
-}
-
 loadMeta();
 setTimeout(async()=>{const s=await api('/api/status').catch(()=>null);
   if(s){for(const k of ['starmap','recall','review','memory'])SIG[k]=s[k];}
   refreshView(cur,true); // 首屏渲染（views.js 已在上方同步加载完）
 },100);
 setInterval(poll,4000);
-heartbeat();
-hbTimer=setInterval(heartbeat,hbInterval);
-document.addEventListener('visibilitychange',()=>{heartbeat();});
 </script>
 <script src="views.js"></script>
 </body>
