@@ -4,12 +4,14 @@ setlocal
 
 rem ---------------------------------------------------------------------------
 rem  Memory Observatory: local HTTP backend + browser frontend (read-only).
-rem  Drag a folder/file onto this bat, or pass it as an argument. All forms are
-rem  read-only and need no registry:
+rem  Double-click (no argument) = list every registered library and switch with
+rem  the dropdown in the page's top-right corner. No token needed to start.
+rem  Drag a folder/file onto this bat to open one specific source instead:
 rem    - project root folder            (token.json lives here)
 rem    - library folder under libraries^\^<label^>
 rem    - .ai_memory\token.json file     (read-only: library resolved from it)
 rem    - or the workspace.db file itself
+rem  All forms are read-only; the target one is just an extra entry in the list.
 rem
 rem  NOTE: webtool is new code, absent from old published exe.
 rem  This script prefers the source .venv; only when HM_ANALYZE_USE_PUBLISHED=1
@@ -48,29 +50,24 @@ if not exist "%HM_CLI%" (
   exit /b 1
 )
 
-if "%~1"=="" (
-  echo.
-  echo  Drag a folder/file onto this bat to open the memory observatory:
-  echo    - project root folder            ^(token.json lives here^)
-  echo    - library folder under libraries^\^<label^>
-  echo    - .ai_memory\token.json file     ^(read-only: library resolved from it^)
-  echo    - or the workspace.db file itself
-  echo.
-  echo  Read-only. No database is created or modified.
-  echo.
-  pause
-  exit /b 1
-)
+rem No argument = list every registered library (registry.json) and let the page's
+rem top-right dropdown pick one. A target is now optional, not a token requirement.
+set "HM_TARGET="
+if not "%~1"=="" set "HM_TARGET=%~1"
 
 if not defined HM_ANALYZE_PORT set "HM_ANALYZE_PORT=8765"
 
 echo Using: %HM_SRC%
-echo Opening observatory for: %~1
+if defined HM_TARGET (
+  echo Opening observatory for: %HM_TARGET%
+) else (
+  echo Opening observatory for: all registered libraries ^(switch in the top-right dropdown^)
+)
 echo URL: http://127.0.0.1:%HM_ANALYZE_PORT%
 echo   (press Ctrl+C in this window to stop the server)
 echo.
 
-"%HM_CLI%" analyze "%~1" --port %HM_ANALYZE_PORT%
+"%HM_CLI%" analyze %HM_TARGET% --port %HM_ANALYZE_PORT%
 if errorlevel 1 (
   echo.
   echo [ERROR] Observatory exited with an error, see the message above.

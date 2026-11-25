@@ -39,6 +39,29 @@ def _due_state(level: int, period_start: int | None, kind: str, source: WebSourc
     return {"code": "pending", "label": "待裁定", "remain_ms": remain, "next_ms": next_ms}
 
 
+def _predict(source: WebSource, level: int, activity: float, kind: str) -> dict[str, Any]:
+    """预计裁定结果：复用生命周期现成的 ``decide()``，不重写升降线判据。
+
+    与真实裁定同一份代码，预测才不会漂。遗忘层 / 配置外档位显式交代，
+    不假装能裁定。返回 {action, label, reason}。
+    """
+    if level <= 0:
+        return {"action": "hold", "label": "遗忘层·不裁定", "reason": "遗忘层只能复活或删除"}
+    dim = period_kind(kind)
+    try:
+        d = source.levels.decide(level, activity, dim)
+    except ValueError:
+        # 配置外的残留档位：decide 按契约抛 ValueError，这里转成可读的预测
+        return {"action": "hold", "label": "配置外档位", "reason": "等级不在配置表里，裁定器拒绝"}
+    if d.action == "up":
+        label = f"预计升级 → L{d.level}"
+    elif d.action == "down":
+        label = f"预计降级 → L{d.level}"
+    else:
+        label = f"维持 L{level}"
+    return {"action": d.action, "label": label, "reason": d.reason}
+
+
 def get(source: WebSource) -> dict[str, Any]:
     now = int(time.time() * 1000)
     nodes: list[dict[str, Any]] = []
@@ -77,6 +100,7 @@ def get(source: WebSource) -> dict[str, Any]:
                         "up": spec.up_threshold if spec else None,
                         "down": spec.down_threshold if spec else None,
                         "period_days": spec.period_days(period_kind(kind)) if spec else None,
+                        "predict": _predict(source, level, activity, kind),
                     }
                 )
     finally:

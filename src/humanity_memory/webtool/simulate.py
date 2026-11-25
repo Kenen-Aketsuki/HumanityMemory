@@ -78,6 +78,8 @@ def post(source: WebSource, body: dict[str, Any]) -> dict[str, Any]:
                 "id": str(item.id),
                 "kind": getattr(item, "kind", "unknown"),
                 "level": getattr(item, "forget_level", None),
+                # 前端悬浮窗要显示条目内容；截 500 字够看全文大意，不撑爆响应
+                "content": str(getattr(item, "content", "") or "")[:500],
                 "score": round(float(h.score), 4),
                 "vec_sim": None if h.vector_similarity is None else round(float(h.vector_similarity), 4),
                 "lex": None if h.lexical_score is None else round(float(h.lexical_score), 4),

@@ -32,12 +32,16 @@
 
 | 能力 | 取数实现 | 渲染实现 | 产物 | 启动入口 | 数据源 |
 | --- | --- | --- | --- | --- | --- |
-| 星图 | `starmap.py`: `resolve_db` → `read_nodes`/`read_vectors` → `build_graph` | `render_html(graph)` 塞自包含 HTML | 单个 `.html` | `starmap.bat` → `humanity-memory starmap <path>` | 库根目录 `workspace.db`（只读 `mode=ro`） |
-| recall 历史 | `reports.py`: `read_retrievals` + `read_node_activity` + `latest_judge_snapshot` + `level_thresholds` | `retrieval_view.py`: `render_retrieval_html(records, meta)` | 单个 `.html` | `report.bat` → `humanity-memory retrieval-report` | 工作区 `retrieval/*.jsonl` + 库实时 `activity` |
+| 星图 | `starmap.py`: `resolve_db` → `read_nodes`/`read_vectors` → `build_graph` | `render_html(graph)` 塞自包含 HTML | 单个 `.html` | ~~`starmap.bat`~~ → `humanity-memory starmap <path>`；日常改走观测台（§6 iframe 复用） | 库根目录 `workspace.db`（只读 `mode=ro`） |
+| recall 历史 | `reports.py`: `read_retrievals` + `read_node_activity` + `latest_judge_snapshot` + `level_thresholds` | `retrieval_view.py`: `render_retrieval_html(records, meta)` | 单个 `.html` | ~~`report.bat`~~ → `humanity-memory retrieval-report`；日常改走观测台（§6 iframe 复用） | 工作区 `retrieval/*.jsonl` + 库实时 `activity` |
 | **复盘记录**（原 judge 历史） | `reports.py`: `write_judge_report` 落 `.md` + `.json`；`build_judge_report` 可重建快照 | **无 HTML**，只有 `render_judge_markdown` | `reports/judge/<stamp>.{md,json}`，文件名 `YYYYMMDD-HHMMSS` | 由 `lifecycle judge` 旁路生成 | 工作区 `reports/judge/*.json` + 库实时字段（新增/顶替） |
 | **记忆现状**（新） | 直接只读扫 `knowledge`/`episodes` 当前行 + `lifecycle.LevelTable.period_ms()` 算倒计时 | 无（本工具新增） | 无（纯实时，不落盘） | 本工具内 | 库根目录 `workspace.db`（只读） |
 | 检索测试 | 无 | 无 | 无 | 无 | 需要用 `store.search()` 现算 |
 
+> **入口收敛（2026-11-25）**：`starmap.bat` / `report.bat` 已删除。星图与检索分析改为统一从观测台看
+> （iframe 内嵌的仍是同一套渲染逻辑，见 §6）；CLI 子命令 `starmap` / `retrieval-report` 保留，
+> 只用于脚本化出单文件 HTML。
+>
 > 注：复盘快照的 `items[]`（本次裁定）与 `nodes[]`（全量节点）是**两个不同时刻**的活跃度 ——
 > `items[].activity` 是裁定那一刻的值，`nodes[].activity` 是裁定**落库后**从库里读回的值。
 > 根因：`_settle_period()` 会 `activity = 0`（`store.py:1218`），而报告在裁定落库之后才写
@@ -146,10 +150,13 @@
 ### 4.1 命令形态
 
 ```
-humanity-memory analyze <target> [--port 8765] [--no-browser]
+humanity-memory analyze [target] [--port 8765] [--no-browser]
 ```
 
-`--target` 接受（与 `starmap` / 只读工具一致）：
+**target 可省略**（双击 `analyze.bat` 即可）：省略时不解析 token，
+直接读 registry 列出**全部已登记的库**，页面右上角下拉切换（见 §4.3）。
+
+给了 `target` 时接受（与 `starmap` / 只读工具一致）：
 
 1. 令牌文件 `.ai_memory/token.json`（或令牌所在目录）；
 2. 库根目录，如 `<安装根>/libraries/<库名>`；
@@ -157,7 +164,8 @@ humanity-memory analyze <target> [--port 8765] [--no-browser]
 4. 直接的 `workspace.db` 文件。
 
 统一交给 `bindings.resolve_readonly()`，拿不到库就按现有拒绝契约给 code + 处置建议，
-不静默生成空库。
+不静默生成空库。此时该 target 只是「额外的一条」，标签仍以 registry 为准，
+下拉里照样能切到别的库。
 
 ### 4.2 启动动作
 
@@ -169,16 +177,42 @@ humanity-memory analyze <target> [--port 8765] [--no-browser]
 
 > 端口被占：默认 8765，失败时提示 `--port <其它>`，不静默换端口。
 
+### 4.3 库切换（不依赖启动参数、不依赖 token）
+
+观测台原先是「一次启动 = 一个库」，换个库得重开进程、重新拖一次路径。现在
+「观测哪个库」是**运行时状态**（`webtool/libraries.py::SourcePool`）：
+
+1. **清单来源**：`registry.json`（`~/.humanity-memory/registry.json`，`keys.read()`）
+   —— 已登记的库就是全部可观测的库，标签也以它为准；
+2. **兜底**：`<安装根>/libraries/*` 中含 `workspace.db` 的子目录（registry 缺失/损坏、
+   或离线拷来一份库时仍然能看）；registry 读失败只记一条 warning 展示在页面上；
+3. **显式 target**：并成清单里的额外一条，**不覆盖** registry 同名库的标签；
+4. **不可用的库不隐藏**：目录不在 / 缺 `workspace.db` 的条目标 `ok:false`
+   并禁用（常见于移动硬盘没挂上），提示语就是原因。
+
+前端：右上角 `<select>`，值即库标签。切换流程 `POST /api/library {label}` →
+后端**先构造新 `WebSource` 再赋值**（失败保持原库，返回 404 `unknown_library`
+或 503 取数错误）→ 前端重记 `localStorage['hm.obs.lib']`、重取 `/api/session`、
+重置签名基线、重载当前视图（iframe 里的老工具页也带 `?t=` 重新取数）。
+下次打开默认按 `?lib=` > 上次选择 > 服务端默认（清单里第一个可用库）定库；
+记着的库打不开时退回默认库并在状态栏说明，不卡首屏。
+
+并发：切库在锁内完成，`current` 是原子赋值；**每个请求进来先对当前库做一次快照**，
+所以一次响应里不会出现「前半段读 A 库、后半段读 B 库」。切库只读，不写库、
+不写 registry、不改活跃度。
+
 ---
 
 ## 5. HTTP API 设计
 
-全部 `GET` 只读；仅检索测试用 `POST`。错误统一
+全部 `GET` 只读；仅检索测试与「换库」用 `POST`。错误统一
 `{"ok": false, "code": "...", "message": "..."}`。
 
 | 端点 | 方法 | 返回要点 | 复用的现有实现 |
 | --- | --- | --- | --- |
-| `/api/session` | GET | `{db, dir, schema_version, node_count, has_retrieval, has_judge, levels}` | `starmap.inspect_schema` / `reports.level_thresholds` |
+| `/api/libraries` | GET | `{current, libraries:[{label,dir,db,ok,error,origin,db_size}], warnings}`，每次调用重扫 | `keys.read()` + `config.libraries_home()` |
+| `/api/library` | POST | body `{label}` 或 `{target}`；返回新清单；未知标签 404 `unknown_library` | `libraries.SourcePool.switch()` |
+| `/api/session` | GET | `{db, dir, library, schema_version, node_count, has_retrieval, has_judge, levels}` | `starmap.inspect_schema` / `reports.level_thresholds` |
 | `/api/starmap` | GET | `{graph:{nodes,edges,meta}}` | `starmap.build_graph` + 等级/活跃度逻辑（从 `run()` 抽出可复用段） |
 | `/api/recall` | GET | `{records, meta:{levels,nodes,activity,generated}}` | `reports.read_retrievals` 等四个函数 + `render_retrieval_html` 的 meta 组装 |
 | `/api/review` | GET | `{days:[{date, at, changes:[...], activity_deltas:[...], added:[...], replaced:[...], deduped:[...]}]}`，按天倒序；字段见 §6.1 | 扫 `reports/judge/*.json` + 逐份解析 + 库实时 `created_at`/`invalidated_by`/`memory_events` |
@@ -207,7 +241,8 @@ humanity-memory analyze <target> [--port 8765] [--no-browser]
 
 **星图 / recall 复用老工具全文渲染逻辑（实施期重要修正）**：最初这两个视图用 `views.js`
 自写简化版，结果交互全丢（无法拖拽/缩放/悬停）、UI 明显逊于老的 `starmap.bat` /
-`report.bat` 产物。实施改为：新增 `webtool/live.py`，在运行时把 `starmap._HTML_TEMPLATE`
+`report.bat` 产物（两个 bat 已于 2026-11-25 删除，模板本身保留并继续被复用）。实施改为：
+新增 `webtool/live.py`，在运行时把 `starmap._HTML_TEMPLATE`
 和 `retrieval_view._TEMPLATE` 的 `/*__DATA__*/` 注入点换成一段 async loader（fetch API →
 DATA → 执行原脚本主体），老模板的 CSS/JS **一行不改**；server 暴露 `/starmap.html` /
 `/recall.html`，主界面对应 tab 用 iframe 嵌入。这样老工具成熟的交互（拖拽节点、滚轮缩放、
@@ -382,7 +417,8 @@ POST /api/search-test  {"query": "...", "limit": 8, "kinds": null}
 | --- | --- | --- |
 | `src/humanity_memory/webtool/__init__.py` | 包 | 新增 |
 | `src/humanity_memory/webtool/server.py` | HTTP 路由 / 请求处理 / 启动 | 新增 |
-| `src/humanity_memory/webtool/datasource.py` | target 定位 + 各视图取数适配（含表名兼容） | 新增 |
+| `src/humanity_memory/webtool/datasource.py` | target 定位 + 各视图取数适配（含表名兼容）+ 库标签 | 新增 |
+| `src/humanity_memory/webtool/libraries.py` | 库清单（registry + libraries 兜底）+ `SourcePool` 运行时切库 | 新增 |
 | `src/humanity_memory/webtool/simulate.py` | 检索测试（search + 模拟 delta，无写入） | 新增 |
 | `src/humanity_memory/webtool/review.py` | 复盘记录取数：按天分组 + 活跃度 diff + 新增/顶替/合并明细 | 新增 |
 | `src/humanity_memory/webtool/memory_state.py` | 记忆现状取数：实时节点 + `LevelTable.period_ms` 倒计时 | 新增 |
@@ -402,7 +438,7 @@ POST /api/search-test  {"query": "...", "limit": 8, "kinds": null}
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
 | P1 骨架 | `analyze` 命令 + server 起停 + `/api/session` + `/api/status` + 前端外壳空 tab | 传 lilith 库根能起服务、session 显示 schema/计数 |
-| P2 现有两视图 | `/api/starmap`（含 `build_graph_payload` 抽取）+ `/api/recall`，接前端 | 与现有 starmap.bat / report.bat 产物**逐字段一致** |
+| P2 现有两视图 | `/api/starmap`（含 `build_graph_payload` 抽取）+ `/api/recall`，接前端 | 与 CLI `starmap` / `retrieval-report` 产物**逐字段一致** |
 | P3 复盘记录 | `review.py` + `/api/review`：按天分组 + 活跃度 diff + 新增/顶替/合并 + 前端时间轴/md 切换 | 有报告的库（如 island）能按天翻；diff 口径正确（§6.1）；`items=[]` 与 lilith 空库显示空状态 |
 | P4 记忆现状 | `memory_state.py` + `/api/memory` + 前端实时表（§6.2） | 倒计时与 `lifecycle.is_due` 判定一致；"已到期"条目与真跑 judge 的 due 对得上 |
 | P5 检索测试 | `simulate.py` + `/api/search-test` + 前端表单 | 同查询跑 search-test 前后：库 mtime 不变、JSONL 不增行、activity 不变 |

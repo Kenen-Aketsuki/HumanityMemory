@@ -257,7 +257,7 @@ window.render_review=async function(force){
 };
 
 /* ============================ 记忆现状 ============================ */
-let memData=null, memSort='level', memFilter='all';
+let memData=null, memSort='id', memDir=1, memFilter='all', memQuery='';
 function fmtRemain(ms){
   if(ms==null)return '—';
   if(ms<=0)return '已到期';
@@ -279,47 +279,93 @@ window.render_memory=async function(force){
     '<span class="kv down">已到期 <b>'+(counts.due||0)+'</b></span>'+
     '<span class="kv">遗忘层 <b>'+(counts.forgotten||0)+'</b></span>'+
     '<span class="kv">未计时 <b>'+(counts.unstarted||0)+'</b></span>'+
-    '<span style="margin-left:auto"><select id="memFilter">'+
+    '<input id="memQuery" type="text" placeholder="按 ID 检索…" value="'+esc(memQuery)+'" style="width:200px;margin-left:auto" autocomplete="off">'+
+    '<select id="memFilter">'+
       ['all|全部','pending|待裁定','due|已到期','forgotten|遗忘层'].map(x=>{
         const [v,l]=x.split('|');return '<option value="'+v+'"'+(memFilter===v?' selected':'')+'>'+l+'</option>';
       }).join('')+
-    '</select></span></div></div>';
+    '</select></div></div>';
   el.innerHTML=bar+'<div class="card" style="padding:0;overflow:hidden"><div class="scroll" id="memTable"></div></div>';
 
+  // 可排序列：id / 类型 / 等级 / 活跃度 / 距下次裁定。点同列翻转升降，点新列回到升序。
+  const COLS=[['id','id'],['kind','类型'],['level','等级'],['activity','活跃度'],
+    [null,'摘要'],[null,'裁定状态'],[null,'预计裁定'],[null,'距下次裁定'],[null,'升/降线']];
+  const SORTABLE={id:1,kind:1,level:1,activity:1,remain:1};
+  const KIND_ORD={experience:0,episode:1,log:2,digest:3};
+
   function draw(){
-    let rows=nodes.filter(n=>memFilter==='all'||n.due_code===memFilter);
-    const key=n=>memSort==='activity'?n.activity:memSort==='level'?n.level:(n.remain_ms==null?Infinity:n.remain_ms);
+    let rows=nodes.filter(n=>
+      (memFilter==='all'||n.due_code===memFilter)&&
+      (!memQuery||String(n.id).toLowerCase().indexOf(memQuery)>=0));
     rows=rows.slice().sort((a,b)=>{
-      if(memSort==='remain'){ // 已到期优先
-        const av=a.due_code==='due'?-1:(a.remain_ms==null?Infinity:a.remain_ms);
-        const bv=b.due_code==='due'?-1:(b.remain_ms==null?Infinity:b.remain_ms);
-        return av-bv;
+      let va,vb;
+      switch(memSort){
+        case 'kind':     va=KIND_ORD[a.kind]!=null?KIND_ORD[a.kind]:9;
+                         vb=KIND_ORD[b.kind]!=null?KIND_ORD[b.kind]:9; break;
+        case 'level':    va=(a.level==null?-1:a.level); vb=(b.level==null?-1:b.level); break;
+        case 'activity': va=(Number(a.activity)||0); vb=(Number(b.activity)||0); break;
+        case 'remain':   // 已到期排最前，未计时的排最后，与旧排序语义一致
+                         va=a.due_code==='due'?-1:(a.remain_ms==null?Infinity:a.remain_ms);
+                         vb=b.due_code==='due'?-1:(b.remain_ms==null?Infinity:b.remain_ms); break;
+        default:         va=String(a.id); vb=String(b.id);
       }
-      return key(b)-key(a);
+      const c=(typeof va==='string')?va.localeCompare(vb):va-vb;
+      return c*memDir;
     });
     const tr=rows.map(n=>{
-      const cls=n.due_code==='due'?'down':n.due_code==='forgotten'?'kv':'';
       const dueCls=n.due_code==='due'?'down':n.due_code==='pending'?'up':'';
+      const p=n.predict||{};
+      const pCls=p.action==='up'?'up':p.action==='down'?'down':'kv';
       return '<tr><td class="id">'+esc(n.id)+'</td><td>'+(NAMES[n.kind]||n.kind)+'</td>'+
         '<td>L'+(n.level==null?'—':n.level)+'</td><td>'+num(n.activity,2)+'</td>'+
         '<td>'+esc(n.content)+'</td>'+
         '<td class="'+dueCls+'">'+esc(n.due_label)+'</td>'+
+        '<td class="'+pCls+'"'+(p.reason?' title="裁定依据：'+esc(p.reason)+'"':'')+'>'+esc(p.label||'—')+'</td>'+
         '<td class="'+dueCls+'">'+fmtRemain(n.remain_ms)+'</td>'+
         '<td>'+(n.up!=null?num(n.up,1):'—')+' / '+(n.down!=null?num(n.down,1):'—')+'</td></tr>';
     }).join('');
+    const th=COLS.map(([key,label])=>{
+      if(!key)return '<th>'+label+'</th>';
+      const on=memSort===key;
+      const arrow=on?(memDir===1?' ▲':' ▼'):'';
+      return '<th data-s="'+key+'" style="cursor:pointer;'+(on?'color:var(--exp)':'')+'"'+
+        ' title="点击排序，再点翻转升降">'+label+arrow+'</th>';
+    }).join('');
     document.getElementById('memTable').innerHTML=
-      '<table><thead><tr>'+
-        ['<th data-s="id">id</th>','<th>类型</th>','<th data-s="level">等级</th>','<th data-s="activity">活跃度</th>','<th>摘要</th>','<th>裁定状态</th>','<th data-s="remain">距下次裁定</th>','<th>升/降线</th>'].join('')+
-      '</tr></thead><tbody>'+tr+'</tbody></table>';
+      '<table><thead><tr>'+th+'</tr></thead><tbody>'+tr+'</tbody></table>';
     document.querySelectorAll('#memTable th[data-s]').forEach(th=>th.onclick=()=>{
-      memSort=th.dataset.s;draw();
+      if(memSort===th.dataset.s){memDir=-memDir;}
+      else{memSort=th.dataset.s;memDir=1;}
+      draw();
     });
   }
   document.getElementById('memFilter').onchange=e=>{memFilter=e.target.value;draw();};
+  document.getElementById('memQuery').oninput=e=>{memQuery=e.target.value.trim().toLowerCase();draw();};
   draw();
 };
 
 /* ============================ 检索测试 ============================ */
+// 悬浮窗：检索结果 ID 列悬停显示条目内容（跟随鼠标，不挡点击）
+let hitTipEl=null;
+function showHitTip(ev,text){
+  if(!hitTipEl){
+    hitTipEl=document.createElement('div');
+    hitTipEl.style.cssText='position:fixed;z-index:999;display:none;max-width:460px;max-height:300px;'+
+      'overflow:auto;background:rgba(13,20,34,.97);border:1px solid var(--line);border-radius:8px;'+
+      'padding:10px 12px;font:12px/1.6 inherit;color:var(--text);white-space:pre-wrap;word-break:break-word;'+
+      'box-shadow:0 6px 18px rgba(0,0,0,.55);pointer-events:none';
+    document.body.appendChild(hitTipEl);
+  }
+  hitTipEl.textContent=text||'（无内容）';
+  hitTipEl.style.display='block';
+  const pad=14;let x=ev.clientX+pad,y=ev.clientY+pad;
+  const r=hitTipEl.getBoundingClientRect();
+  if(x+r.width>window.innerWidth-8)x=ev.clientX-r.width-pad;
+  if(y+r.height>window.innerHeight-8)y=ev.clientY-r.height-pad;
+  hitTipEl.style.left=x+'px';hitTipEl.style.top=y+'px';
+}
+function hideHitTip(){if(hitTipEl)hitTipEl.style.display='none';}
+
 window.render_search=async function(force){
   const el=document.getElementById('v-search');
   // 只在首次挂载表单，避免轮询重绘丢失输入
@@ -332,7 +378,7 @@ window.render_search=async function(force){
           '<select id="sk"><option value="all">全部类型</option><option value="experience">经验</option><option value="episode">经历</option></select>'+
           '<button class="act" id="sgo">检索</button>'+
         '</div>'+
-        '<div class="note" style="margin-top:8px;font-size:11px">模拟 recall 的检索与打分，纯只读：不写活跃度、不写检索日志、不触发复盘闸门。深度回忆会改写遗忘层，不在模拟范围内。</div>'+
+        '<div class="note" style="margin-top:8px;font-size:11px">模拟 recall 的检索与打分，纯只读：不写活跃度、不写检索日志、不触发复盘闸门。深度回忆会改写遗忘层，不在模拟范围内。悬停结果里的 id 列可查看条目内容。</div>'+
       '</div>'+
       '<div class="card" id="searchResult"><div class="empty">输入查询并点「检索」</div></div>';
     document.getElementById('sgo').onclick=runSearch;
@@ -348,10 +394,10 @@ window.render_search=async function(force){
       const d=await api('/api/search-test',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({query:q,limit:limit,kinds:kinds})});
       const hs=d.hits||[];
-      const rows=hs.map(h=>
+      const rows=hs.map((h,i)=>
         '<tr'+(h.needs_verify?' title="可信度偏低，标了先验证再用"':'')+'>'+
         '<td>'+h.rank+'</td><td>'+(NAMES[h.kind]||h.kind)+'</td>'+
-        '<td class="id">'+esc(h.id)+(h.fallback?' <span style="color:var(--warn)" title="宽泛层兜底召回">宽松</span>':'')+'</td><td>L'+(h.level==null?'—':h.level)+'</td>'+
+        '<td class="id hittip" data-i="'+i+'">'+esc(h.id)+(h.fallback?' <span style="color:var(--warn)" title="宽泛层兜底召回">宽松</span>':'')+'</td><td>L'+(h.level==null?'—':h.level)+'</td>'+
         '<td>'+num(h.score,4)+'</td><td>'+num(h.vec_sim,3)+' / '+num(h.lex,2)+'</td>'+
         '<td>'+num(h.activity,2)+'</td><td class="up">+'+num(h.simulated_delta,3)+'</td>'+
         '<td>'+num(h.activity_after,2)+'</td></tr>').join('');
@@ -365,6 +411,15 @@ window.render_search=async function(force){
           ['#','类型','id','等级','分数','向量/词面','当前活跃度','模拟增量','假想活跃度'].map(x=>'<th>'+x+'</th>').join('')+
           '</tr></thead><tbody>'+rows+'</tbody></table>':'<div class="empty">这次没有命中任何记忆。</div>')+
         '<div class="note" style="margin-top:10px;font-size:11px">'+esc(d.note||'')+'</div>';
+      // ID 列悬停出浮层：事件委托挂在结果容器上，重绘不用重绑
+      const res=document.getElementById('searchResult');
+      res.onmousemove=ev=>{
+        const t=ev.target.closest&&ev.target.closest('.hittip');
+        const h=t&&hs[Number(t.dataset.i)];
+        if(h)showHitTip(ev,h.content);
+        else hideHitTip();
+      };
+      res.onmouseleave=hideHitTip;
     }catch(e){
       document.getElementById('searchResult').innerHTML='<div class="card note">检索失败：'+esc(e.message)+'</div>';
     }finally{btn.disabled=false;btn.textContent='检索';}

@@ -505,18 +505,27 @@ type_weight: experience 1.00 / episode 0.96 / log 0.90
 | Markdown 导出 | `export --out <目录>` | `知识现状.md`、`经历/YYYY-MM-DD-<摘要>.md`、`日志/YYYY-MM-DD.md` |
 | 星图 | `starmap <目录> --out <HTML>` | 单文件 HTML，节点 = 条目，边 = 语义相似，辉光 = 活跃度 |
 | 检索报告 | `retrieval-report` | 单文件 HTML，含阈值诊断，调参看这个 |
-| **记忆观测台** | `analyze <目录> [--port 8765]` | 本地 HTTP 后端 + 浏览器前端，五个视图合一（见下） |
+| **记忆观测台** | `analyze [目录] [--port 8765]` | 本地 HTTP 后端 + 浏览器前端，五个视图合一，右上角下拉切库（见下） |
+
+`starmap` / `retrieval-report` 是 CLI 产物；日常看库走观测台即可 —— 它内嵌的是同一套渲染逻辑，
+不用先生成 HTML 文件。原来的 `starmap.bat` / `report.bat` 两个入口已删除（2026-11-25）。
 
 ### 记忆观测台（analyze）
 
 一个把只读视图整合起来的 Web 工具：起一个只监听 `127.0.0.1` 的本地后端，浏览器打开
-`http://127.0.0.1:8765` 即可。双击 `tools/analyze.bat` 或把库目录拖上去也能启动。
+`http://127.0.0.1:8765` 即可。双击 `analyze.bat`（**不用拖任何东西**）或把库目录拖上去都能启动。
 
 ```
-humanity-memory analyze "D:/.../libraries/lilith"   # 库目录
+humanity-memory analyze                            # 列出 registry 里所有库，右上角下拉切换
+humanity-memory analyze "D:/.../libraries/lilith"   # 直接看某个库目录
 humanity-memory analyze "<项目根>"                   # 按 .ai_memory/token.json 解析库
 humanity-memory analyze workspace.db --port 9999     # 换端口
 ```
+
+不给 target 时**不需要 token**：清单来自 `~/.humanity-memory/registry.json`（已登记的库），
+registry 缺失时兜底扫 `<安装根>/libraries/*`；页面右上角的「观测库」下拉即切，
+选择记在浏览器本地，重新打开还是上次那个库。给了 target 也只是清单里的额外一条，随时能切走。
+盘没挂上的库会标成「不可用」并禁用，不会从列表里消失。
 
 五个 tab：
 
@@ -532,9 +541,9 @@ humanity-memory analyze workspace.db --port 9999     # 换端口
 它走 `search()`（纯只读）而非 `recall()`，模拟增量只是算出来展示，绝不落库；
 也不会像深度回忆那样复活遗忘层。前端每 4 秒轮询数据源签名，库或报告一变就增量重拉对应视图。
 
-> 观测台是新代码，旧发布版 exe 里没有。`tools/analyze.bat` 默认走源码 `.venv`；
+> 观测台是新代码，旧发布版 exe 里没有。`analyze.bat` 默认走源码 `.venv`；
 > 只有重新 `build_release --publish` 之后，才可设 `HM_ANALYZE_USE_PUBLISHED=1` 走发布版。
-> Windows 下可直接用 `python -m humanity_memory.cli analyze <目录>` 免装 exe。
+> Windows 下可直接用 `python -m humanity_memory.cli analyze [目录]` 免装 exe。
 
 `export` 的 `--out` 必填，没有默认落点：一旦允许自动推导目录，就等于给了它一条
 「悄悄往项目记忆目录写文件」的路径，手写笔记与渲染产物会混在同一层。
@@ -614,8 +623,8 @@ MCP initialize 报的都是它；源码一个字节都不动，工作区不会�
 攒多了用 `--prune --keep N` 收拾：保留最近 N 个 + `current`，同时把对应条目从 `history.json`
 摘掉、配套库快照一起删；被进程占用的目录只 warn 跳过，不会因为一个删不掉就中途失败。
 
-`starmap.bat` / `report.bat` / `upgrade.bat` 优先调用**发布版**，只有发布版不存在时才退回 `.venv`，
-所以改完源码这三个 bat 不会自动跟着变 —— 要么先 `--publish`，要么删掉发布根让它退回源码态。
+`analyze.bat` / `upgrade.bat` 优先调用**发布版**，只有发布版不存在时才退回 `.venv`，
+所以改完源码这两个 bat 不会自动跟着变 —— 要么先 `--publish`，要么删掉发布根让它退回源码态。
 bat 第二行会打印 `Using: published (...)` 或 `source (...)`。
 
 `dev.bat` 把工作区钉在隔离目录（`local.env` 里的 `HM_DEV_ROOT`），保证源码态碰不到生产库。

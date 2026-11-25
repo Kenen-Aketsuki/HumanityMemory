@@ -15,10 +15,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from .. import bindings
+from .. import bindings, keys
 from ..config import Config
 from ..lifecycle import LevelTable
 from ..reports import judge_dir_name, retrieval_dir_name
+from ..token import same_path
 
 
 class SourceError(Exception):
@@ -44,7 +45,7 @@ class WebSource:
     下多个请求并发不会共享同一个 sqlite3.Connection。
     """
 
-    def __init__(self, target: str | Path | None) -> None:
+    def __init__(self, target: str | Path | None, *, label: str | None = None) -> None:
         try:
             self.layout = bindings.resolve_readonly(target)
         except bindings.BindingError as exc:
@@ -69,6 +70,26 @@ class WebSource:
         else:
             self.cfg_error = None
         self.levels = LevelTable.from_config(self.cfg)
+        self.label = label or self._guess_label()
+
+    # ---- 标签 ----
+
+    def _guess_label(self) -> str:
+        """库标签：**以 registry 为准**，对不上就退回目录名（离线拷来的库没登记）。
+
+        标签只是显示与切换用的名字，不是身份 —— registry 坏了也不该让取数失败。
+        """
+        try:
+            for name, lib in keys.read().libraries.items():
+                if same_path(lib.path, self.library_dir):
+                    return name
+        except Exception:  # noqa: BLE001 - 显示用的名字，不值得挡住只读取数
+            pass
+        return (
+            self.library_dir.parent.name
+            if self.library_dir.name == ".ai_memory"
+            else self.library_dir.name
+        )
 
     # ---- 路径 ----
 
@@ -182,6 +203,7 @@ class WebSource:
             "ok": True,
             "db": str(self.db),
             "dir": str(self.library_dir),
+            "library": self.label,
             "schema_version": schema["schema_version"],
             "embedding_model": schema.get("embedding_model"),
             "node_count": count,

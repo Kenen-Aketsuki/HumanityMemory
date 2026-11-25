@@ -2,6 +2,10 @@
 
 只监听 127.0.0.1，全程只读。每个请求现读现算，无内存缓存（设计文档 §8）。
 路由表与取数函数一一对应；取数失败统一转 {"ok":false,code,message}。
+
+「观测哪个库」是运行时状态（`SourcePool`），不是启动参数：每个请求进来先对
+当前库做一次快照，因此一次响应内永远只读一个库；`POST /api/library` 换库后
+下一次请求才生效（前端换完再重载视图）。
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from .datasource import SourceError, WebSource
+from .libraries import LibraryNotFound, SourcePool
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
@@ -28,13 +33,21 @@ class APIError(Exception):
 
 
 class Handler(BaseHTTPRequestHandler):
-    """无状态请求处理：所有数据从 self.server.source 现取。"""
+    """无状态请求处理：所有数据从本请求开头快照到的那个库现取。"""
 
     server_version = "HMWebtool/1.0"
 
     @property
+    def pool(self) -> SourcePool:
+        return self.server.pool  # type: ignore[attr-defined]
+
+    @property
     def source(self) -> WebSource:
-        return self.server.source  # type: ignore[attr-defined]
+        return self._src  # type: ignore[attr-defined]
+
+    def _snapshot(self) -> None:
+        """一次请求只认一个库：切库发生在请求中途也不会读到半新半旧的数据。"""
+        self._src = self.pool.source
 
     # ---- 基础响应 ----
 
@@ -94,9 +107,16 @@ class Handler(BaseHTTPRequestHandler):
                     ctype = "text/javascript; charset=utf-8" if path.endswith(".js") else "text/css; charset=utf-8"
                     self._send(200, target.read_bytes(), content_type=ctype)
                     return
+            self._snapshot()
             routes: dict[str, Callable[[dict[str, list[str]]], Any]] = {
                 "/api/session": lambda q: self.source.session(),
-                "/api/status": lambda q: {**self.source.signatures(), "now": int(time.time() * 1000)},
+                "/api/status": lambda q: {
+                    **self.source.signatures(),
+                    "now": int(time.time() * 1000),
+                    "library": self.source.label,
+                },
+                # 库清单不依赖「当前库」，所以放在基础路由里：库刚被删光时也要能列出来
+                "/api/libraries": lambda q: self.pool.listing(),
             }
             # 延迟导入：各视图模块到对应阶段才建，未建时返回明确错误
             extra = self._view_routes()
@@ -114,17 +134,36 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/")
         try:
             if path == "/api/search-test":
-                length = int(self.headers.get("Content-Length") or 0)
-                raw = self.rfile.read(length) if length else b"{}"
-                try:
-                    body = json.loads(raw)
-                except (ValueError, UnicodeDecodeError) as exc:
-                    raise APIError("bad_json", f"请求体不是合法 JSON：{exc}") from exc
-                self._json(self._view_routes()["/api/search-test"](body))
+                self._snapshot()
+                self._json(self._view_routes()["/api/search-test"](self._read_json()))
+                return
+            if path == "/api/library":
+                # 换库要先于任何取数：换完这一次请求就返回新清单，视图由前端重载
+                self._json(self._switch_library(self._read_json()))
                 return
             self._json({"ok": False, "code": "not_found", "message": f"未知端点：{path}"}, 404)
         except Exception as exc:  # noqa: BLE001
             self._error(exc)
+
+    def _read_json(self) -> Any:
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            return json.loads(raw)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise APIError("bad_json", f"请求体不是合法 JSON：{exc}") from exc
+
+    def _switch_library(self, body: Any) -> dict[str, Any]:
+        if not isinstance(body, dict):
+            raise APIError("bad_json", "请求体必须是 JSON 对象")
+        label = (body.get("label") or "").strip() or None
+        target = (body.get("target") or "").strip() or None
+        if not label and not target:
+            raise APIError("missing_param", "需要 label（registry 里的库名）或 target（任意库路径）")
+        try:
+            return self.pool.switch(label=label, target=target)
+        except LibraryNotFound as exc:
+            raise APIError("unknown_library", str(exc), 404) from exc
 
     def _view_routes(self) -> dict[str, Callable[[Any], Any]]:
         """各阶段视图路由；模块不存在时给出明确提示而不是 500。"""
@@ -169,31 +208,43 @@ class WebServer(ThreadingHTTPServer):
     def __init__(
         self,
         addr: tuple[str, int],
-        source: WebSource,
+        source: WebSource | SourcePool,
     ) -> None:
-        self.source = source
+        # 兼容老调用：给一个 WebSource 就是「单库模式」，池里只有它一条
+        self.pool = source if isinstance(source, SourcePool) else SourcePool.from_source(source)
         super().__init__(addr, Handler)
 
 
 def serve(
-    target: str | Path | None,
+    target: str | Path | None = None,
     *,
     port: int = 8765,
     open_browser: bool = True,
 ) -> int:
-    """启动本地服务：Ctrl+C 优雅退出。返回进程退出码。"""
-    source = WebSource(target)
+    """启动本地服务：Ctrl+C 优雅退出。返回进程退出码。
+
+    `target` 省略 = 从 registry 取全部已登记的库，页面右上角下拉切换；
+    给了 target 仍然照旧（拖拽一个项目 / token / 库目录 / db 直接看那一个），
+    只是它同时也会出现在下拉里，随时能切走。
+    """
+    pool = SourcePool(target)
     try:
-        server = WebServer(("127.0.0.1", port), source)
+        server = WebServer(("127.0.0.1", port), pool)
     except OSError as exc:
         raise SourceError("port_busy", f"端口 {port} 被占用：{exc}\n换一个：--port <其它>") from exc
 
+    src = pool.source
     url = f"http://127.0.0.1:{port}"
     print(f"记忆观测台已启动：{url}")
-    print(f"  数据源：{source.db}")
-    print(f"  库目录：{source.library_dir}")
-    if source.cfg_error:
-        print(f"  配置提示：{source.cfg_error}（已退回默认参数）")
+    print(f"  当前库：{pool.current_label}")
+    print(f"  数据源：{src.db}")
+    print(f"  库目录：{src.library_dir}")
+    if src.cfg_error:
+        print(f"  配置提示：{src.cfg_error}（已退回默认参数）")
+    usable = sum(1 for e in pool.entries if e.ok)
+    print(f"  可切换的库：{usable} 个（页面右上角下拉选择）")
+    for warning in pool.warnings:
+        print(f"  提示：{warning}")
     print("  只读模式：不写库、不改活跃度、不写检索日志")
     print("  按 Ctrl+C 退出")
     if open_browser:

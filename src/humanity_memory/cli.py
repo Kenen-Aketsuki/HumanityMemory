@@ -1613,7 +1613,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_an = sub.add_parser(
         "analyze", help="本地可视化分析工具：HTTP 后端 + 浏览器前端（只读）"
     )
-    p_an.add_argument("target", help="库根目录 / token 文件 / 项目根 / workspace.db")
+    p_an.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help=(
+            "库根目录 / token 文件 / 项目根 / workspace.db。"
+            "省略 = 列出 registry 里全部已登记的库，页面右上角下拉切换"
+        ),
+    )
     p_an.add_argument("--port", type=int, default=8765, help="监听端口（默认 8765）")
     p_an.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     p_an.set_defaults(func=cmd_analyze)

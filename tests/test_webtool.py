@@ -336,6 +336,9 @@ def test_http_all_endpoints() -> None:
                 return json.loads(r.read())
 
         assert get("/api/session")["ok"] is True
+        libs = get("/api/libraries")
+        assert libs["ok"] is True and libs["current"], "库清单必须自带当前库，前端才能回显下拉"
+        assert any(item["label"] == libs["current"] for item in libs["libraries"])
         assert "starmap" in get("/api/status")
         assert get("/api/starmap")["ok"] is True
         assert get("/api/recall")["ok"] is True
@@ -478,3 +481,72 @@ def test_signature_changes_on_real_write(lib) -> None:
     before = src.sig_starmap()
     store.write_memory("签名必须跟着真实写入变化", importance=0.5)
     assert src.sig_starmap() != before, "库真的变了签名却没变：前端将不再自动刷新"
+
+
+# ---------------------------------------------------------------- 8. 库切换（不依赖启动参数）
+
+
+def _make_lib(home: Path, base: Path, name: str) -> Path:
+    """按真实布局造一个库（`<root>/.ai_memory/workspace.db`），返回库目录。"""
+    proj = base / name
+    (proj / ".ai_memory").mkdir(parents=True)
+    cfg = Config.load({"HM_HOME": str(home), "HM_EMBED_DIM": "8"})
+    store = MemoryStore(cfg, resolve_layout(proj, home=cfg.home))
+    store.close()
+    return proj / ".ai_memory"
+
+
+def test_library_pool_lists_registry_and_switches(tmp_path: Path, monkeypatch) -> None:
+    """观测台脱离启动 target：registry 里的库就是下拉清单，切库只换当前观测对象。
+
+    守三件：
+    1. 清单按 registry 标签排序，且「登记了但目录不在」的库标成不可用而不是消失；
+    2. 切库成功/失败都不破坏当前态（失败时仍是原来那个库）；
+    3. 显式 target 只是一种额外条目，标签仍以 registry 为准。
+    """
+    from humanity_memory.webtool.datasource import SourceError
+    from humanity_memory.webtool.libraries import LibraryNotFound, SourcePool
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HM_HOME", str(home))
+    monkeypatch.setenv("HM_LIBRARIES", str(tmp_path / "no_libraries"))  # 隔离本机 .env
+
+    alpha = _make_lib(home, tmp_path / "proj_a", "alpha")
+    beta = _make_lib(home, tmp_path / "proj_b", "beta")
+    ghost = tmp_path / "gone" / "ghost"
+    (home / "registry.json").write_text(
+        json.dumps({
+            "version": 2,
+            "salt": "0123456789abcdef",
+            "libraries": {
+                "alpha": {"path": str(alpha)},
+                "beta": {"path": str(beta)},
+                "ghost": {"path": str(ghost)},
+            },
+            "keys": {},
+        }),
+        encoding="utf-8",
+    )
+
+    pool = SourcePool()
+    assert pool.current_label == "alpha", "默认应落在第一个可用的库（按标签排序）"
+    labels = [e.label for e in pool.entries]
+    assert labels == ["alpha", "beta", "ghost"]
+    assert [e.ok for e in pool.entries] == [True, True, False]
+    assert "库目录不存在" in (pool.entries[2].error or "")
+
+    state = pool.switch(label="beta")
+    assert state["current"] == "beta"
+    assert pool.source.db == beta / "workspace.db"
+    assert pool.source.session()["library"] == "beta"
+
+    for bad in ("nope", "ghost"):  # 不在清单 / 登记了但打不开：都不许把当前库弄没
+        with pytest.raises(LibraryNotFound if bad == "nope" else SourceError):
+            pool.switch(label=bad)
+        assert pool.current_label == "beta"
+
+    # 显式 target：当成额外条目并入，标签按 registry 认（而不是目录名 proj_a）
+    single = SourcePool(alpha)
+    assert single.current_label == "alpha"
+    assert [e.label for e in single.entries] == ["alpha", "beta", "ghost"]

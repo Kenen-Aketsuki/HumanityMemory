@@ -294,11 +294,27 @@ def validate_settings(settings: dict[str, Any]) -> list[str]:
             )
         above = by_level.get(level + 1)
         above_down = above.get("down_threshold") if above else None
-        if above_down is not None and float(up) <= float(above_down):
-            problems.append(
-                f"滞回倒挂：level={level} 的 up_threshold={up} "
-                f"不高于 level={level + 1} 的 down_threshold={above_down}"
-            )
+        # 阈值是「周期总量」，各档周期天数不同，总量刻度跨档不可比
+        # （L6 的降档线 13.5 天然大于 L5 的升档线 3.5，但这不是倒挂 ——
+        # 前者是 30 天的总量、后者是 7 天的总量）。所以跨档滞回必须在
+        # 日均刻度上比：up/本档经验周期 vs 下一档 down/下一档经验周期。
+        own_period = item.get("period_experience_days")
+        above_period = above.get("period_experience_days") if above else None
+        if (
+            above_down is not None
+            and own_period
+            and float(own_period) > 0
+            and above_period
+            and float(above_period) > 0
+        ):
+            up_daily = float(up) / float(own_period)
+            down_daily = float(above_down) / float(above_period)
+            if up_daily <= down_daily:
+                problems.append(
+                    f"滞回倒挂（日均刻度）：level={level} 的 up_threshold={up} "
+                    f"折算日均 {up_daily:g} 不高于 level={level + 1} 的 "
+                    f"down_threshold={above_down} 折算日均 {down_daily:g}"
+                )
 
     bands = _optional(settings, "initial", "bands", default=[])
     if not isinstance(bands, list) or not bands:

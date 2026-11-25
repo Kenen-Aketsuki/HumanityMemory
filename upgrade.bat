@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 setlocal enabledelayedexpansion
-rem Same entry resolution as starmap.bat: published build first, dev venv as fallback.
+rem Same entry resolution as analyze.bat: published build first, dev venv as fallback.
 rem Path config: env var wins, then local.env in this folder (not tracked by git).
 if not defined HM_RELEASE_ROOT if exist "%~dp0local.env" (
   for /f "usebackq tokens=1,2 delims==" %%A in ("%~dp0local.env") do (

@@ -18,6 +18,9 @@ header{display:flex;align-items:center;gap:14px;padding:10px 18px;border-bottom:
 h1{font-size:15px;font-weight:500;margin:0}
 .sub{color:var(--muted);font-size:12px}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);display:inline-block;margin-right:5px}
+/* 右上角观测库下拉：库清单来自 registry，切库不改启动参数 */
+.picker{margin-left:auto;display:flex;align-items:center;gap:8px}
+.picker select{min-width:150px;max-width:280px}
 nav{display:flex;gap:2px;padding:0 12px;border-bottom:1px solid var(--line);background:var(--bg);
   position:sticky;top:0;z-index:5}
 nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);
@@ -64,6 +67,10 @@ iframe.embed{width:100%;height:calc(100vh - 108px);border:0;background:#070b14;
 <header>
   <h1>🐋 记忆观测台</h1>
   <span class="sub"><span class="dot" id="dot"></span><span id="meta">连接中…</span></span>
+  <label class="picker" title="切换当前观测的记忆库（清单来自 registry）">
+    <span class="kv">观测库</span>
+    <select id="lib"><option value="">加载中…</option></select>
+  </label>
 </header>
 <nav id="nav">
   <button data-v="starmap" class="on">星图</button>
@@ -121,7 +128,7 @@ async function loadMeta(){
   try{
     const d=await api('/api/session');
     document.getElementById('meta').textContent=
-      d.db.split(/[\\/]/).pop()+' · schema v'+d.schema_version+' · '+d.node_count+' 条记忆';
+      (d.library||String(d.db).split(/[\\/]/).pop())+' · schema v'+d.schema_version+' · '+d.node_count+' 条记忆';
     document.getElementById('dot').style.background='var(--ok)';
     metaLoaded=true;
   }catch(e){
@@ -130,11 +137,59 @@ async function loadMeta(){
   }
 }
 
+// ---- 观测库：清单来自 /api/libraries（registry 登记 + libraries 目录兜底） ----
+// 切库是运行时状态，不重启进程；换完把签名基线重来一遍，否则 poll 会拿旧库的签名比对。
+const LIB_KEY='hm.obs.lib';
+function libSelect(){return document.getElementById('lib');}
+function rememberLib(label){ try{localStorage.setItem(LIB_KEY,label);}catch(e){} }
+
+async function loadLibs(){
+  const d=await api('/api/libraries');
+  const list=d.libraries||[], sel=libSelect();
+  sel.innerHTML=list.length
+    ? list.map(l=>'<option value="'+esc(l.label)+'"'+(l.ok?'':' disabled')+'>'+
+        esc(l.label)+(l.ok?'':'（不可用）')+'</option>').join('')
+    : '<option value="">（没有可观测的库）</option>';
+  CURRENT=d.current||'';
+  if(CURRENT) sel.value=CURRENT;
+  if((d.warnings||[]).length) document.getElementById('status').textContent=d.warnings.join('；');
+  return d;
+}
+async function resyncSig(){
+  const s=await api('/api/status').catch(()=>null);
+  if(s){for(const k of ['starmap','recall','review','memory'])SIG[k]=s[k];}
+}
+async function switchLib(label){
+  const d=await api('/api/library',{
+    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label})});
+  CURRENT=d.current||label;
+  libSelect().value=CURRENT;
+  rememberLib(CURRENT);
+  await loadMeta();
+  await resyncSig();
+  return d;
+}
+libSelect().onchange=async ev=>{
+  const sel=ev.target, want=sel.value, prev=CURRENT;
+  if(!want||want===CURRENT) return;
+  sel.disabled=true;
+  document.getElementById('status').textContent='正在切换到 '+want+'…';
+  try{
+    await switchLib(want);
+    document.getElementById('status').textContent='已切换到 '+CURRENT;
+    refreshView(cur,true); // 当前视图整页重载（iframe 里的老工具也会重新取数）
+  }catch(e){
+    // 失败保持原库：后端 switch 也是先构造新源再赋值，不会留下半个状态
+    document.getElementById('status').textContent='切换失败：'+e.message;
+    sel.value=prev;
+  }finally{ sel.disabled=false; }
+};
+
 // 视图刷新分发：星图 / recall 由 iframe 内的老工具页自取数；其余走 views.js
 const EMBED_SRC={starmap:'/starmap.html',recall:'/recall.html'};
 function loadEmbed(name,force){
   const f=document.getElementById('f-'+name); if(!f)return;
-  // 懒加载：首次显示才设 src；force（签名变化/切 tab）时重载以取最新数据
+  // 懒加载：首次显示才设 src；force（签名变化/切 tab/换库）时重载以取最新数据
   if(!f.src || force){ f.src=EMBED_SRC[name]+(force?'?t='+Date.now():''); }
 }
 async function refreshView(name,force){
@@ -147,8 +202,9 @@ async function refreshView(name,force){
     '<div class="card note">加载失败：'+esc(e.message)+'</div>'; }
 }
 
-// 轮询签名：谁变只重拉谁
+// 轮询签名：谁变只重拉谁（首屏没就位前不刷，避免与 boot 抢同一次加载）
 async function poll(){
+  if(!ready) return;
   try{
     const s=await api('/api/status');
     for(const k of ['starmap','recall','review','memory']){
@@ -162,12 +218,27 @@ async function poll(){
   }
 }
 
-loadMeta();
-setTimeout(async()=>{const s=await api('/api/status').catch(()=>null);
-  if(s){for(const k of ['starmap','recall','review','memory'])SIG[k]=s[k];}
+// 首屏：先拿库清单，再按「URL ?lib= > 上次选择 > 服务端默认」定当前库
+(async function boot(){
+  try{ await loadLibs(); }
+  catch(e){ document.getElementById('status').textContent='库清单加载失败：'+e.message; }
+  let want=null;
+  try{ want=new URLSearchParams(location.search).get('lib'); }catch(e){}
+  if(!want){ try{ want=localStorage.getItem(LIB_KEY); }catch(e){} }
+  if(want && want!==CURRENT){
+    try{ await switchLib(want); }
+    catch(e){ // 上次选的库可能已被 revoke / 盘没挂上：退回服务端默认，别卡住首屏
+      document.getElementById('status').textContent='切到 '+want+' 失败：'+e.message+'（已用 '+(CURRENT||'默认库')+'）';
+      await loadMeta(); await resyncSig();
+    }
+  }else{
+    await loadMeta(); await resyncSig();
+  }
+  ready=true;
   refreshView(cur,true); // 首屏渲染（views.js 已在上方同步加载完）
-},100);
+})();
 setInterval(poll,4000);
+
 </script>
 <script src="views.js"></script>
 </body>

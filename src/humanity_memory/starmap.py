@@ -719,7 +719,10 @@ canvas.drag{cursor:grabbing}
 #hud{position:absolute;left:16px;bottom:14px;color:var(--muted);font-size:11px;
   pointer-events:none;letter-spacing:.3px}
 #legend{position:absolute;right:16px;bottom:14px;font-size:11px;color:var(--muted);
-  pointer-events:none;text-align:right;line-height:1.9}
+  pointer-events:auto;text-align:right;line-height:1.9;background:rgba(13,20,34,.85);
+  border:1px solid var(--line);border-radius:8px;padding:6px 10px;max-width:70%}
+#legendHead{cursor:pointer;user-select:none;color:#cfe0ff}
+#legendBody{margin-top:4px}
 .warn{color:#ffc46b;font-size:11px;margin-top:8px;word-break:break-word}
 /* 活跃度色标：三锚点与画布里的辉光同源（青 0 → 黄 0.5 → 红 1） */
 .glowbar{height:10px;border-radius:5px;margin:4px 0 3px;
@@ -784,7 +787,9 @@ const tip=document.getElementById('tip');
 let W=0,H=0,DPR=1,view={x:0,y:0,k:1};
 let alpha=1,frame=0,hover=null,selected=null,dragging=null,panning=null,fixedHover=true,downX=0,downY=0;
 const enabled={semantic:true,invalidates:true,digest:true,tag:false};
-const kinds={experience:true,episode:true,log:true,digest:true};
+// 复盘恒星默认隐藏（2026-11-25 要求）：金色恒星视觉存在感太强，
+// 平时看的是知识/经历本身；侧栏勾选「复盘」随时可以打开。
+const kinds={experience:true,episode:true,log:true,digest:false};
 let minScore=DATA.meta.min_score;
 // 等级量程与整张等级表都由后端从配置（[[forget.levels]]）带过来。
 // 不写死档数、也不假设等级是 0~N 连续整数：表的形状归配置管，这里只负责画。
@@ -1103,7 +1108,8 @@ function buildUI(){
     ET[k]+' <span style="color:var(--muted);margin-left:auto">'+(m.edge_counts[k]||0)+'</span></label>').join('');
   et.querySelectorAll('input').forEach(el=>el.onchange=()=>{enabled[el.dataset.et]=el.checked;refresh();});
   const kd=document.getElementById('kinds');
-  kd.innerHTML=Object.keys(L).map(k=>'<label class="row"><input type="checkbox" data-k="'+k+'" checked> '+
+  kd.innerHTML=Object.keys(L).map(k=>'<label class="row"><input type="checkbox" data-k="'+k+'"'+
+    (kinds[k]?' checked':'')+'> '+
     '<span class="dot" style="background:'+C[k]+'"></span>'+L[k]+' <span style="color:var(--muted);margin-left:auto">'+
     (m.kind_counts[k]||0)+'</span></label>').join('');
   kd.querySelectorAll('input').forEach(el=>el.onchange=()=>{kinds[el.dataset.k]=el.checked;refresh();});
@@ -1154,7 +1160,11 @@ function buildUI(){
     ? ((am.min||0).toFixed(2)+' → '+(am.max||0).toFixed(2)
       +(isRatio&&am.zero?' · '+am.zero+' 个为 0':''))
     : '无节点';
-  document.getElementById('legend').innerHTML=
+  // 图例默认折叠（2026-11-25 要求）：只留一行「图例 ▸」，点开看全部说明。
+  const legend=document.getElementById('legend');
+  legend.innerHTML=
+    '<div id="legendHead">图例 <span id="legendArrow">▸</span></div>'+
+    '<div id="legendBody" style="display:none">'+
     '<span style="color:#cfe0ff">点大小 = 重要度 · 辉光颜色 = 活跃度 · 辉光透明度 = 遗忘等级</span><br>'+
     '<span style="color:#0fe0e5">　冷 0</span><span style="color:#8292ab"> ─ </span>'+
     '<span style="color:#f6de14">中 0.5</span><span style="color:#8292ab"> ─ </span>'+
@@ -1166,7 +1176,14 @@ function buildUI(){
     '<span style="color:#ffe08a">黄色恒星 = 复盘批次</span><br>'+
     '<span style="color:'+LOG_GLOW+'">灰色辉光 = 原始日志（无活跃度 / 无等级）</span><br>'+
     '<span style="color:#5fd6a0">绿色实线 = 标签共现</span><br>'+
-    '<span style="color:#cfe0ff">悬停 / 选中 / 搜中 = 加粗其可见连线</span>';
+    '<span style="color:#cfe0ff">悬停 / 选中 / 搜中 = 加粗其可见连线</span>'+
+    '</div>';
+  document.getElementById('legendHead').onclick=()=>{
+    const body=document.getElementById('legendBody');
+    const open=body.style.display==='none';
+    body.style.display=open?'block':'none';
+    document.getElementById('legendArrow').textContent=open?'▾':'▸';
+  };
   const notes=document.getElementById('notes');
   notes.innerHTML='<h2>数据源说明</h2>'+(m.notes.length?m.notes.map(x=>'<div class="kv">'+esc(x)+'</div>').join(''):
     '<div class="kv"><span>无额外提示</span></div>')+
@@ -1357,7 +1374,7 @@ def build_graph_payload(db: Path, args: Any) -> tuple[dict[str, Any], dict[str, 
 
     返回 ``(graph, extras)`` —— ``extras`` 带 CLI 才需要的诊断字段（notes/warnings/
     real_nodes/coverage 等），HTTP 端只取 graph。CLI 的 ``run()`` 是本函数的薄包装，
-    两条路径共用同一份取数逻辑，保证浏览器里看到的与 starmap.bat 产物一致。
+    两条路径共用同一份取数逻辑，保证浏览器里看到的与 `starmap` 子命令产物一致。
     """
     conn = open_readonly(db)
     try:
