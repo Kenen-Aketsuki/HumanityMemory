@@ -1150,6 +1150,7 @@ def cmd_retrieval_report(args: argparse.Namespace) -> int:
     from .reports import (
         latest_judge_snapshot,
         level_thresholds,
+        read_item_contents,
         read_node_activity,
         read_retrievals,
     )
@@ -1179,8 +1180,19 @@ def cmd_retrieval_report(args: argparse.Namespace) -> int:
             for n in (snapshot or {}).get("nodes", [])
         ]
 
+        # 单文件报告是离线产物，页面没法向后端懒取正文，只能在生成时内联。
+        # 只取日志里真正出现过的 id（记录可能跨几十天，全库内联没必要）。
+        hit_ids = [str(h.get("id")) for r in records for h in (r.get("hits") or [])]
+        contents = {
+            item_id: item["content"]
+            for item_id, item in read_item_contents(
+                store.layout.workspace_db, [x for x in hit_ids if x]
+            ).items()
+        }
+
         html = render_retrieval_html(
             records,
+            contents=contents,
             meta={
                 "db": str(store.layout.workspace_db),
                 "days": args.days,

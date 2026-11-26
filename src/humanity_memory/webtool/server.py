@@ -169,14 +169,15 @@ class Handler(BaseHTTPRequestHandler):
         """各阶段视图路由；模块不存在时给出明确提示而不是 500。"""
         routes: dict[str, Callable[[Any], Any]] = {}
         try:
-            from . import starmap_view, recall_view, review, memory_state, simulate
+            from . import starmap_view, recall_view, review, memory_state, simulate, items
         except ImportError as exc:
             # 未实现的阶段：返回占位，前端显示"待接入"而不是崩
             def not_ready(q: Any) -> dict[str, Any]:
                 return {"ok": False, "code": "not_ready", "message": f"视图尚未接入：{exc}"}
 
             for p in (
-                "/api/starmap", "/api/recall", "/api/review", "/api/memory", "/api/search-test"
+                "/api/starmap", "/api/recall", "/api/review", "/api/memory", "/api/search-test",
+                "/api/item",
             ):
                 routes[p] = not_ready
             return routes
@@ -185,6 +186,8 @@ class Handler(BaseHTTPRequestHandler):
         routes["/api/recall"] = lambda q: recall_view.get(self.source, q)
         routes["/api/review"] = lambda q: review.get(self.source)
         routes["/api/memory"] = lambda q: memory_state.get(self.source)
+        # 悬停记忆 ID 的正文反查：ids 可重复出现（?ids=a&ids=b），统一按逗号拼起来
+        routes["/api/item"] = lambda q: items.get(self.source, ",".join(q.get("ids", [])))
         routes["/api/search-test"] = lambda b: simulate.post(self.source, b)
         return routes
 

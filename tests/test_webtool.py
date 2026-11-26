@@ -550,3 +550,93 @@ def test_library_pool_lists_registry_and_switches(tmp_path: Path, monkeypatch) -
     single = SourcePool(alpha)
     assert single.current_label == "alpha"
     assert [e.label for e in single.entries] == ["alpha", "beta", "ghost"]
+
+
+# ---------------------------------------------------------------- 11. 悬停记忆 ID 显示正文
+
+
+def test_item_contents_lookup(lib) -> None:
+    """按 id 反查正文：拿得到、截断注明、查不到的如实缺失（不假装有内容）。"""
+    from humanity_memory.reports import read_item_contents
+
+    store, library_dir = lib
+    exp = store.write_memory("中文 路径与空格的正文反查", importance=0.5)
+    exp_id = str(exp.id)
+
+    got = read_item_contents(library_dir / "workspace.db", [exp_id, "nope-missing"])
+    assert exp_id in got
+    assert got[exp_id]["kind"] == "experience"
+    assert got[exp_id]["content"] == "中文 路径与空格的正文反查"
+    assert "nope-missing" not in got, "查不到的 id 不能凭空造一条"
+
+    # 截断必须注明原文字数，否则浮层里看到的像是全文
+    short = read_item_contents(library_dir / "workspace.db", [exp_id], limit=4)
+    assert short[exp_id]["content"].startswith("中文 路")
+    assert "已截断" in short[exp_id]["content"]
+
+    # 全量读（单文件报告内联用）
+    assert exp_id in read_item_contents(library_dir / "workspace.db")
+
+
+def test_item_api_endpoint(lib) -> None:
+    """GET /api/item 返回 {items, ids, missing}，且只读。"""
+    import threading
+    import urllib.request
+
+    from humanity_memory.webtool.server import WebServer
+
+    store, library_dir = lib
+    exp = store.write_memory("悬停浮层要显示的正文", importance=0.5)
+    exp_id = str(exp.id)
+    store.close()  # 先关写入端，观测台才是「单开只读」的现场
+
+    src = WebSource(library_dir)
+    srv = WebServer(("127.0.0.1", 0), src)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/item?ids={exp_id},gone-id", timeout=10
+        ) as r:
+            d = json.loads(r.read())
+        assert d["ok"] is True
+        assert d["items"][exp_id]["content"] == "悬停浮层要显示的正文"
+        assert d["missing"] == ["gone-id"]
+        # 没给 ids 时是空结构，不是 500
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/item", timeout=10) as r:
+            assert json.loads(r.read()) == {"ok": True, "items": {}, "ids": [], "missing": []}
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        t.join(timeout=5)
+
+
+def test_hover_tip_wired_on_recall_and_review_pages() -> None:
+    """recall 历史 / 复盘记录的 id 列必须带 data-memid，浮层逻辑两边都在。"""
+    from humanity_memory import retrieval_view
+    from humanity_memory.webtool import live
+
+    root = Path(__file__).resolve().parents[1]
+    js = (root / "src/humanity_memory/webtool/static/views.js").read_text(encoding="utf-8")
+
+    # 复盘记录：四张表的 id 列都走 memCell（= td.id + data-memid）
+    assert "function memCell(" in js and "data-memid=" in js
+    assert js.count("memCell(") >= 5, "复盘记录里的 id 列没全部挂上 data-memid"
+    assert "bindMemTips(document.getElementById('reviewDetail'))" in js
+    assert "bindMemTips(document.getElementById('recDetail'))" in js
+    # 懒加载端点与缓存：同一 id 不重复请求
+    assert "/api/item?ids=" in js and "memCache" in js
+
+    # recall 历史（iframe 里的老模板）：详情表 id 列带 data-memid，浮层两级取数
+    page = live.retrieval_live_html()
+    assert 'data-memid=' in page
+    assert "CONTENTS=DATA.contents" in page
+    assert "'/api/item?ids='" in page and "bindTips()" in page
+
+    # 单文件离线报告：正文在生成时内联，页面无需后端也能悬停
+    html = retrieval_view.render_retrieval_html(
+        [{"at": 1, "query": "q", "hits": [{"rank": 1, "id": "x_1", "kind": "experience"}]}],
+        contents={"x_1": "内联正文"},
+    )
+    assert '"contents":{"x_1":"内联正文"}' in html

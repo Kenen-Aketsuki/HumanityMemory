@@ -38,7 +38,12 @@ table{width:100%;border-collapse:collapse;font-size:12px}
 th{color:var(--muted);font-weight:500;text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);
   position:sticky;top:0;background:var(--panel)}
 td{padding:7px 9px;border-bottom:1px solid #161d27;vertical-align:top}
+/* 条目行悬浮高亮：行多时视线要能锁定当前行（复盘/记忆现状/检索测试的表格共用） */
+tbody tr:hover td{background:var(--hover)}
+th[data-s]:hover{color:var(--text)}
 .id{font-family:ui-monospace,Consolas,monospace;color:var(--muted);font-size:11px}
+/* 悬停记忆 ID 看正文：虚线底标 + help 光标，提示这一列可以悬停（浮层不挡点击） */
+.id.hittip{cursor:help;text-decoration:underline dotted rgba(214,226,240,.28);text-underline-offset:2px}
 .empty{padding:36px 16px;color:var(--dim);text-align:center}
 /* 侧栏可点列表项（复盘记录左侧时间轴 / recall 记录列表）的选中态 */
 .item{cursor:pointer}

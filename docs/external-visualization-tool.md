@@ -126,6 +126,7 @@
    │  ├─ /api/recall       → reports.read_* + level_*     │
    │  ├─ /api/review       → 扫 judge/*.json + 库实时字段  │
    │  ├─ /api/memory       → 扫当前节点 + 实时裁定倒计时    │
+   │  ├─ /api/item         → 按 id 反查正文（悬停浮层用）    │
    │  ├─ /api/search-test  → store.search + 模拟 delta     │
    │  └─ /api/status       数据源签名（供轮询）             │
    ├─────────────────────────────────────────────────────┤
@@ -217,6 +218,7 @@ humanity-memory analyze [target] [--port 8765] [--no-browser]
 | `/api/recall` | GET | `{records, meta:{levels,nodes,activity,generated}}` | `reports.read_retrievals` 等四个函数 + `render_retrieval_html` 的 meta 组装 |
 | `/api/review` | GET | `{days:[{date, at, changes:[...], activity_deltas:[...], added:[...], replaced:[...], deduped:[...]}]}`，按天倒序；字段见 §6.1 | 扫 `reports/judge/*.json` + 逐份解析 + 库实时 `created_at`/`invalidated_by`/`memory_events` |
 | `/api/memory` | GET | `{nodes:[{id,kind,level,activity,next_judge_ms,due,...}], meta:{levels,now}}`，实时算倒计时 | 只读扫 `knowledge`/`episodes` + `LevelTable.period_ms()`；字段见 §6.2 |
+| `/api/item` | GET | `?ids=a,b,c` → `{items:{id:{id,kind,content,level,activity,invalidated_by,archived}}, ids, missing}`；查不到的 id 落 `missing`，不造假内容 | `reports.read_item_contents`（`mode=ro`，正文截 500 字并注明原文长度） |
 | `/api/search-test` | POST | `{hits:[...], simulated:[...], took_ms, note}` | 见 §7 |
 | `/api/status` | GET | `{starmap:"<sig>", recall:"<sig>", review:"<sig>", memory:"<sig>", now}` | 见 §8 |
 
@@ -238,6 +240,13 @@ humanity-memory analyze [target] [--port 8765] [--no-browser]
 | **复盘记录** | 左侧**按天**时间轴 + 右侧四块：① 遗忘等级变动 ② 活跃度变动 ③ 新增与顶替 ④ md 原文 | `/api/review` | `views.js` 自绘 |
 | **记忆现状** | 当前全量记忆表：活跃度 / 遗忘等级 / **距下次裁定时间**，可排序筛选 | `/api/memory` | `views.js` 自绘 |
 | 检索测试 | 查询输入框 + 参数（limit/kinds） + 结果表（分数/向量·词面/活跃度/**模拟增量**） | `POST /api/search-test` | `views.js` 自绘 |
+
+**悬停记忆 id 看正文（三个列表页统一）**：检索记录与裁定快照只存 id 与判定依据，不存正文，
+所以浮层内容要现取。检索测试的结果自带 `content`（当场命中）；recall 历史与复盘记录只有 id，
+由前端按需打 `/api/item` 反查并缓存（同一 id 只请求一次，鼠标移动不重复发请求）。
+`retrieval-report` 生成的单文件 HTML 是离线产物，没有后端可查，改在生成时把正文内联进
+`DATA.contents`（只内联记录里出现过的 id）。浮层 `pointer-events:none`、跟随鼠标并做边界翻转，
+不挡点击与左栏选中。
 
 **星图 / recall 复用老工具全文渲染逻辑（实施期重要修正）**：最初这两个视图用 `views.js`
 自写简化版，结果交互全丢（无法拖拽/缩放/悬停）、UI 明显逊于老的 `starmap.bat` /

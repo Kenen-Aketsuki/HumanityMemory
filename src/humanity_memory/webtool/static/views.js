@@ -17,6 +17,73 @@ function modeTag(d){
   return '<span style="color:var(--dim)" title="未记录检索模式">模式未记录</span>';
 }
 
+/* ====================== 悬浮框：悬停记忆 ID 显示正文 ======================
+   检索测试 / recall 历史 / 复盘记录三个页面共用这一套（原先只在检索测试里实现）。
+   正文来源分两种：
+     * 检索测试：结果里自带 content，直接显示；
+     * 历史记录：只有 id，走 /api/item 现查（懒加载 + 缓存，同一 id 只请求一次）。
+   浮层 pointer-events:none，不挡点击，也不影响左栏选中。 */
+let hitTipEl=null;
+function showHitTip(ev,text){
+  if(!hitTipEl){
+    hitTipEl=document.createElement('div');
+    hitTipEl.style.cssText='position:fixed;z-index:999;display:none;max-width:460px;max-height:300px;'+
+      'overflow:auto;background:rgba(13,20,34,.97);border:1px solid var(--line);border-radius:8px;'+
+      'padding:10px 12px;font:12px/1.6 inherit;color:var(--text);white-space:pre-wrap;word-break:break-word;'+
+      'box-shadow:0 6px 18px rgba(0,0,0,.55);pointer-events:none';
+    document.body.appendChild(hitTipEl);
+  }
+  hitTipEl.textContent=text||'（无内容）';
+  hitTipEl.style.display='block';
+  const pad=14;let x=ev.clientX+pad,y=ev.clientY+pad;
+  const r=hitTipEl.getBoundingClientRect();
+  if(x+r.width>window.innerWidth-8)x=ev.clientX-r.width-pad;
+  if(y+r.height>window.innerHeight-8)y=ev.clientY-r.height-pad;
+  hitTipEl.style.left=x+'px';hitTipEl.style.top=y+'px';
+}
+function hideHitTip(){if(hitTipEl)hitTipEl.style.display='none';}
+
+// 历史记录里的 id → 正文：懒加载缓存。null 表示「查过但没有内容」，别反复请求。
+const memCache=new Map(), memPending=new Set();
+let tipHover=null;   // {id, ev} 最近一次悬停，异步回来时用它刷新浮层
+
+async function ensureMemContent(id){
+  if(memCache.has(id)||memPending.has(id))return;
+  memPending.add(id);
+  try{
+    const d=await api('/api/item?ids='+encodeURIComponent(id));
+    const it=(d.items||{})[id];
+    memCache.set(id,it?String(it.content||'（这条没有正文）')
+                     :'（库里没有这条记忆：可能已被删除或归档）');
+  }catch(e){
+    memCache.set(id,'（内容加载失败：'+e.message+'）');
+  }finally{
+    memPending.delete(id);
+  }
+  if(tipHover&&tipHover.id===id)showHitTip(tipHover.ev,memCache.get(id));
+}
+
+function memTip(ev,id){
+  tipHover={id:id,ev:ev};
+  if(memCache.has(id)){showHitTip(ev,memCache.get(id));return;}
+  showHitTip(ev,'加载中…');
+  ensureMemContent(id);
+}
+
+// 事件委托：内容区重绘（换记录 / 换日期）后不用重绑
+function bindMemTips(container){
+  if(!container)return;
+  container.onmousemove=ev=>{
+    const t=ev.target.closest&&ev.target.closest('[data-memid]');
+    if(t){memTip(ev,t.dataset.memid);return;}
+    tipHover=null;hideHitTip();
+  };
+  container.onmouseleave=()=>{tipHover=null;hideHitTip();};
+}
+function memCell(id,extra){
+  return '<td class="id hittip" data-memid="'+esc(id)+'">'+esc(id)+(extra||'')+'</td>';
+}
+
 /* ============================ 星图 ============================ */
 let starGraph=null, starRAF=null;
 window.render_starmap=async function(force){
@@ -158,9 +225,10 @@ window.render_recall=async function(force){
     '</div>';
   function detail(i){
     const r=recs[i];if(!r)return;
+    tipHover=null;hideHitTip();
     const rows=(r.hits||[]).map(h=>
       '<tr><td>'+(h.rank||'')+'</td><td>'+(NAMES[h.kind]||h.kind)+'</td>'+
-      '<td class="id">'+esc(h.id)+(h.forgotten?' 遗忘':'')+'</td><td>L'+(h.level==null?'—':h.level)+'</td>'+
+      memCell(h.id,(h.forgotten?' 遗忘':''))+'<td>L'+(h.level==null?'—':h.level)+'</td>'+
       '<td>'+num(h.score,3)+'</td><td>'+num(h.vec_sim,3)+' / '+num(h.lex,2)+'</td>'+
       '<td>'+num(h.activity_before,2)+' → '+num(h.activity_after,2)+'</td>'+
       '<td class="'+(h.delta>0?'up':'')+'">'+(h.delta>0?'+'+num(h.delta,3):num(h.delta,3))+'</td></tr>').join('');
@@ -174,6 +242,8 @@ window.render_recall=async function(force){
     detail(Number(n.dataset.i));
   });
   if(recs.length)detail(0);
+  // 悬停 id 看正文：容器只建一次，绑一次即可（detail 重绘不影响委托）
+  bindMemTips(document.getElementById('recDetail'));
 };
 
 /* ============================ 复盘记录 ============================ */
@@ -205,14 +275,16 @@ window.render_review=async function(force){
   }
   function detail(i){
     reviewSel=i;const d=days[i];
+    tipHover=null;hideHitTip();   // 换日期时旧浮层别残留（原元素已被 innerHTML 换掉）
     const s=d.summary||{};
     let html='<div class="row" style="margin-bottom:12px">'+
       '<span class="kv">到期 <b>'+(s.due||0)+'</b></span><span class="kv">已裁定 <b>'+(s.settled||0)+'</b></span>'+
-      '<span class="kv">节点 <b>'+(s.total_nodes||0)+'</b></span><span class="kv">快照文件 <b>'+esc(d.file)+'</b></span></div>';
+      '<span class="kv">节点 <b>'+(s.total_nodes||0)+'</b></span><span class="kv">快照文件 <b>'+esc(d.file)+'</b></span>'+
+      '<span class="kv">悬停 id 看记忆原文</span></div>';
 
     // 1 等级变动
     const chg=d.changes.map(x=>
-      '<tr><td class="id">'+esc(x.id)+'</td><td>'+(NAMES[x.kind]||x.kind||'—')+'</td>'+
+      '<tr>'+memCell(x.id)+'<td>'+(NAMES[x.kind]||x.kind||'—')+'</td>'+
       '<td>L'+(x.from==null?'—':x.from)+' → L'+(x.to==null?'—':x.to)+' '+(
         x.action==='up'?'<span class="up">↑</span>':x.action==='down'?'<span class="down">↓</span>':'=')+'</td>'+
       '<td class="'+(Number(x.activity)>0?'up':'')+'">'+num(x.activity,2)+'</td>'+
@@ -223,7 +295,7 @@ window.render_review=async function(force){
 
     // 2 活跃度变动
     const dl=d.activity_deltas.map(x=>
-      '<tr><td class="id">'+esc(x.id)+'</td><td>'+(NAMES[x.kind]||x.kind||'—')+'</td>'+
+      '<tr>'+memCell(x.id)+'<td>'+(NAMES[x.kind]||x.kind||'—')+'</td>'+
       '<td>'+num(x.prev,2)+'</td><td>'+num(x.current,2)+'</td>'+
       '<td class="'+(x.delta>0?'up':x.delta<0?'down':'')+'">'+(x.delta>0?'+':'')+num(x.delta,2)+'</td></tr>');
     html+=sec('② 活跃度变动','相邻天快照 nodes[] 按 id 算差（裁定后 vs 裁定后，不是检索增量）',
@@ -231,9 +303,9 @@ window.render_review=async function(force){
       '<div class="note" style="margin-top:8px;font-size:11px">提示：裁定后活跃度会清零，这里的差是「裁定完 vs 裁定完」。检索命中增量请看 recall 历史页。</div>');
 
     // 3 新增 / 顶替 / 合并
-    const add=d.added.map(x=>'<tr><td class="id">'+esc(x.id)+'</td><td>'+(NAMES[x.kind]||x.kind)+'</td><td>L'+(x.level==null?'—':x.level)+'</td><td>'+num(x.activity,2)+'</td><td>'+esc(x.summary)+'</td></tr>');
-    const rep=d.replaced.map(x=>'<tr><td class="id">'+esc(x.old_id)+'</td><td class="id">'+esc(x.new_id)+'</td><td>'+esc(x.summary)+'</td><td>'+ts(x.at)+'</td></tr>');
-    const ded=d.deduped.map(x=>'<tr><td class="id">'+esc(x.item_id)+'</td><td class="up">+'+num(x.delta,2)+'</td><td>'+esc(x.summary)+'</td><td>'+ts(x.at)+'</td></tr>');
+    const add=d.added.map(x=>'<tr>'+memCell(x.id)+'<td>'+(NAMES[x.kind]||x.kind)+'</td><td>L'+(x.level==null?'—':x.level)+'</td><td>'+num(x.activity,2)+'</td><td>'+esc(x.summary)+'</td></tr>');
+    const rep=d.replaced.map(x=>'<tr>'+memCell(x.old_id)+memCell(x.new_id)+'<td>'+esc(x.summary)+'</td><td>'+ts(x.at)+'</td></tr>');
+    const ded=d.deduped.map(x=>'<tr>'+memCell(x.item_id)+'<td class="up">+'+num(x.delta,2)+'</td><td>'+esc(x.summary)+'</td><td>'+ts(x.at)+'</td></tr>');
     let third='';
     const empty3=(d.added.length+d.replaced.length+d.deduped.length)===0;
     if(empty3){third='<div class="empty" style="padding:12px">当天无新增 / 顶替 / 合并</div>';}
@@ -254,6 +326,8 @@ window.render_review=async function(force){
     detail(Number(n.dataset.i));
   });
   detail(reviewSel<days.length?reviewSel:0);
+  // 悬停 id 看正文：四张表的 id 列都带 data-memid，统一在详情容器上委托
+  bindMemTips(document.getElementById('reviewDetail'));
 };
 
 /* ============================ 记忆现状 ============================ */
@@ -345,27 +419,6 @@ window.render_memory=async function(force){
 };
 
 /* ============================ 检索测试 ============================ */
-// 悬浮窗：检索结果 ID 列悬停显示条目内容（跟随鼠标，不挡点击）
-let hitTipEl=null;
-function showHitTip(ev,text){
-  if(!hitTipEl){
-    hitTipEl=document.createElement('div');
-    hitTipEl.style.cssText='position:fixed;z-index:999;display:none;max-width:460px;max-height:300px;'+
-      'overflow:auto;background:rgba(13,20,34,.97);border:1px solid var(--line);border-radius:8px;'+
-      'padding:10px 12px;font:12px/1.6 inherit;color:var(--text);white-space:pre-wrap;word-break:break-word;'+
-      'box-shadow:0 6px 18px rgba(0,0,0,.55);pointer-events:none';
-    document.body.appendChild(hitTipEl);
-  }
-  hitTipEl.textContent=text||'（无内容）';
-  hitTipEl.style.display='block';
-  const pad=14;let x=ev.clientX+pad,y=ev.clientY+pad;
-  const r=hitTipEl.getBoundingClientRect();
-  if(x+r.width>window.innerWidth-8)x=ev.clientX-r.width-pad;
-  if(y+r.height>window.innerHeight-8)y=ev.clientY-r.height-pad;
-  hitTipEl.style.left=x+'px';hitTipEl.style.top=y+'px';
-}
-function hideHitTip(){if(hitTipEl)hitTipEl.style.display='none';}
-
 window.render_search=async function(force){
   const el=document.getElementById('v-search');
   // 只在首次挂载表单，避免轮询重绘丢失输入
