@@ -165,6 +165,79 @@ def test_search_test_loads_vec_extension() -> None:
     assert hit["vec_sim"] is not None and hit["vec_sim"] > 0.7
 
 
+def test_search_test_condition_and_scope(lib) -> None:
+    """指定检索条件（严格/宽松）与范围（记忆/遗忘）按语义生效，且全程只读。
+
+    默认 = 严格不够再宽松、记忆找不到再翻遗忘；限定后不跨方法/区域补结果，
+    找不到就返回空。遗忘层只模拟命中，不能写复活计数。
+    """
+    store, libdir = lib
+    live = store.write_memory("橙子日落 观测记录", allow_duplicate=True)
+    dead = store.write_memory("香蕉月食 夜间记录", kind="episode", allow_duplicate=True)
+    # 把经历压到遗忘层（0 级），它就不该再出现在常规视野
+    store.workspace_conn.execute("UPDATE episodes SET forget_level = 0 WHERE id = ?", (str(dead.id),))
+    store.workspace_conn.commit()
+    # 临时库没有向量（离线环境不下载模型），maxpool 拿向量相似度做锚会恒为 0；
+    # 用 rrf 才能在纯词面数据上验证「仅宽松」确实绕过了严格层。
+    (libdir / "memory.toml").write_text('[search]\nfallback_mode = "rrf"\n', encoding="utf-8")
+
+    def snap() -> tuple:
+        con = sqlite3.connect(
+            "file:" + str(libdir / "workspace.db").replace("\\", "/") + "?mode=ro", uri=True
+        )
+        rows = con.execute(
+            "SELECT id, forget_level, activity FROM knowledge UNION ALL "
+            "SELECT id, forget_level, activity FROM episodes ORDER BY id"
+        ).fetchall()
+        revive = con.execute("SELECT id, revive_hits FROM episodes ORDER BY id").fetchall()
+        con.close()
+        logs = sorted(str(p) for p in (libdir / "retrieval").glob("*.jsonl"))
+        return rows, revive, logs
+
+    before = snap()
+
+    def run(q: str, **kw) -> dict:
+        return simulate.post(WebSource(libdir), {"query": q, "limit": 8, **kw})
+
+    # 仅严格 + 仅记忆：短词严格命中；严格找不到时不许跨层去遗忘层兜
+    strict = run("橙子日落", condition="strict", scope="memory")
+    assert [h["id"] for h in strict["hits"]] == [live.id]
+    assert strict["mode"] == "strict" and strict["deep"] is False
+    assert all(not h["fallback"] and not h["forgotten"] for h in strict["hits"])
+    assert run("香蕉月食", condition="strict", scope="memory")["hits"] == []
+
+    # 仅遗忘：翻 0 级、标 forgotten，且不复活；仅记忆看不到它
+    dead_hit = run("香蕉月食", scope="forgotten")
+    assert [h["id"] for h in dead_hit["hits"]] == [dead.id]
+    assert dead_hit["hits"][0]["forgotten"] is True
+    assert dead_hit["deep"] is True
+    assert run("香蕉月食", scope="memory")["hits"] == []
+
+    # 默认范围：常规找不到 → 按 recall 的判据翻遗忘层
+    default_deep = run("香蕉月食")
+    assert [h["id"] for h in default_deep["hits"]] == [dead.id]
+    assert default_deep["deep"] is True and default_deep["condition"] == "default"
+
+    # 仅严格 vs 仅宽松：长查询严格覆盖不到，宽松能拆词捞回；限定后不许再兜底
+    long_q = "橙子日落 无关词甲乙 无关词丙丁"
+    assert run(long_q, condition="strict", scope="memory")["hits"] == []
+    broad = run(long_q, condition="broad", scope="memory")
+    assert [h["id"] for h in broad["hits"]] == [live.id]
+    assert broad["mode"] == "fallback" and broad["hits"][0]["fallback"] is True
+    assert broad["condition"] == "broad" and broad["deep"] is False
+
+    # 非法枚举要有明确错误，而不是悄悄退回默认
+    bad = run("橙子日落", condition="未知")
+    assert bad["ok"] is False and bad["code"] == "bad_param"
+
+    assert snap() == before, "指定方法检索写库或写了检索日志"
+
+    js = (Path(__file__).resolve().parents[1]
+          / "src/humanity_memory/webtool/static/views.js").read_text(encoding="utf-8")
+    for needle in ("按照指定方法检索", "检索条件", "检索范围", "仅严格", "仅宽松", "仅记忆", "仅遗忘"):
+        assert needle in js, f"前端缺少选项：{needle}"
+
+
 # ---------------------------------------------------------------- 2. 空库优雅
 
 

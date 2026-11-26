@@ -219,7 +219,7 @@ humanity-memory analyze [target] [--port 8765] [--no-browser]
 | `/api/review` | GET | `{days:[{date, at, changes:[...], activity_deltas:[...], added:[...], replaced:[...], deduped:[...]}]}`，按天倒序；字段见 §6.1 | 扫 `reports/judge/*.json` + 逐份解析 + 库实时 `created_at`/`invalidated_by`/`memory_events` |
 | `/api/memory` | GET | `{nodes:[{id,kind,level,activity,next_judge_ms,due,...}], meta:{levels,now}}`，实时算倒计时 | 只读扫 `knowledge`/`episodes` + `LevelTable.period_ms()`；字段见 §6.2 |
 | `/api/item` | GET | `?ids=a,b,c` → `{items:{id:{id,kind,content,level,activity,invalidated_by,archived}}, ids, missing}`；查不到的 id 落 `missing`，不造假内容 | `reports.read_item_contents`（`mode=ro`，正文截 500 字并注明原文长度） |
-| `/api/search-test` | POST | `{hits:[...], simulated:[...], took_ms, note}` | 见 §7 |
+| `/api/search-test` | POST | `{query,limit,condition,scope,hits:[...],mode,deep,took_ms,note}`；入参 `condition`/`scope` 见 §7.4 | 见 §7 |
 | `/api/status` | GET | `{starmap:"<sig>", recall:"<sig>", review:"<sig>", memory:"<sig>", now}` | 见 §8 |
 
 **重构要求**：`starmap.run()` 目前把「取数 + 等级/活跃度 + 组装 graph + 写文件 + 打印」揉在一起。
@@ -356,10 +356,15 @@ remain_ms > 0     → 显示「X 天 X 小时」或「X.X 天」（前端选一�
 ### 7.2 实现要点
 
 ```
-POST /api/search-test  {"query": "...", "limit": 8, "kinds": null}
+POST /api/search-test  {"query": "...", "limit": 8, "kinds": null,
+                        "condition": "default", "scope": "default"}
    │
-   ├─ store.search(query, limit, kinds)      ← 纯只读，不强化、不写 JSONL
-   │     → hits（score / vec_sim / lex / level / activity 现值）
+   ├─ 选定检索条件（怎么找）与范围（去哪找），见 §7.4
+   │     ├─ 条件 default = 严格不够再宽松；strict = 仅严格；broad = 仅宽松
+   │     └─ 范围 default = 先记忆后遗忘；memory = 仅记忆；forgotten = 仅遗忘
+   │
+   ├─ store.search() / _broad_search()       ← 纯只读，不强化、不写 JSONL
+   │     → hits（score / vec_sim / lex / level / activity 现值，forgotten/fallback 标记）
    │
    ├─ 对每条 hit 用纯函数算「假想 delta」：
    │     fused = store._fuse(vec_sim, lex_sim)
@@ -372,8 +377,9 @@ POST /api/search-test  {"query": "...", "limit": 8, "kinds": null}
             took_ms, note:"仅模拟：未写活跃度、未写检索日志"}
 ```
 
-- **不调** `deep_recall()`：它会 revive 遗忘层、改库。检索测试默认只跑常规检索，
-  UI 上给一句说明"深度回忆会改写遗忘层，故不在模拟范围内"。
+- **不调** `deep_recall()`：它会 revive 遗忘层、改库。默认范围翻遗忘层时用
+  `search(level_filter="forgotten")` 只读模拟，命中只标 `forgotten`，
+  不写复活计数；UI 提示"遗忘层只模拟命中，不会复活"。
 - **不写** JSONL：`_log_retrieval` 不参与，避免污染 recall 历史分析的数据源。
 - **不经过 gate**：见 §2.2，在 API 注释和 UI 提示里写明"分析用途，不计入活跃度"。
 
@@ -381,6 +387,23 @@ POST /api/search-test  {"query": "...", "limit": 8, "kinds": null}
 
 | # | 类型 | id | 等级 | 分数 | 向量/词面 | 当前活跃度 | 模拟增量 | 假想活跃度 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+
+### 7.4 按照指定方法检索
+
+表单里两组下拉与 recall 记录的两个维度一一对应：
+
+| 参数 | 选项 | 语义 |
+| --- | --- | --- |
+| `condition`（检索条件 / 怎么找） | `default`（默认） | 严格阈值不够再走宽泛兜底（RRF / maxpool），与 `store.search()` 默认行为一致 |
+| | `strict`（仅严格） | 显式传 `min_score=cfg.min_retrieval` 关掉兜底；严格层找不到就空 |
+| | `broad`（仅宽松） | 直接调 `_broad_search()`，跳过严格层；宽泛层找不到就空 |
+| `scope`（检索范围 / 去哪找） | `default`（默认） | 先在记忆层（0 级除外）找；常规结果相似度低于 `deep_recall_floor` 才翻遗忘层 |
+| | `memory`（仅记忆） | 只查常规视野，不翻遗忘层 |
+| | `forgotten`（仅遗忘） | 只查 0 级遗忘层，命中标「遗忘」，不复活 |
+
+两组正交，可任意组合：`仅严格 + 仅遗忘` = 只在遗忘层跑严格阈值；
+`仅宽松 + 默认` = 记忆层跑宽泛兜底，相似度不够再翻遗忘层跑宽泛兜底。
+被限定后**不向其它方法或区域退让**，找不到就返回空结果。
 
 ---
 

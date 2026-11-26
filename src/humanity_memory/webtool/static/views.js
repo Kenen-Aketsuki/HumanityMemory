@@ -431,7 +431,20 @@ window.render_search=async function(force){
           '<select id="sk"><option value="all">全部类型</option><option value="experience">经验</option><option value="episode">经历</option></select>'+
           '<button class="act" id="sgo">检索</button>'+
         '</div>'+
-        '<div class="note" style="margin-top:8px;font-size:11px">模拟 recall 的检索与打分，纯只读：不写活跃度、不写检索日志、不触发复盘闸门。深度回忆会改写遗忘层，不在模拟范围内。悬停结果里的 id 列可查看条目内容。</div>'+
+        '<div class="row" style="margin-top:10px;align-items:center">'+
+          '<span class="kv" style="color:var(--text)">按照指定方法检索</span>'+
+          '<label class="kv">检索条件 <select id="sc">'+
+            '<option value="default">默认（先严格后宽松）</option>'+
+            '<option value="strict">仅严格</option>'+
+            '<option value="broad">仅宽松</option>'+
+          '</select></label>'+
+          '<label class="kv">检索范围 <select id="ss">'+
+            '<option value="default">默认（先记忆后遗忘）</option>'+
+            '<option value="memory">仅记忆</option>'+
+            '<option value="forgotten">仅遗忘</option>'+
+          '</select></label>'+
+        '</div>'+
+        '<div class="note" style="margin-top:8px;font-size:11px">模拟 recall 的检索与打分，纯只读：不写活跃度、不写检索日志、不触发复盘闸门，也不会复活遗忘层。默认按默认逻辑检索（严格不够再宽松、记忆找不到再翻遗忘）；限定条件或范围后，找不到就显示空。悬停结果里的 id 列可查看条目内容。</div>'+
       '</div>'+
       '<div class="card" id="searchResult"><div class="empty">输入查询并点「检索」</div></div>';
     document.getElementById('sgo').onclick=runSearch;
@@ -442,21 +455,30 @@ window.render_search=async function(force){
     if(!q){document.getElementById('searchResult').innerHTML='<div class="empty">请输入查询</div>';return;}
     const limit=Number(document.getElementById('sl').value)||8;
     let kinds=document.getElementById('sk').value; kinds=kinds==='all'?null:kinds;
+    const condition=document.getElementById('sc').value;
+    const scope=document.getElementById('ss').value;
+    const conditionLabel=document.getElementById('sc').selectedOptions[0].text;
+    const scopeLabel=document.getElementById('ss').selectedOptions[0].text;
     const btn=document.getElementById('sgo');btn.disabled=true;btn.textContent='检索中…';
     try{
       const d=await api('/api/search-test',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({query:q,limit:limit,kinds:kinds})});
+        body:JSON.stringify({query:q,limit:limit,kinds:kinds,condition:condition,scope:scope})});
       const hs=d.hits||[];
       const rows=hs.map((h,i)=>
         '<tr'+(h.needs_verify?' title="可信度偏低，标了先验证再用"':'')+'>'+
         '<td>'+h.rank+'</td><td>'+(NAMES[h.kind]||h.kind)+'</td>'+
-        '<td class="id hittip" data-i="'+i+'">'+esc(h.id)+(h.fallback?' <span style="color:var(--warn)" title="宽泛层兜底召回">宽松</span>':'')+'</td><td>L'+(h.level==null?'—':h.level)+'</td>'+
+        '<td class="id hittip" data-i="'+i+'">'+esc(h.id)+
+          (h.fallback?' <span style="color:var(--warn)" title="宽泛层召回">宽松</span>':'')+
+          (h.forgotten?' <span style="color:var(--warn)" title="遗忘层命中（仅模拟，未复活）">遗忘</span>':'')+
+        '</td><td>L'+(h.level==null?'—':h.level)+'</td>'+
         '<td>'+num(h.score,4)+'</td><td>'+num(h.vec_sim,3)+' / '+num(h.lex,2)+'</td>'+
         '<td>'+num(h.activity,2)+'</td><td class="up">+'+num(h.simulated_delta,3)+'</td>'+
         '<td>'+num(h.activity_after,2)+'</td></tr>').join('');
       document.getElementById('searchResult').innerHTML=
         '<div class="row" style="margin-bottom:10px">'+
           '<span class="kv">查询 <b>'+esc(q)+'</b></span>'+
+          '<span class="kv">检索条件 <b>'+esc(conditionLabel)+'</b></span>'+
+          '<span class="kv">检索范围 <b>'+esc(scopeLabel)+'</b></span>'+
           '<span class="kv">命中 <b>'+hs.length+'</b></span>'+
           '<span class="kv">检索模式 '+modeTag(d)+'</span>'+
           '<span class="kv">耗时 <b>'+num(d.took_ms,1)+' ms</b></span></div>'+
