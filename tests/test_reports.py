@@ -119,7 +119,7 @@ def test_judge_report_can_be_disabled(env) -> None:
     cfg.settings.setdefault("report", {})["judge_enabled"] = False
     now = 3_000_000_000_000
     item = store.write_memory("该降的", importance=0.5)
-    _force(store, item_id=item.id, forget_level=2, activity=0.0,
+    _force(store, item_id=item.id, forget_level=1, activity=0.0,
            period_start=now - int(10 * DAY_MS))
 
     report = store.judge_due(now=now)

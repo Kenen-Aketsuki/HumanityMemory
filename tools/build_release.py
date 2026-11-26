@@ -14,6 +14,14 @@
     python tools/build_release.py --publish       # 备份库 → 打包 → smoke（首次只产出，不切换）
     python tools/build_release.py --promote       # 把 current 切到最新构建版本
     python tools/build_release.py --rollback      # 回上一版（exe + 库快照）
+    python tools/build_release.py --prune --keep 2 # 清理旧版本（保留最近 2 个 + current）
+
+版本号从哪来
+------------
+pyproject.toml 里的 version 是**源码基线**（git 跟踪，只在正式发版时改）。
+`--target` 可以为本次构建单独指定版本号：它只写进 exe 包内的 version.txt 和
+`build.json`，**不碰源码**，所以滚动发布不会在 git 里留下版本 diff。
+同版本重复构建用 `--force`，旧目录会被改名留档为 `v<ver>.stale-<时间戳>`。
 
 退出码：0 成功；1 失败（打包/smoke/回滚失败）；2 用法错误。
 """
@@ -78,6 +86,9 @@ CURRENT_TXT = RELEASE / "current.txt"
 HISTORY = RELEASE / "history.json"
 BACKUPS = RELEASE / "backups"
 ENV_DEST = RELEASE / ".env"
+# 本地构建序号：住在发布根里（项目树外，天然不被 git 跟踪），
+# 大版本号跟源码走，这个序号只用来区分同一大版本下的第 N 次本地打包。
+LOCAL_STATE = RELEASE / "local_build.json"
 
 
 # ---------------------------------------------------------------- 小工具
@@ -150,6 +161,44 @@ def project_version() -> str:
         return match.group(1)
 
 
+def package_base_version() -> str | None:
+    """源码里 `_BASE_VERSION` 写的基线版本；用来和 pyproject 对齐检查。"""
+    try:
+        text = (PKG / "__init__.py").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(r'^_BASE_VERSION\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def local_state() -> dict:
+    state = read_json(LOCAL_STATE, {}) or {}
+    return state if isinstance(state, dict) else {}
+
+
+def next_local_version(base: str) -> str:
+    """生成下一个本地构建版本号：`<基线>-local.<序号>`。
+
+    序号存在发布根的 local_build.json（项目树外，天然不进 git），所以微调打包
+    永远不会在源码里留下版本 diff。基线（大版本）一变序号就从 1 重新数——
+    那是另一个源码版本，跟旧序号没有可比性。
+    """
+    state = local_state()
+    seq = int(state.get("seq") or 0) if state.get("base") == base else 0
+    seq += 1
+    version = f"{base}-local.{seq}"
+    write_json(
+        LOCAL_STATE,
+        {
+            "base": base,
+            "seq": seq,
+            "version": version,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        },
+    )
+    return version
+
+
 def git_sha() -> str:
     try:
         out = subprocess.run(
@@ -167,7 +216,7 @@ def version_dir(version: str) -> Path:
     return RELEASE / f"v{version}"
 
 
-_VERSION_RE = re.compile(r"^v\d+(?:\.\d+)*$")
+_VERSION_RE = re.compile(r"^v\d+(?:\.\d+)*(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$")
 
 
 def built_versions() -> list[Path]:
@@ -310,6 +359,13 @@ def run_pyinstaller(version: str, target: Path) -> None:
     dist.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
 
+    # 版本号随包注入，而不是写死进源码：exe 的 --version / doctor / MCP initialize
+    # 都读包里这个 version.txt，所以同一个源码基线可以打出任意版本号，
+    # 打包多少次都不会在 git 里留下 version diff。
+    # 文件放 work/ 而不是 staging/：staging 在产物搬走后会被回收，留个文件会挡住 rmdir。
+    version_file = work / "version.txt"
+    version_file.write_text(version.strip() + "\n", encoding="utf-8")
+
     cmd = [
         sys.executable,
         "-m",
@@ -332,6 +388,10 @@ def run_pyinstaller(version: str, target: Path) -> None:
         f"{PKG / 'schema.sql'}{os.pathsep}humanity_memory",
         "--add-data",
         f"{PKG / 'memory.default.toml'}{os.pathsep}humanity_memory",
+        # 注入的版本号：落到 _internal/humanity_memory/version.txt，
+        # 由 __init__._packaged_version() 读取（源码态没有这个文件，回落到基线）
+        "--add-data",
+        f"{version_file}{os.pathsep}humanity_memory",
         "--collect-all",
         "sqlite_vec",
         # cli 里的 upgrade / starmap 都是延迟 import（未调用时零开销），
@@ -678,9 +738,15 @@ def ensure_env() -> None:
 
 
 def cmd_publish(args: argparse.Namespace) -> int:
-    version = args.target or project_version()
+    base = project_version()
+    version = args.target or next_local_version(base)
     target = version_dir(version)
     say(f"发布 v{version} → {rel(target)}")
+    if args.target:
+        if version != base:
+            say(f"  版本号来自 --target：源码基线仍是 v{base}，不修改任何源码文件")
+    else:
+        say(f"  本地构建号（源码基线 v{base}，序号存在 {rel(LOCAL_STATE)}，不进 git）")
 
     if target.exists() and not args.force:
         die(
@@ -855,12 +921,110 @@ def cmd_rollback(args: argparse.Namespace) -> int:
     return 0
 
 
+def human_size(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}GB"
+
+
+def tree_size(path: Path) -> int:
+    total = 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def cmd_prune(args: argparse.Namespace) -> int:
+    """清理旧版本目录与对应库快照。
+
+    保留口径：最近 `--keep` 个（按 mtime）+ 永远保留 current。写不进去/被占用的
+    目录只 warn 跳过，绝不因为一个目录删不掉就中断整场清理。
+    """
+    keep = max(1, args.keep)
+    built = built_versions()          # 按 mtime 升序
+    if not built:
+        say("release/ 下没有版本目录，没得清理")
+        return 0
+
+    cur = current_dir()
+    keep_dirs = set(built[-keep:])
+    if cur is not None and cur in built:
+        keep_dirs.add(cur)
+    victims = [p for p in built if p not in keep_dirs]
+    if not victims:
+        say(f"没有可清理的版本：共 {len(built)} 个，保留 {keep} 个 + current")
+        return 0
+
+    freed = sum(tree_size(p) for p in victims)
+    say(f"保留：{', '.join(p.name for p in built if p in keep_dirs)}")
+    say(f"清理：{len(victims)} 个版本，约 {human_size(freed)}")
+    for p in victims:
+        say(f"    {p.name}  {human_size(tree_size(p))}")
+    if not confirm("  确认删除这些版本目录（连同对应的库快照）？", args.yes):
+        say("  已取消")
+        return 0
+
+    removed: list[Path] = []
+    actual_freed = 0
+    for p in victims:
+        size = tree_size(p)
+        try:
+            shutil.rmtree(p)
+        except OSError as exc:
+            warn(f"  跳过 {p.name}：{exc}（可能还有进程在用这个 exe）")
+            continue
+        removed.append(p)
+        actual_freed += size
+        say(f"  已删除 {p.name}")
+
+    if not removed:
+        warn("  一个都没删掉——先退出 MCP 客户端再试")
+        return 1
+
+    # history 必须跟着删：留着指向不存在目录的条目，--rollback 会直接 die 在目标解析上
+    gone = {p.name for p in removed}
+    hist = load_history()
+    kept_versions = [v for v in hist.get("versions", []) if v.get("dir") not in gone]
+    if len(kept_versions) != len(hist.get("versions", [])):
+        hist["versions"] = kept_versions
+        write_json(HISTORY, hist)
+
+    for p in removed:
+        snapshot = BACKUPS / f"workspace.pre-{p.name}.db"
+        if not snapshot.is_file():
+            continue
+        try:
+            snapshot.unlink()
+            say(f"  已删除快照 {snapshot.name}")
+        except OSError as exc:
+            warn(f"  快照 {snapshot.name} 删除失败：{exc}")
+
+    say(f"\n清理完成：释放约 {human_size(actual_freed)}。**current 未动**，不需要重启客户端。")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     version = project_version()
+    state = local_state()
     cur = current_dir()
     hist = load_history()
-    say(f"pyproject 版本 : {version}")
-    say(f"current        : {cur.name if cur else '（未发布，生产跑源码态）'}")
+    say(f"源码基线版本 : {version}（大版本，跟 git 走；只在源码大版本变化时改）")
+    say(f"本地构建号   : {state.get('version') or '（还没本地打包过）'}")
+    built_info = read_json(cur / "build.json", {}) if cur else {}
+    current_label = cur.name if cur else "（未发布，生产跑源码态）"
+    if cur and built_info.get("version"):
+        current_label = f"{cur.name}（构建版本 {built_info['version']}）"
+    say(f"current      : {current_label}")
+    pkg_base = package_base_version()
+    if pkg_base and pkg_base != version:
+        warn(f"版本基线不一致：pyproject={version} / __init__._BASE_VERSION={pkg_base}，请先对齐")
     say(f"junction 存在  : {CURRENT_LINK.exists()}")
     say(f"release/.env   : {'有' if ENV_DEST.is_file() else '无'}")
     built = built_versions()
@@ -917,9 +1081,19 @@ def build_parser() -> argparse.ArgumentParser:
     action.add_argument("--publish", action="store_true", help="备份库 → 打包 → smoke（首次只产出不切换）")
     action.add_argument("--promote", action="store_true", help="把 current 切到指定/最新构建版本")
     action.add_argument("--rollback", action="store_true", help="回上一版（exe + 库快照）")
+    action.add_argument(
+        "--prune",
+        action="store_true",
+        help="清理旧版本目录与对应库快照（保留最近 --keep 个 + current）",
+    )
     action.add_argument("--status", action="store_true", help="查看当前版本、历史、备份、客户端配置")
-    parser.add_argument("--target", metavar="VER", help="指定版本号（默认取 pyproject.toml）")
+    parser.add_argument(
+        "--target",
+        metavar="VER",
+        help="显式指定版本号（默认自动生成 <pyproject基线>-local.N，不改源码）",
+    )
     parser.add_argument("--force", action="store_true", help="覆盖同版本目录（需先停客户端）")
+    parser.add_argument("--keep", type=int, default=3, metavar="N", help="--prune 保留的版本数（默认 3；current 永远保留）")
     parser.add_argument("--no-switch", action="store_true", help="只打包，不切 current")
     parser.add_argument("--keep-db", action="store_true", help="回滚时不还原库快照，只退 exe")
     parser.add_argument("--yes", action="store_true", help="跳过所有交互确认")
@@ -960,6 +1134,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_promote(args)
         if args.rollback:
             return cmd_rollback(args)
+        if args.prune:
+            return cmd_prune(args)
         return cmd_status(args)
     except KeyboardInterrupt:
         say("\n已中断")

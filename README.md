@@ -6,7 +6,7 @@
 
 | 项 | 现状 |
 | --- | --- |
-| 版本 | `0.5.3`（库 schema `v4`） |
+| 版本 | `2.0`（库 schema `v5`；本地构建号形如 `2.0-local.N`，不跟 git） |
 | 运行环境 | Python ≥ 3.10；运行时依赖只有 `sqlite-vec` / `mcp` / `httpx`（3.10 另加 `tomli`） |
 | 记忆类型 | 经验 `experience` / 经历 `episode` / 日志 `log`，外加一层不进库的信条 |
 | 对外形态 | 29 个 MCP 工具 + 21 个 CLI 子命令 + 1 个 Skill |
@@ -364,7 +364,11 @@ consolidate_apply(experience=[...], episodes=[...], purge=true)
 活跃度只由「真实使用」累加：`memory_recall` 给命中项加，`memory_search` 刻意不加。
 如果日常能随手 search，这些检索就不计入活跃度，遗忘曲线随之失真。
 
-所以 `memory_search` 只在复盘时开放，判据全是**代码能核验的事实**：
+log 是例外：它没有 `activity` 字段，只把「被哪些查询命中过」记进 `retrievals`。
+复盘时工具从这些条件重放算出新条目的起始活跃度；来源映射与继承值也都由工具算，
+模型只负责提炼内容。
+
+所以 `memory_search` 只在复盘时开放。判据全是**代码能核验的事实**，不看模型自觉：
 
 | 途径 | 条件 |
 | --- | --- |
@@ -494,13 +498,56 @@ type_weight: experience 1.00 / episode 0.96 / log 0.90
 
 ## 只读视图
 
-数据库是唯一事实源。下面三样都是**只读派生**，不写库、不进记忆：
+数据库是唯一事实源。下面这些产物都是**只读派生**，不写库、不进记忆：
 
 | 产物 | 命令 | 内容 |
 | --- | --- | --- |
 | Markdown 导出 | `export --out <目录>` | `知识现状.md`、`经历/YYYY-MM-DD-<摘要>.md`、`日志/YYYY-MM-DD.md` |
 | 星图 | `starmap <目录> --out <HTML>` | 单文件 HTML，节点 = 条目，边 = 语义相似，辉光 = 活跃度 |
 | 检索报告 | `retrieval-report` | 单文件 HTML，含阈值诊断，调参看这个 |
+| **记忆观测台** | `analyze [目录] [--port 8765]` | 本地 HTTP 后端 + 浏览器前端，五个视图合一，右上角下拉切库（见下） |
+
+`starmap` / `retrieval-report` 是 CLI 产物；日常看库走观测台即可 —— 它内嵌的是同一套渲染逻辑，
+不用先生成 HTML 文件。原来的 `starmap.bat` / `report.bat` 两个入口已删除（2026-11-25）。
+
+### 记忆观测台（analyze）
+
+一个把只读视图整合起来的 Web 工具：起一个只监听 `127.0.0.1` 的本地后端，浏览器打开
+`http://127.0.0.1:8765` 即可。双击 `analyze.bat`（**不用拖任何东西**）或把库目录拖上去都能启动。
+
+```
+humanity-memory analyze                            # 列出 registry 里所有库，右上角下拉切换
+humanity-memory analyze "D:/.../libraries/lilith"   # 直接看某个库目录
+humanity-memory analyze "<项目根>"                   # 按 .ai_memory/token.json 解析库
+humanity-memory analyze workspace.db --port 9999     # 换端口
+```
+
+不给 target 时**不需要 token**：清单来自 `~/.humanity-memory/registry.json`（已登记的库），
+registry 缺失时兜底扫 `<安装根>/libraries/*`；页面右上角的「观测库」下拉即切，
+选择记在浏览器本地，重新打开还是上次那个库。给了 target 也只是清单里的额外一条，随时能切走。
+盘没挂上的库会标成「不可用」并禁用，不会从列表里消失。
+
+五个 tab：
+
+| 视图 | 内容 |
+| --- | --- |
+| 星图 | 力导向图，节点 = 条目，边 = 语义相似，辉光 = 活跃度 |
+| recall 历史 | 检索记录 + 热度榜 + 阈值诊断 |
+| 复盘记录 | 按天：遗忘等级变动、活跃度较前一天 diff、新增/顶替/合并明细、md 原文 |
+| 记忆现状 | 当前活跃度 / 遗忘等级 / 距下次裁定倒计时（实时） |
+| 检索测试 | 手输查询跑一次检索，展示分数与**模拟**活跃度增量 |
+
+三个列表页（recall 历史 / 复盘记录 / 检索测试）里的记忆 id **悬停即弹出正文**：检索测试的结果
+自带正文；历史页只有 id，正文由页面按需从 `/api/item` 只读反查并缓存。`retrieval-report` 的
+单文件 HTML 没有后端可查，生成时就把正文内联进去，离线也能悬停。
+
+**全程只读**：`analyze` 不写库、不改活跃度、不写检索日志。特别是「检索测试」——
+它走 `search()`（纯只读）而非 `recall()`，模拟增量只是算出来展示，绝不落库；
+也不会像深度回忆那样复活遗忘层。前端每 4 秒轮询数据源签名，库或报告一变就增量重拉对应视图。
+
+> 观测台是新代码，旧发布版 exe 里没有。`analyze.bat` 默认走源码 `.venv`；
+> 只有重新 `build_release --publish` 之后，才可设 `HM_ANALYZE_USE_PUBLISHED=1` 走发布版。
+> Windows 下可直接用 `python -m humanity_memory.cli analyze [目录]` 免装 exe。
 
 `export` 的 `--out` 必填，没有默认落点：一旦允许自动推导目录，就等于给了它一条
 「悄悄往项目记忆目录写文件」的路径，手写笔记与渲染产物会混在同一层。
@@ -558,10 +605,30 @@ python tools/build_release.py --status      # 当前版本、历史、备份、m
 python tools/build_release.py --publish     # 备份库 → 打包 → smoke
 python tools/build_release.py --promote     # 把 current 切到最新构建版本
 python tools/build_release.py --rollback    # 回上一版（exe + 库快照）
+python tools/build_release.py --prune --keep 2   # 清理旧版本，保留最近 2 个 + current
 ```
 
-`starmap.bat` / `report.bat` / `upgrade.bat` 优先调用**发布版**，只有发布版不存在时才退回 `.venv`，
-所以改完源码这三个 bat 不会自动跟着变 —— 要么先 `--publish`，要么删掉发布根让它退回源码态。
+**版本号分两层，打包不再改源码**：
+
+| 层 | 写在哪 | 谁改 | 进 git 吗 |
+| --- | --- | --- | --- |
+| 大版本（基线） | `pyproject.toml` 的 `version` 与 `__init__.py` 的 `_BASE_VERSION` | 只在源码大版本变化时手改 | 是 |
+| 本地构建序号 | `<发布根>/local_build.json` | `--publish` 每次自动 +1 | 否（发布根在项目树外） |
+
+所以日常微调直接 `--publish`，产物版本是 `2.0-local.3` 这种形式，`--version` / `doctor` /
+MCP initialize 报的都是它；源码一个字节都不动，工作区不会冒出「版本号没提交」的脏文件。
+版本号是打包时随包写进 `version.txt` 的（`__init__._packaged_version()` 读它，源码态读不到就回落基线）。
+
+基线变了（比如改成 `2.0`），序号自动从 `local.1` 重新数。要打一个不带本地后缀的纯净版本号
+（正式发版），显式指定：`--publish --target 2.0`。同版本重复构建用 `--force`，
+旧目录会被改名留档成 `v<版本>.stale-<时间戳>`。
+
+滚动发布**不会覆盖**旧目录，每个版本约 50MB（onedir 打包带了 Python 运行时和 sqlite-vec）。
+攒多了用 `--prune --keep N` 收拾：保留最近 N 个 + `current`，同时把对应条目从 `history.json`
+摘掉、配套库快照一起删；被进程占用的目录只 warn 跳过，不会因为一个删不掉就中途失败。
+
+`analyze.bat` / `upgrade.bat` 优先调用**发布版**，只有发布版不存在时才退回 `.venv`，
+所以改完源码这两个 bat 不会自动跟着变 —— 要么先 `--publish`，要么删掉发布根让它退回源码态。
 bat 第二行会打印 `Using: published (...)` 或 `source (...)`。
 
 `dev.bat` 把工作区钉在隔离目录（`local.env` 里的 `HM_DEV_ROOT`），保证源码态碰不到生产库。
@@ -579,6 +646,7 @@ bat 第二行会打印 `Using: published (...)` 或 `source (...)`。
 
 - `docs/two-tier-memory.md` — 两类记忆、等级阶梯、打分与闸门的取舍
 - `docs/workspace-binding-and-token.md` — 工作区绑定、令牌与 registry 的准入语义
+- `docs/external-visualization-tool.md` — 记忆观测台（HTTP 后端 + Web 前端）的设计与只读口径
 
 ## 许可
 

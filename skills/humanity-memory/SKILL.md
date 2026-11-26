@@ -311,12 +311,13 @@ memory_use_workspace(path="D:/proj/YourProject")
 2. cwd 向上查找**含 `token.json` 的** `.ai_memory`
 3. 都没有 → **拒绝**（`no_workspace` / `no_token` + 清单），不建目录、不建库
 
-不接入时（未接入 / 已拒绝），记忆工具**不注册**，只剩
-`memory_bind_status` / `memory_bind_new` / `memory_bind_existing` /
-`memory_bind_adopt` / `memory_bind_decline` / `memory_use_workspace`。
-客户端里表现就是**工具列表只剩这 6 个** —— 正常形态，不是装坏了：
+不接入时（未接入 / 已拒绝），**工具仍全部可见、不会被隐藏**（2026-11-24 起
+不再裁剪工具面）：读写调用一律返回拒绝结果（`ok:false` + `code` + `checklist`），
+正常形态，不是装坏了。`memory_bind_status` / `memory_bind_new` /
+`memory_bind_existing` / `memory_bind_adopt` / `memory_bind_decline` /
+`memory_use_workspace` 不在拒绝范围内，未接入时照常可用：
 先 `memory_bind_status` 看 `code`，`no_workspace` 就
-`memory_use_workspace(path="<项目根>")` 一步恢复（同一进程内挂满工具）。
+`memory_use_workspace(path="<项目根>")` 一步恢复（同一进程内读写立刻放行）。
 这时**先问用户**要哪种接入，再调对应工具——不要自己选，也不要在拒绝态下尝试写入。
 
 ## 存储布局

@@ -121,6 +121,8 @@ activity += 单次贡献
 > 清零制只需 `activity: float` + `period_start: int` 两个字段，一条 `UPDATE` 完成，  
 > 且天然实现"每个周期独立评估"，不存在历史惰性。
 
+**日志层不在此列。** log 没有 `activity` / `forget_level`（见 §8 表结构），它把每次 recall 命中的查询条件记在 `retrievals`（`[{q,n,sim,heat,at}]`）里。复盘时工具从这些条件派生 `I_num`（heat 累加封顶）并重放算 `I_replay`（新条目接不接得住当时的查询），取大作为新条目的 activity 初值。`heat` 是历史热度的落点而非独立字段；log 全程不进 judge / 压缩 / 等级体系。
+
 ### 2.2 可信度 · AI 定初值，工具按证据调分
 
 **取值范围** 0~1。两条腿，分开记：
@@ -771,7 +773,7 @@ timeout                = 30
 日志住 `logs` 表——「一张表一类」本来就是 v4 的样子，`kind` 列只是历史标签（见 7.2）。
 所以 8 个存量库一个字节都不用动，也没有 v5。
 
-### 7.1 字段（v4 已全部落地，无新增）
+### 7.1 字段（v4 已全部落地；v5 另补 `log.retrievals`）
 
 | 表           | 字段                 | 类型                | 用途                     |
 | ----------- | ------------------ | ----------------- | ---------------------- |
@@ -787,6 +789,7 @@ timeout                = 30
 | `episodes`  | `revive_hits`      | INTEGER DEFAULT 0 | 0 级复活计数                |
 | `episodes`  | `level0_since`     | INTEGER（可空）       | 同 `knowledge`          |
 | `episodes`  | `confidence`       | —                 | **派生，不存**              |
+| `logs`      | `retrievals`       | TEXT DEFAULT '[]' | 被 recall 命中的检索条件流水，复盘时派生继承值（**v5 新增；log 没有 activity 列**） |
 
 **`level0_since` 为什么是独立字段**：`level0_purge_days` 要判的是"在 0 级**停留**了多久"，
 而 0 级本身不参与周期裁定，`period_start` 会停在降级那一刻——能算出结果，但那是**隐式约定**，
@@ -849,7 +852,7 @@ v4 的写入路径本来就是按 kind 给初值的，存量数据已经天然�
 
 **所以的迁移动作是零**：
 
-- 不建 v5、不升 `schema_version`（仍是 4）
+- ~~不建 v5、不升 `schema_version`（仍是 4）~~ → **此结论已被 v5 取代**：v5 新增 `logs.retrievals`，见 `docs/log-activity.md`
 - 不搬向量、不重建 FTS
 - 不改写任何一行的 `kind`（它就是历史线索，`state` / `case` 读出来即经验 / 经历）
 - 不删任何存量条目，全部走新机制自然淘汰
@@ -1702,7 +1705,7 @@ def resource(name: str) -> Path:
   - 做什么：只读 `meta.schema_version` 比对，不符则报错退出并打印升级命令
   - 怎么验：`grep -rn retire_legacy_db src/` 无结果；打开 v2 库 → 报错退出，且 `ls` 确认**文件没被改名**
   - **实测**：`retire_legacy_db` / `_is_legacy_db` / `_COLUMN_MIGRATIONS` / `_ensure_column` 全部删除，`grep` 无残留；
-    新增 `probe_schema_version(path)` 用 `mode=ro` 只读探测，返回 `absent / empty / v2 / v3 / v4 / unknown`。
+    新增 `probe_schema_version(path)` 用 `mode=ro` 只读探测，返回 `absent / empty / v2 / v3 / v4 / v5 / unknown`。
     单测断言：打开 v3 库抛 `SchemaVersionError`，且 **size 与 mtime 都未变、目录里没多出任何文件**；
     对 `facts` 表老库报 v2、对非 SQLite 文件报 unknown、空文件报 empty
   - **顺手修掉一个隐藏的写操作**：`open_db` 原先每次都对 `meta` 无脑 UPSERT（`embedding_dim` / `model` / `vec_source`），

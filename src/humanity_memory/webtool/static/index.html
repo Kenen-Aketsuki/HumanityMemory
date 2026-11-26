@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>记忆观测台 · HumanityMemory</title>
+<style>
+:root{
+  --bg:#0b0f16; --panel:#121821; --line:#1f2937; --hover:#17202d;
+  --text:#d6e2f0; --muted:#7d8ea3; --dim:#54637a;
+  --exp:#6fb6ff; --epi:#b9a5ff; --log:#8898ad;
+  --up:#5fd6a0; --warn:#ffc46b; --bad:#f08a8a; --ok:#5fd6a0;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:13px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;}
+header{display:flex;align-items:center;gap:14px;padding:10px 18px;border-bottom:1px solid var(--line)}
+h1{font-size:15px;font-weight:500;margin:0}
+.sub{color:var(--muted);font-size:12px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--ok);display:inline-block;margin-right:5px}
+/* 右上角观测库下拉：库清单来自 registry，切库不改启动参数 */
+.picker{margin-left:auto;display:flex;align-items:center;gap:8px}
+.picker select{min-width:150px;max-width:280px}
+nav{display:flex;gap:2px;padding:0 12px;border-bottom:1px solid var(--line);background:var(--bg);
+  position:sticky;top:0;z-index:5}
+nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);
+  padding:9px 15px;font:13px/1.4 inherit;cursor:pointer}
+nav button:hover{color:var(--text)}
+nav button.on{color:var(--text);border-bottom-color:var(--exp)}
+main{padding:16px 18px;min-height:calc(100vh - 100px)}
+.view{display:none}
+.view.on{display:block}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin-bottom:14px}
+.row{display:flex;gap:18px;flex-wrap:wrap}
+.kv{color:var(--muted);font-size:12px}
+.kv b{color:var(--text);font-weight:500}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{color:var(--muted);font-weight:500;text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);
+  position:sticky;top:0;background:var(--panel)}
+td{padding:7px 9px;border-bottom:1px solid #161d27;vertical-align:top}
+/* 条目行悬浮高亮：行多时视线要能锁定当前行（复盘/记忆现状/检索测试的表格共用） */
+tbody tr:hover td{background:var(--hover)}
+th[data-s]:hover{color:var(--text)}
+.id{font-family:ui-monospace,Consolas,monospace;color:var(--muted);font-size:11px}
+/* 悬停记忆 ID 看正文：虚线底标 + help 光标，提示这一列可以悬停（浮层不挡点击） */
+.id.hittip{cursor:help;text-decoration:underline dotted rgba(214,226,240,.28);text-underline-offset:2px}
+.empty{padding:36px 16px;color:var(--dim);text-align:center}
+/* 侧栏可点列表项（复盘记录左侧时间轴 / recall 记录列表）的选中态 */
+.item{cursor:pointer}
+.item:hover{background:var(--hover)}
+.item.on{background:var(--hover);box-shadow:inset 3px 0 0 var(--exp);color:var(--text)}
+.item.on .kv{color:var(--text)}
+.note{color:var(--warn);font-size:12px}
+.k{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:6px;vertical-align:1px}
+.up{color:var(--up)} .down{color:var(--bad)} .warn{color:var(--warn)}
+input,select,button.act{background:#151d28;border:1px solid var(--line);border-radius:6px;
+  color:var(--text);font:12px/1.5 inherit;padding:5px 9px;outline:none}
+input:focus,select:focus{border-color:var(--exp)}
+button.act{cursor:pointer}
+button.act:hover{border-color:var(--exp)}
+button.act:disabled{opacity:.5;cursor:default}
+footer{position:fixed;bottom:0;left:0;right:0;padding:5px 18px;background:var(--bg);
+  border-top:1px solid var(--line);color:var(--dim);font-size:11px;display:flex;justify-content:space-between}
+.scroll{max-height:calc(100vh - 210px);overflow:auto}
+/* 星图 / 检索：嵌入老工具的完整渲染页，占满主区域。
+   main 有 16px padding，负边距让 iframe 铺到边，视觉上跟老工具一致。 */
+iframe.embed{width:100%;height:calc(100vh - 108px);border:0;background:#070b14;
+  border-radius:8px;display:block}
+</style>
+</head>
+<body>
+<header>
+  <h1>🐋 记忆观测台</h1>
+  <span class="sub"><span class="dot" id="dot"></span><span id="meta">连接中…</span></span>
+  <label class="picker" title="切换当前观测的记忆库（清单来自 registry）">
+    <span class="kv">观测库</span>
+    <select id="lib"><option value="">加载中…</option></select>
+  </label>
+</header>
+<nav id="nav">
+  <button data-v="starmap" class="on">星图</button>
+  <button data-v="recall">recall 历史</button>
+  <button data-v="review">复盘记录</button>
+  <button data-v="memory">记忆现状</button>
+  <button data-v="search">检索测试</button>
+</nav>
+<main>
+  <section class="view on" id="v-starmap"><iframe class="embed" id="f-starmap" title="星图"></iframe></section>
+  <section class="view" id="v-recall"><iframe class="embed" id="f-recall" title="检索分析"></iframe></section>
+  <section class="view" id="v-review"><div class="empty">复盘记录接入中…</div></section>
+  <section class="view" id="v-memory"><div class="empty">记忆现状接入中…</div></section>
+  <section class="view" id="v-search"><div class="empty">检索测试接入中…</div></section>
+</main>
+<footer>
+  <span id="status">就绪</span>
+  <span id="refresh">最后刷新：—</span>
+</footer>
+<script>
+const SIG={starmap:'',recall:'',review:'',memory:''};
+const VIEW_LABEL={starmap:'星图',recall:'recall历史',review:'复盘记录',memory:'记忆现状',search:'检索测试'};
+let cur='starmap', metaLoaded=false;
+
+async function api(path,opts){
+  // 超时兜底：后端偶发卡住（首次加载模型等）时也要让调用方拿到错误、复位按钮，
+  // 否则界面会永久停在"检索中…"。AbortController 能真正中止请求。
+  const ctl=(typeof AbortController!=='undefined')?new AbortController():null;
+  const timer=ctl?setTimeout(()=>ctl.abort(),25000):null;
+  try{
+    const r=await fetch(path,ctl?Object.assign({},opts||{},{signal:ctl.signal}):opts);
+    let d; try{d=await r.json();}catch(e){throw new Error('HTTP '+r.status);}
+    if(d&&d.ok===false&&d.code!=='not_ready') throw new Error(d.message||d.code);
+    return d;
+  }catch(e){
+    if(e&&e.name==='AbortError') throw new Error('请求超时（25s），后端可能正在加载模型，请重试');
+    throw e;
+  }finally{ if(timer)clearTimeout(timer); }
+}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function fmtTime(ms){const d=new Date(ms);const p=n=>String(n).padStart(2,'0');
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());}
+
+// tab 切换
+document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('#nav button').forEach(x=>x.classList.remove('on'));
+  document.querySelectorAll('.view').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on'); cur=b.dataset.v;
+  document.getElementById('v-'+cur).classList.add('on');
+  refreshView(cur,true);
+});
+
+// 会话信息
+async function loadMeta(){
+  try{
+    const d=await api('/api/session');
+    document.getElementById('meta').textContent=
+      (d.library||String(d.db).split(/[\\/]/).pop())+' · schema v'+d.schema_version+' · '+d.node_count+' 条记忆';
+    document.getElementById('dot').style.background='var(--ok)';
+    metaLoaded=true;
+  }catch(e){
+    document.getElementById('meta').textContent='连接失败：'+e.message;
+    document.getElementById('dot').style.background='var(--bad)';
+  }
+}
+
+// ---- 观测库：清单来自 /api/libraries（registry 登记 + libraries 目录兜底） ----
+// 切库是运行时状态，不重启进程；换完把签名基线重来一遍，否则 poll 会拿旧库的签名比对。
+const LIB_KEY='hm.obs.lib';
+function libSelect(){return document.getElementById('lib');}
+function rememberLib(label){ try{localStorage.setItem(LIB_KEY,label);}catch(e){} }
+
+async function loadLibs(){
+  const d=await api('/api/libraries');
+  const list=d.libraries||[], sel=libSelect();
+  sel.innerHTML=list.length
+    ? list.map(l=>'<option value="'+esc(l.label)+'"'+(l.ok?'':' disabled')+'>'+
+        esc(l.label)+(l.ok?'':'（不可用）')+'</option>').join('')
+    : '<option value="">（没有可观测的库）</option>';
+  CURRENT=d.current||'';
+  if(CURRENT) sel.value=CURRENT;
+  if((d.warnings||[]).length) document.getElementById('status').textContent=d.warnings.join('；');
+  return d;
+}
+async function resyncSig(){
+  const s=await api('/api/status').catch(()=>null);
+  if(s){for(const k of ['starmap','recall','review','memory'])SIG[k]=s[k];}
+}
+async function switchLib(label){
+  const d=await api('/api/library',{
+    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label})});
+  CURRENT=d.current||label;
+  libSelect().value=CURRENT;
+  rememberLib(CURRENT);
+  await loadMeta();
+  await resyncSig();
+  return d;
+}
+libSelect().onchange=async ev=>{
+  const sel=ev.target, want=sel.value, prev=CURRENT;
+  if(!want||want===CURRENT) return;
+  sel.disabled=true;
+  document.getElementById('status').textContent='正在切换到 '+want+'…';
+  try{
+    await switchLib(want);
+    document.getElementById('status').textContent='已切换到 '+CURRENT;
+    refreshView(cur,true); // 当前视图整页重载（iframe 里的老工具也会重新取数）
+  }catch(e){
+    // 失败保持原库：后端 switch 也是先构造新源再赋值，不会留下半个状态
+    document.getElementById('status').textContent='切换失败：'+e.message;
+    sel.value=prev;
+  }finally{ sel.disabled=false; }
+};
+
+// 视图刷新分发：星图 / recall 由 iframe 内的老工具页自取数；其余走 views.js
+const EMBED_SRC={starmap:'/starmap.html',recall:'/recall.html'};
+function loadEmbed(name,force){
+  const f=document.getElementById('f-'+name); if(!f)return;
+  // 懒加载：首次显示才设 src；force（签名变化/切 tab/换库）时重载以取最新数据
+  if(!f.src || force){ f.src=EMBED_SRC[name]+(force?'?t='+Date.now():''); }
+}
+async function refreshView(name,force){
+  // 检索测试是手动发起：poll 的循环里不含 search，已经保证不自动刷。
+  // 这里绝不能提前 return —— 否则切到该 tab 时表单永远不会初始化，看起来像卡在"接入中"。
+  if(EMBED_SRC[name]){ loadEmbed(name,force); return; }
+  if(typeof window['render_'+name]!=='function') return;
+  try{ await window['render_'+name](force); }
+  catch(e){ document.getElementById('v-'+name).innerHTML=
+    '<div class="card note">加载失败：'+esc(e.message)+'</div>'; }
+}
+
+// 轮询签名：谁变只重拉谁（首屏没就位前不刷，避免与 boot 抢同一次加载）
+async function poll(){
+  if(!ready) return;
+  try{
+    const s=await api('/api/status');
+    for(const k of ['starmap','recall','review','memory']){
+      if(SIG[k]!==s[k]){ SIG[k]=s[k]; if(cur===k) refreshView(k,true); }
+    }
+    document.getElementById('refresh').textContent='最后刷新：'+fmtTime(s.now);
+    document.getElementById('dot').style.background='var(--ok)';
+  }catch(e){
+    document.getElementById('dot').style.background='var(--bad)';
+    document.getElementById('status').textContent='轮询失败：'+e.message;
+  }
+}
+
+// 首屏：先拿库清单，再按「URL ?lib= > 上次选择 > 服务端默认」定当前库
+(async function boot(){
+  try{ await loadLibs(); }
+  catch(e){ document.getElementById('status').textContent='库清单加载失败：'+e.message; }
+  let want=null;
+  try{ want=new URLSearchParams(location.search).get('lib'); }catch(e){}
+  if(!want){ try{ want=localStorage.getItem(LIB_KEY); }catch(e){} }
+  if(want && want!==CURRENT){
+    try{ await switchLib(want); }
+    catch(e){ // 上次选的库可能已被 revoke / 盘没挂上：退回服务端默认，别卡住首屏
+      document.getElementById('status').textContent='切到 '+want+' 失败：'+e.message+'（已用 '+(CURRENT||'默认库')+'）';
+      await loadMeta(); await resyncSig();
+    }
+  }else{
+    await loadMeta(); await resyncSig();
+  }
+  ready=true;
+  refreshView(cur,true); // 首屏渲染（views.js 已在上方同步加载完）
+})();
+setInterval(poll,4000);
+
+</script>
+<script src="views.js"></script>
+</body>
+</html>

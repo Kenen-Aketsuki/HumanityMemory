@@ -36,10 +36,17 @@ def render_retrieval_html(
     records: Sequence[dict[str, Any]],
     *,
     meta: dict[str, Any] | None = None,
+    contents: dict[str, str] | None = None,
 ) -> str:
+    """``contents`` = {条目 id: 正文}，用于「悬停记忆 ID 弹出内容」。
+
+    单文件报告是离线产物，没有后端可供懒加载，所以正文只能在生成时内联；
+    HTTP 观测台不传它（页面会改走 /api/item 现查，避免把整库正文塞进响应）。
+    """
     data = {
         "records": list(records),
         "meta": meta or {},
+        "contents": contents or {},
     }
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return _TEMPLATE.replace("/*__DATA__*/", "const DATA = " + _escape(payload) + ";")
@@ -94,6 +101,9 @@ h2{font-size:12px;font-weight:500;color:var(--muted);margin:0;padding:10px 14px 
 .q{color:var(--text);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .t{color:var(--dim);font-size:11px;margin-top:3px;display:flex;gap:8px}
 .tag{color:var(--warn)}
+.mode-strict{color:var(--up)}      /* 严格阈值命中 */
+.mode-fallback{color:var(--warn)}  /* 宽泛层兜底：只是沾边，精度低 */
+.mode-unknown{color:var(--dim)}    /* 旧格式记录，未记 mode */
 .row{padding:10px 16px}
 pre.q{white-space:pre-wrap;word-break:break-word;background:var(--panel);border:1px solid var(--line);
   border-radius:8px;padding:10px 12px;margin:0 0 10px;font:13px/1.5 inherit;color:#e7f0fb}
@@ -107,6 +117,8 @@ td{padding:7px 8px;border-bottom:1px solid #161d27;vertical-align:top}
 tr.hit td{background:#172737}
 tr.hit td:first-child{box-shadow:inset 2px 0 var(--warn)}
 tr.hit .id{color:var(--text)}
+/* 条目行悬浮高亮（与观测台各视图一致）；.hit 行保留自己的选中高亮，不被 hover 覆盖 */
+tbody tr:not(.hit):hover td{background:var(--panel)}
 .k{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:6px;vertical-align:1px}
 .id{font-family:ui-monospace,Consolas,monospace;color:var(--dim);font-size:11px}
 .bar{position:relative;height:14px;background:#151d28;border-radius:3px;min-width:70px}
@@ -139,6 +151,14 @@ h2.split{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .note.warn{color:#e8c98a} .note.bad{color:#e6a3a3} .note.ok{color:#9fdcc0}
 .note.mute{color:var(--dim)}
 .empty{padding:16px;color:var(--dim);font-size:12px}
+/* 悬停记忆 ID 的正文浮层（与观测台「检索测试」同款交互）：
+   虚线底标提示可悬停，浮层本身 pointer-events:none，不挡点击与选中。 */
+.id[data-memid]{cursor:help;text-decoration:underline dotted rgba(214,226,240,.28);
+  text-underline-offset:2px}
+#memtip{position:fixed;z-index:999;display:none;max-width:460px;max-height:300px;overflow:auto;
+  background:rgba(13,20,34,.97);border:1px solid var(--line);border-radius:8px;padding:10px 12px;
+  font:12px/1.6 inherit;color:var(--text);white-space:pre-wrap;word-break:break-word;
+  box-shadow:0 6px 18px rgba(0,0,0,.55);pointer-events:none;}
 </style>
 </head>
 <body>
@@ -259,6 +279,14 @@ function shown(){
   recs.forEach((r,i)=>{if(matchRec(r))out.push({r,i});});
   return out;
 }
+/* 检索模式标签：strict=严格阈值命中；fallback=宽泛层兜底（精度低）；
+   旧记录没有 mode 字段，显示"未记录"而不是瞎猜。 */
+function modeTag(r){
+  const m=r.mode;
+  if(m==='strict')   return '<span class="mode-strict" title="严格阈值命中">严格</span>';
+  if(m==='fallback') return '<span class="mode-fallback" title="严格层没捞到，宽泛层兜底召回，精度较低">宽松兜底</span>';
+  return '<span class="mode-unknown" title="旧格式记录，未记录检索模式">模式未记录</span>';
+}
 function list(sel){
   const el=document.getElementById('list');
   const rows=shown();
@@ -280,6 +308,7 @@ function list(sel){
       '<div class="q">'+esc(x.r.query||'（空查询）')+'</div>'+
       '<div class="t"><span>'+ts(x.r.at)+'</span><span>'+
       (x.r.hit_count||(x.r.hits||[]).length)+' 命中</span>'+
+      modeTag(x.r)+
       (x.r.deep?'<span class="tag">深度</span>':'')+'</div>'+
     '</div>').join('');
   el.querySelectorAll('.item').forEach(node=>{
@@ -316,8 +345,77 @@ function bindQid(){
   });
 }
 
+/* ---------------- 悬停记忆 ID 显示正文 ----------------
+   检索记录只存 id 与打分，正文要回库现查。两级来源：
+     1. DATA.contents —— CLI 单文件报告在生成时内联（离线可看）；
+     2. /api/item?id=… —— HTTP 观测台现查（不在响应里塞整库正文）。
+   两者都没有（离线又被裁掉）时不弹错误，静默即可。 */
+const CONTENTS=DATA.contents||{};
+const memCache=new Map(), memPending=new Set();
+let tipEl=null, tipHover=null;
+
+function showTip(ev,text){
+  if(!tipEl){
+    tipEl=document.createElement('div');
+    tipEl.id='memtip';
+    document.body.appendChild(tipEl);
+  }
+  tipEl.textContent=text||'（无内容）';
+  tipEl.style.display='block';
+  const pad=14;
+  let x=ev.clientX+pad, y=ev.clientY+pad;
+  const r=tipEl.getBoundingClientRect();
+  if(x+r.width>window.innerWidth-8)x=ev.clientX-r.width-pad;
+  if(y+r.height>window.innerHeight-8)y=ev.clientY-r.height-pad;
+  tipEl.style.left=x+'px'; tipEl.style.top=y+'px';
+}
+function hideTip(){ if(tipEl)tipEl.style.display='none'; }
+
+async function fetchContent(id){
+  if(memCache.has(id)||memPending.has(id))return;
+  memPending.add(id);
+  try{
+    const resp=await fetch('/api/item?ids='+encodeURIComponent(id),{cache:'no-store'});
+    const d=await resp.json();
+    if(d&&d.ok===false)throw new Error(d.message||d.code);
+    const it=(d.items||{})[id];
+    memCache.set(id, it?String(it.content||'（这条没有正文）')
+                      :'（库里没有这条记忆：可能已被删除或归档）');
+  }catch(e){
+    memCache.set(id,null);   // 离线单文件 / 后端不在：不弹浮层，也不弹错误
+  }finally{
+    memPending.delete(id);
+  }
+  if(tipHover&&tipHover.id===id){
+    const t=memCache.get(id);
+    if(t)showTip(tipHover.ev,t); else hideTip();
+  }
+}
+
+function memTip(ev,id){
+  tipHover={id:id,ev:ev};
+  const local=CONTENTS[id];
+  if(local!=null){ showTip(ev,local||'（这条没有正文）'); return; }
+  if(memCache.has(id)){ showTip(ev,memCache.get(id)||'内容不可用'); return; }
+  showTip(ev,'加载中…');
+  fetchContent(id);
+}
+
+/* 事件委托挂在详情容器上：detail() 每次 innerHTML 重建，不重绑也不会丢 */
+function bindTips(){
+  const box=document.getElementById('detail');
+  if(!box)return;
+  box.addEventListener('mousemove',ev=>{
+    const node=ev.target.closest&&ev.target.closest('[data-memid]');
+    if(node){ memTip(ev,node.dataset.memid); return; }
+    tipHover=null; hideTip();
+  });
+  box.addEventListener('mouseleave',()=>{ tipHover=null; hideTip(); });
+}
+
 function detail(i){
   const r=recs[i]; if(!r)return;
+  tipHover=null; hideTip();   // 换记录时旧浮层别残留
   const hits=r.hits||[];
   const maxDelta=Math.max(0,...hits.map(h=>h.delta||0))||1;
   const rows=hits.map(h=>{
@@ -330,7 +428,8 @@ function detail(i){
       '<td>'+(h.rank||'')+'</td>'+
       '<td><span class="k" style="background:'+(C[h.kind]||'#8898ad')+'"></span>'+
         esc(NAMES[h.kind]||h.kind)+'</td>'+
-      '<td class="id">'+esc(h.id)+(h.forgotten?' <span class="tag">遗忘层</span>':'')+'</td>'+
+      '<td class="id" data-memid="'+esc(h.id)+'">'+esc(h.id)+(h.forgotten?' <span class="tag">遗忘层</span>':'')+
+        (h.fallback?' <span class="mode-fallback" title="宽泛层兜底召回">宽松</span>':'')+'</td>'+
       '<td>L'+(h.level==null?'—':h.level)+'</td>'+
       '<td>'+num(h.score,3)+'</td>'+
       '<td class="id">'+num(h.vec_sim,3)+' / '+num(h.lex,2)+'</td>'+
@@ -346,6 +445,7 @@ function detail(i){
         '<span>时间 <b>'+ts(r.at)+'</b></span>'+
         '<span>命中 <b>'+hits.length+'</b></span>'+
         '<span>耗时 <b>'+num(r.elapsed_ms,1)+' ms</b></span>'+
+        '<span>检索模式 '+modeTag(r)+'</span>'+
         '<span>深度回忆 <b>'+(r.deep?'是':'否')+'</b></span>'+
       '</div>'+
       (hits.length?'<table><thead><tr>'+
@@ -414,7 +514,7 @@ function bindHotSort(){
   });
 }
 
-summary(); renderStats(); list(); hot(); renderDiag(); bindHotSort(); bindQid();
+summary(); renderStats(); list(); hot(); renderDiag(); bindHotSort(); bindQid(); bindTips();
 if(recs.length)detail(0);
 </script>
 </body>

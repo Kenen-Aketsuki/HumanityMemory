@@ -501,8 +501,17 @@ D:/work/A/                                   D:/work/A/
 | `memory_use_workspace(path)` | **仅进程内**重新解析 + 校验；无合法令牌仍返回拒绝 + 清单 |
 | `memory_doctor`（若存在） | 只读诊断，不带任何库内容 |
 
-其余 18 个工具在拒绝态**不注册**（不是注册后报错）——模型看不到，就不会误调，
-也就不会出现"agent 以为写入成功"这类事故。`INSTRUCTIONS_TAIL` 追加硬规则：
+**2026-11-24 修订：拒绝态工具裁剪已废除。** 原设计是「其余 18 个工具在拒绝态
+不注册（不是注册后报错）——模型看不到，就不会误调」；但各宿主对运行中增删
+工具的机制不一样，DSH 等地方效果不佳。改为**工具面始终全量注册**：
+
+- 拒绝态下读写工具调用一律返回 §6.1 拒绝载荷（`ok:false` + `code` + `checklist`），
+  不会出现"agent 以为写入成功"的事故，语义不变；
+- 上表 6 个自救工具**不在拒绝范围内**，未接入时照常可用，注册道路不堵；
+- 实现：`mcp_server.tool()` 装饰器内 `_refusal()` 前置拦截（`store is None` 即拒），
+  接入成功后 store 就位自动放行，无需重挂载或重启客户端。
+
+`INSTRUCTIONS_TAIL` 追加硬规则：
 
 > 若 `memory_bind_status` 显示未接入（`code != null`）：**先向用户提问**（新建库 / 绑到已有库 /
 > 沿用本目录已有的库 / 本次不接入），拿到答复再用对应 `memory_bind_*`。
@@ -521,7 +530,7 @@ D:/work/A/                                   D:/work/A/
 | `memory_bind_decline` | 新增；写 `library: null` 令牌 |
 | `memory_use_workspace` | `persist` 失效（不再写 last-workspace）；语义改为"重新解析并校验" |
 | `memory_promote` | 保持下线 |
-| 其余 18 个 | 拒绝态不注册（当前工具总数 24） |
+| 其余 18 个 | 2026-11-24 起：始终注册；拒绝态调用返回拒绝 + checklist |
 
 ---
 

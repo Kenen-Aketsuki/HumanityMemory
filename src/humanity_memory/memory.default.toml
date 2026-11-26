@@ -34,12 +34,12 @@ archived_purge_days = 180
 # 记忆寿命 —— 否则回来跑一次 judge，所有条目的周期起点都停在几个月前，
 # 一判断全是「已到期」，接下来的日子就只剩集体降级。
 #
-# 取值 2 不是随手定的：冻结后一次计算最多承认 2 天流逝，于是
-#   周期 > 2 天的档位（L3 及以上）在静默后仍然不到期 —— 它们都还有价值；
-#   周期 ≤ 2 天的 L2/L1 照常掉下去 —— 那两档本来就快进遗忘层，无所谓。
-# 想保护得更宽就调小（但会拖慢正常衰减），想更中性就调大到接近实际计算间隔。
-# 置 0 关闭冻结（回到「有多少算多少」的旧行为）。
-max_gap_days = 2
+# 取值 1：冻结后一次计算最多承认 1 天流逝，于是
+#   周期 > 1 天的档位（L2 及以上）在静默后仍然不到期 —— 静默不折寿；
+#   周期 = 1 天的 L1 照常掉下去 —— 它本来就是遗忘层门口的快通道。
+# 想保护得更宽就调小（0 = 关闭冻结，回到「有多少算多少」的旧行为），
+# 想更中性就调大到接近实际计算间隔。
+max_gap_days = 1
 # 0 级复活所需的深度命中次数
 revive_hits = 2
 # 复活后落到哪一级
@@ -49,8 +49,24 @@ revive_to_level = 1
 # 遗忘等级表（0~10 共 11 档）
 # 顺序任意，程序按 level 字段排序；加一档只需新增一段 [[forget.levels]]。
 # 顶档不写 up_threshold（不能再升）；0 级不写周期（不参与周期裁定）。
-# up_threshold / down_threshold 是周期末的「活跃度」判据，不是分数本身。
+# up_threshold / down_threshold 是周期末的「活跃度总量」判据，不是分数本身。
 #
+# 2026-11-25 重标定：以实测最高频 L5 档全周期活跃度 3.0（日均 0.43）为锚，
+# 按日均活跃度区间划档，阈值 = 日均线 × 本档**经验周期**天数：
+#   档   日均区间        经验周期   down = 低线×天数   up = 高线×天数
+#   L1   0.05~0.10       1 天       0.05               0.10
+#   L2   0.05~0.20       2 天       0.10               0.40
+#   L3   0.15~0.30       3 天       0.45               0.90
+#   L4   0.25~0.40       5 天       1.25               2.00
+#   L5   0.35~0.50       7 天       2.45               3.50
+#   L6   0.45~0.60       30 天      13.5               18.0
+#   L7   0.55~0.70       120 天     66.0               84.0
+#   L8   0.65~0.80       240 天     156.0              192.0
+#   L9   0.75~0.90       365 天     273.75             328.5
+#   L10  0.85~1.00       540 天     459.0              —（顶档）
+# 相邻档日均区间重叠 0.05，即天然滞回死区（例如 L5 日均 0.43 落在 0.35~0.50 内，稳态）。
+# 注意：阈值按经验周期折算，经历走快周期（如 L6 为 21 天），等效日均线更陡 ——
+# 与「经历忘得快」的既有设计一致。
 # 分两段看，这是本表的设计意图：
 #   1~5 级 —— 短时记忆。两种周期都在 1 周以内，一天到一周就裁定一次，
 #             新条目在这里快速试错：被检索到就往上爬，没人再问就往下掉。
@@ -63,79 +79,79 @@ revive_to_level = 1
 level = 10
 period_experience_days = 540
 period_episode_days = 365
-down_threshold = 27.2
+down_threshold = 459.0
 compress = "full"
 
 [[forget.levels]]
 level = 9
 period_experience_days = 365
 period_episode_days = 240
-up_threshold = 34.0
-down_threshold = 20.0
+up_threshold = 328.5
+down_threshold = 273.75
 compress = "full"
 
 [[forget.levels]]
 level = 8
 period_experience_days = 240
 period_episode_days = 120
-up_threshold = 25.0
-down_threshold = 14.4
+up_threshold = 192.0
+down_threshold = 156.0
 compress = "full"
 
 [[forget.levels]]
 level = 7
 period_experience_days = 120
 period_episode_days = 60
-up_threshold = 18.0
-down_threshold = 10.4
+up_threshold = 84.0
+down_threshold = 66.0
 compress = "full"
 
 [[forget.levels]]
 level = 6
 period_experience_days = 30
 period_episode_days = 21
-up_threshold = 13.0
-down_threshold = 7.6
+up_threshold = 18.0
+down_threshold = 13.5
 compress = "full"
 
 [[forget.levels]]
 level = 5
 period_experience_days = 7
 period_episode_days = 7
-up_threshold = 9.5
-down_threshold = 5.6
+up_threshold = 3.5
+down_threshold = 2.45
 compress = "full"
 
 [[forget.levels]]
 level = 4
 period_experience_days = 5
 period_episode_days = 5
-up_threshold = 7.0
-down_threshold = 4.0
+up_threshold = 2.0
+down_threshold = 1.25
 compress = "full"
 
 [[forget.levels]]
 level = 3
 period_experience_days = 3
 period_episode_days = 3
-up_threshold = 5.0
-down_threshold = 2.8
+up_threshold = 0.9
+down_threshold = 0.45
 compress = "full"
 
 [[forget.levels]]
 level = 2
 period_experience_days = 2
 period_episode_days = 2
-up_threshold = 3.5
-down_threshold = 1.6
+up_threshold = 0.4
+down_threshold = 0.1
 compress = "full"
 
 [[forget.levels]]
 level = 1
 period_experience_days = 1
 period_episode_days = 1
-up_threshold = 2.0
-down_threshold = 0.5
+up_threshold = 0.1
+down_threshold = 0.05
 compress = "sentence"
 
 [[forget.levels]]
@@ -198,6 +214,12 @@ L2 = 0.5
 sim_floor = 0.35
 # 单次贡献 = (sim - sim_floor) ^ curve_power
 curve_power = 2.0
+# 单条 log 保留的不同 query 上限（超出淘汰最旧的）
+retrievals_cap = 32
+# 复盘继承值上限：防高频召回给新条目一个离谱的起始活跃度
+inherit_cap = 1.0
+# 复盘来源自动映射的相似度门槛；无命中回落当天全量日志
+source_match_floor = 0.35
 
 
 # ============================================================================

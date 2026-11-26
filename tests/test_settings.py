@@ -48,15 +48,15 @@ def _write_levels(path: Path, levels: list[dict], **forget_overrides) -> None:
 
 def _default_levels() -> list[dict]:
     return [
-        {"level": 5, "period_knowledge_days": 365, "period_episode_days": 180,
+        {"level": 5, "period_experience_days": 365, "period_episode_days": 180,
          "down_threshold": 20.0, "compress": "full"},
-        {"level": 4, "period_knowledge_days": 180, "period_episode_days": 90,
+        {"level": 4, "period_experience_days": 180, "period_episode_days": 90,
          "up_threshold": 25.0, "down_threshold": 12.0, "compress": "full"},
-        {"level": 3, "period_knowledge_days": 90, "period_episode_days": 30,
+        {"level": 3, "period_experience_days": 90, "period_episode_days": 30,
          "up_threshold": 15.0, "down_threshold": 6.0, "compress": "full"},
-        {"level": 2, "period_knowledge_days": 30, "period_episode_days": 14,
+        {"level": 2, "period_experience_days": 30, "period_episode_days": 14,
          "up_threshold": 8.0, "down_threshold": 3.0, "compress": "moderate"},
-        {"level": 1, "period_knowledge_days": 7, "period_episode_days": 7,
+        {"level": 1, "period_experience_days": 7, "period_episode_days": 7,
          "up_threshold": 4.0, "down_threshold": 1.0, "compress": "sentence"},
         {"level": 0, "compress": "title"},
     ]
@@ -154,14 +154,35 @@ def test_missing_up_threshold_names_the_level(tmp_path: Path) -> None:
 
 
 def test_hysteresis_inversion_is_rejected(tmp_path: Path) -> None:
-    """level=3 的升档线压到 level=4 的降档线之下 → 活跃度抖一下就横跳。"""
+    """日均刻度下的滞回倒挂：level=3 升档线折算日均压到 level=4 降档线之下。"""
 
     def mutate(levels: list[dict]) -> None:
         for item in levels:
             if item["level"] == 3:
-                item["up_threshold"] = 10.0  # < level4.down_threshold = 12.0
+                # 5/90 ≈ 0.056 < level4.down 12/180 ≈ 0.067（日均倒挂）
+                item["up_threshold"] = 5.0
 
     _expect_error(tmp_path, mutate, "滞回倒挂")
+
+
+def test_raw_scale_gap_across_periods_is_not_inversion(tmp_path: Path) -> None:
+    """裸值比下一档降档线小不算倒挂：阈值是周期总量，各档周期天数不同，
+    总量刻度跨档不可比。10/90 ≈ 0.111 > 12/180 ≈ 0.067（日均合法）→ 正常加载。"""
+
+    def mutate(levels: list[dict]) -> None:
+        for item in levels:
+            if item["level"] == 3:
+                item["up_threshold"] = 10.0  # < level4.down_threshold = 12.0，但日均更高
+
+    levels = _default_levels()
+    mutate(levels)
+    ws = tmp_path / "proj" / ".ai_memory"
+    _write_levels(ws / "memory.toml", levels)
+    # 夹具只有 6 档：补一段等长的压缩表，别让长度校验抢在滞回检查前拒绝启动
+    with (ws / "memory.toml").open("a", encoding="utf-8") as fh:
+        fh.write("\n[compress]\nrequired_compression = [3, 2, 0, 0, 0, 0]\n")
+    cfg = Config.load({"HM_HOME": str(tmp_path / "home")}, library_dir=ws)
+    assert cfg.settings["forget"]["levels"]
 
 
 def test_compression_array_length_must_match_levels(tmp_path: Path) -> None:

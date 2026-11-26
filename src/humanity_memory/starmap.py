@@ -719,7 +719,10 @@ canvas.drag{cursor:grabbing}
 #hud{position:absolute;left:16px;bottom:14px;color:var(--muted);font-size:11px;
   pointer-events:none;letter-spacing:.3px}
 #legend{position:absolute;right:16px;bottom:14px;font-size:11px;color:var(--muted);
-  pointer-events:none;text-align:right;line-height:1.9}
+  pointer-events:auto;text-align:right;line-height:1.9;background:rgba(13,20,34,.85);
+  border:1px solid var(--line);border-radius:8px;padding:6px 10px;max-width:70%}
+#legendHead{cursor:pointer;user-select:none;color:#cfe0ff}
+#legendBody{margin-top:4px}
 .warn{color:#ffc46b;font-size:11px;margin-top:8px;word-break:break-word}
 /* 活跃度色标：三锚点与画布里的辉光同源（青 0 → 黄 0.5 → 红 1） */
 .glowbar{height:10px;border-radius:5px;margin:4px 0 3px;
@@ -784,7 +787,9 @@ const tip=document.getElementById('tip');
 let W=0,H=0,DPR=1,view={x:0,y:0,k:1};
 let alpha=1,frame=0,hover=null,selected=null,dragging=null,panning=null,fixedHover=true,downX=0,downY=0;
 const enabled={semantic:true,invalidates:true,digest:true,tag:false};
-const kinds={experience:true,episode:true,log:true,digest:true};
+// 复盘恒星默认隐藏（2026-11-25 要求）：金色恒星视觉存在感太强，
+// 平时看的是知识/经历本身；侧栏勾选「复盘」随时可以打开。
+const kinds={experience:true,episode:true,log:true,digest:false};
 let minScore=DATA.meta.min_score;
 // 等级量程与整张等级表都由后端从配置（[[forget.levels]]）带过来。
 // 不写死档数、也不假设等级是 0~N 连续整数：表的形状归配置管，这里只负责画。
@@ -1103,7 +1108,8 @@ function buildUI(){
     ET[k]+' <span style="color:var(--muted);margin-left:auto">'+(m.edge_counts[k]||0)+'</span></label>').join('');
   et.querySelectorAll('input').forEach(el=>el.onchange=()=>{enabled[el.dataset.et]=el.checked;refresh();});
   const kd=document.getElementById('kinds');
-  kd.innerHTML=Object.keys(L).map(k=>'<label class="row"><input type="checkbox" data-k="'+k+'" checked> '+
+  kd.innerHTML=Object.keys(L).map(k=>'<label class="row"><input type="checkbox" data-k="'+k+'"'+
+    (kinds[k]?' checked':'')+'> '+
     '<span class="dot" style="background:'+C[k]+'"></span>'+L[k]+' <span style="color:var(--muted);margin-left:auto">'+
     (m.kind_counts[k]||0)+'</span></label>').join('');
   kd.querySelectorAll('input').forEach(el=>el.onchange=()=>{kinds[el.dataset.k]=el.checked;refresh();});
@@ -1154,7 +1160,11 @@ function buildUI(){
     ? ((am.min||0).toFixed(2)+' → '+(am.max||0).toFixed(2)
       +(isRatio&&am.zero?' · '+am.zero+' 个为 0':''))
     : '无节点';
-  document.getElementById('legend').innerHTML=
+  // 图例默认折叠（2026-11-25 要求）：只留一行「图例 ▸」，点开看全部说明。
+  const legend=document.getElementById('legend');
+  legend.innerHTML=
+    '<div id="legendHead">图例 <span id="legendArrow">▸</span></div>'+
+    '<div id="legendBody" style="display:none">'+
     '<span style="color:#cfe0ff">点大小 = 重要度 · 辉光颜色 = 活跃度 · 辉光透明度 = 遗忘等级</span><br>'+
     '<span style="color:#0fe0e5">　冷 0</span><span style="color:#8292ab"> ─ </span>'+
     '<span style="color:#f6de14">中 0.5</span><span style="color:#8292ab"> ─ </span>'+
@@ -1166,7 +1176,14 @@ function buildUI(){
     '<span style="color:#ffe08a">黄色恒星 = 复盘批次</span><br>'+
     '<span style="color:'+LOG_GLOW+'">灰色辉光 = 原始日志（无活跃度 / 无等级）</span><br>'+
     '<span style="color:#5fd6a0">绿色实线 = 标签共现</span><br>'+
-    '<span style="color:#cfe0ff">悬停 / 选中 / 搜中 = 加粗其可见连线</span>';
+    '<span style="color:#cfe0ff">悬停 / 选中 / 搜中 = 加粗其可见连线</span>'+
+    '</div>';
+  document.getElementById('legendHead').onclick=()=>{
+    const body=document.getElementById('legendBody');
+    const open=body.style.display==='none';
+    body.style.display=open?'block':'none';
+    document.getElementById('legendArrow').textContent=open?'▾':'▸';
+  };
   const notes=document.getElementById('notes');
   notes.innerHTML='<h2>数据源说明</h2>'+(m.notes.length?m.notes.map(x=>'<div class="kv">'+esc(x)+'</div>').join(''):
     '<div class="kv"><span>无额外提示</span></div>')+
@@ -1336,9 +1353,29 @@ def resolve_levels(
 # ---------------------------------------------------------------- CLI 入口
 
 
-def run(args: argparse.Namespace) -> int:
-    started = time.time()
-    db, notes = resolve_db(args.path)
+# 星图默认参数：CLI parser 与 webtool 共用，避免两处各写一份
+STARMAP_DEFAULTS: dict[str, Any] = {
+    "min_score": 0.55,
+    "top_k": 6,
+    "max_nodes": 400,
+    "activity_mode": "ratio",
+}
+
+
+def _arg(args: Any, name: str) -> Any:
+    """从 argparse.Namespace / SimpleNamespace / dict 取参数，缺了用默认值。"""
+    if isinstance(args, dict):
+        return args.get(name, STARMAP_DEFAULTS[name])
+    return getattr(args, name, STARMAP_DEFAULTS[name])
+
+
+def build_graph_payload(db: Path, args: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """纯取数：从库文件构建星图 graph（不写文件、不打印、不解析 target 路径）。
+
+    返回 ``(graph, extras)`` —— ``extras`` 带 CLI 才需要的诊断字段（notes/warnings/
+    real_nodes/coverage 等），HTTP 端只取 graph。CLI 的 ``run()`` 是本函数的薄包装，
+    两条路径共用同一份取数逻辑，保证浏览器里看到的与 `starmap` 子命令产物一致。
+    """
     conn = open_readonly(db)
     try:
         schema = inspect_schema(conn)
@@ -1347,29 +1384,40 @@ def run(args: argparse.Namespace) -> int:
         edges, stats = build_graph(
             nodes,
             vecs,
-            min_score=args.min_score,
-            top_k=args.top_k,
-            max_nodes=args.max_nodes,
+            min_score=_arg(args, "min_score"),
+            top_k=_arg(args, "top_k"),
+            max_nodes=_arg(args, "max_nodes"),
         )
     finally:
         conn.close()
 
+    db = db.resolve()
+    notes: list[str] = []
+    return _assemble_graph(db, schema, nodes, vecs, edges, stats, args, notes)
+
+
+def _assemble_graph(
+    db: Path,
+    schema: dict[str, Any],
+    nodes: list[dict[str, Any]],
+    vecs: dict[tuple[str, int], tuple[float, ...]],
+    edges: list[dict[str, Any]],
+    stats: dict[str, Any],
+    args: Any,
+    notes: list[str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """组装 graph 与诊断信息（原 run() 的中段，抽出来给 CLI / HTTP 复用）。"""
+    started = time.time()
     real_nodes = sum(1 for n in nodes if n["kind"] != "digest")
 
-    # 等级轴由配置的 [[forget.levels]] 生成：档数、每档周期都读配置，
-    # 代码里不写死「一共几档」，也不假设等级是 0~N 连续整数。
     level_table, level_source, neutral_level = resolve_levels(db, nodes)
     level_max = int(level_table[0]["level"])
-    # 日志没有等级列（不参与等级机制）：给中间档当占位，透明度本来就固定 0.17，
-    # 这一项只影响光晕半径，取表中正间而不是写死 3。
-    # 复盘恒星排除在外 —— 它连等级都没有，光晕大小一直是「零档」那档。
     for node in nodes:
         if node["kind"] != "digest" and not node.get("has_level"):
             node["forget_level"] = neutral_level
 
-    # 色标必须在等级表定下来之后再算 —— ratio 口径的分母就是这张表给的。
     act_stats = assign_activity(
-        nodes, level_table, mode=getattr(args, "activity_mode", "ratio")
+        nodes, level_table, mode=_arg(args, "activity_mode")
     )
     covered = sum(
         1 for n in nodes if n["kind"] != "digest" and (n["table"], n["rowid"]) in vecs
@@ -1387,8 +1435,6 @@ def run(args: argparse.Namespace) -> int:
     if act_stats.get("fallback"):
         warnings.append(str(act_stats["fallback"]))
     if act_stats.get("mode") == "ratio" and act_stats.get("scored"):
-        # 「整库都在零活跃」在 ratio 口径下会变成整片青，这不是画错了，
-        # 是本周期确实没人被检索到 —— 但必须说出来，否则没人能判断该怪数据还是怪图。
         zero = int(act_stats.get("zero") or 0)
         if zero >= int(act_stats["scored"]):
             warnings.append(
@@ -1414,18 +1460,55 @@ def run(args: argparse.Namespace) -> int:
             "coverage": f"{covered}/{real_nodes}",
             "kind_counts": dict(Counter(n["kind"] for n in nodes)),
             "edge_counts": stats["edge_counts"],
-            "min_score": args.min_score,
+            "min_score": _arg(args, "min_score"),
             "max_level": level_max,
-            # 整张表交给前端画图例：档位、周期都来自配置，前端不再自己数 0~N
             "levels": level_table,
             "level_source": level_source,
-            # 色标口径写进产物，免得日后看 HTML 的人猜「这个青色到底代表什么」
             "activity": dict(act_stats),
             "generated_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "dir_files": files,
             "notes": all_notes,
             "warnings": warnings,
         },
+    }
+    extras = {
+        "started": started,
+        "real_nodes": real_nodes,
+        "covered": covered,
+        "warnings": warnings,
+        "edge_counts": stats["edge_counts"],
+        "semantic_pairs_computed": stats.get("semantic_pairs_computed", 0),
+        "digest_nodes": stats["digest_nodes"],
+        "level_max": level_max,
+        "schema": schema,
+        "level_table": level_table,
+        "level_source": level_source,
+        "all_notes": all_notes,
+    }
+    return graph, extras
+
+
+def run(args: argparse.Namespace) -> int:
+    started = time.time()
+    db, resolve_notes = resolve_db(args.path)
+    graph, extras = build_graph_payload(db, args)
+    # 把 resolve_db 的 notes 合进 graph（HTTP 路径没有这一步）
+    graph["meta"]["notes"] = list(
+        dict.fromkeys(resolve_notes + list(graph["meta"].get("notes") or []))
+    )
+    schema = extras["schema"]
+    warnings = extras["warnings"]
+    real_nodes = extras["real_nodes"]
+    covered = extras["covered"]
+    level_table = extras["level_table"]
+    level_source = extras["level_source"]
+    nodes = graph["nodes"]
+    edges = graph["edges"]
+    level_max = extras["level_max"]
+    stats = {
+        "edge_counts": extras["edge_counts"],
+        "digest_nodes": extras["digest_nodes"],
+        "semantic_pairs_computed": extras["semantic_pairs_computed"],
     }
 
     out = Path(args.out).expanduser().resolve()

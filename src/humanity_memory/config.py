@@ -294,11 +294,27 @@ def validate_settings(settings: dict[str, Any]) -> list[str]:
             )
         above = by_level.get(level + 1)
         above_down = above.get("down_threshold") if above else None
-        if above_down is not None and float(up) <= float(above_down):
-            problems.append(
-                f"滞回倒挂：level={level} 的 up_threshold={up} "
-                f"不高于 level={level + 1} 的 down_threshold={above_down}"
-            )
+        # 阈值是「周期总量」，各档周期天数不同，总量刻度跨档不可比
+        # （L6 的降档线 13.5 天然大于 L5 的升档线 3.5，但这不是倒挂 ——
+        # 前者是 30 天的总量、后者是 7 天的总量）。所以跨档滞回必须在
+        # 日均刻度上比：up/本档经验周期 vs 下一档 down/下一档经验周期。
+        own_period = item.get("period_experience_days")
+        above_period = above.get("period_experience_days") if above else None
+        if (
+            above_down is not None
+            and own_period
+            and float(own_period) > 0
+            and above_period
+            and float(above_period) > 0
+        ):
+            up_daily = float(up) / float(own_period)
+            down_daily = float(above_down) / float(above_period)
+            if up_daily <= down_daily:
+                problems.append(
+                    f"滞回倒挂（日均刻度）：level={level} 的 up_threshold={up} "
+                    f"折算日均 {up_daily:g} 不高于 level={level + 1} 的 "
+                    f"down_threshold={above_down} 折算日均 {down_daily:g}"
+                )
 
     bands = _optional(settings, "initial", "bands", default=[])
     if not isinstance(bands, list) or not bands:
@@ -557,6 +573,23 @@ class Config:
     @property
     def activity_curve_power(self) -> float:
         return float(_dig(self.settings, "activity", "curve_power"))
+
+    @property
+    def retrievals_cap(self) -> int:
+        """单条 log 保留的不同 query 上限（超出淘汰最旧的）。"""
+        return max(
+            1, int(_optional(self.settings, "activity", "retrievals_cap", default=32))
+        )
+
+    @property
+    def activity_inherit_cap(self) -> float:
+        """复盘继承值的上限：防高频召回给新条目一个离谱的起始活跃度。"""
+        return max(0.0, float(_optional(self.settings, "activity", "inherit_cap", default=1.0)))
+
+    @property
+    def source_match_floor(self) -> float:
+        """复盘来源自动映射的相似度门槛；无命中回落当天全量日志。"""
+        return float(_optional(self.settings, "activity", "source_match_floor", default=0.35))
 
     @property
     def dedup_floor(self) -> float:

@@ -184,17 +184,17 @@ def cfg() -> Config:
     return Config.load({"HM_EMBED_DIM": "8"})
 
 
-# ---------------------------------------------------------------- 新库就是 v4
+# ---------------------------------------------------------------- 新库就是 v5
 
 
-def test_new_db_is_v4_with_new_columns(tmp_path: Path, cfg: Config) -> None:
+def test_new_db_is_v5_with_new_columns(tmp_path: Path, cfg: Config) -> None:
     db = tmp_path / "ws" / "workspace.db"
     conn = open_db(db, cfg)
     try:
         version = conn.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()[0]
-        assert version == str(EXPECTED_SCHEMA_VERSION) == "4"
+        assert version == str(EXPECTED_SCHEMA_VERSION) == "5"
 
         k_cols = {r[1] for r in conn.execute("PRAGMA table_info(knowledge)")}
         assert {"forget_level", "confidence", "activity", "period_start", "level0_since"} <= k_cols
@@ -203,13 +203,17 @@ def test_new_db_is_v4_with_new_columns(tmp_path: Path, cfg: Config) -> None:
         assert {"forget_level", "activity", "period_start", "revive_hits", "level0_since"} <= e_cols
         assert "confidence" not in e_cols, "经历的可信度是派生的，不该落盘"
 
+        l_cols = {r[1] for r in conn.execute("PRAGMA table_info(logs)")}
+        assert "retrievals" in l_cols, "log 记检索条件"
+        assert "activity" not in l_cols, "log 不记热度：热度是检索条件的派生量"
+
         tables = {
             r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
         assert "memory_events" in tables
     finally:
         conn.close()
-    assert probe_schema_version(db) == "v4"
+    assert probe_schema_version(db) == "v5"
 
 
 def test_events_table_is_append_only(tmp_path: Path, cfg: Config) -> None:
@@ -282,7 +286,7 @@ def test_upgrade_preview_keeps_source_untouched(tmp_path: Path) -> None:
     assert report["dry_run"] is True
     assert report["source_version"] == "3"
     assert report["target_version"] == LATEST_VERSION
-    assert report["chain"] == ["v3 → v4"]
+    assert report["chain"] == ["v3 → v4", "v4 → v5"]
     assert report["plan"]["counts"]["knowledge"] == 4
     assert report["plan"]["counts"]["episodes"] == 2
     assert report["out"] is None
@@ -314,7 +318,7 @@ def test_upgrade_writes_new_db_and_passes_checks(tmp_path: Path) -> None:
         version = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()[0]
-        assert version == "4"
+        assert version == "5"
 
         # 初始等级按 importance 走出厂 bands；可信度按 kind 固定映射
         rows = {
@@ -357,6 +361,51 @@ def test_upgrade_writes_new_db_and_passes_checks(tmp_path: Path) -> None:
         conn.close()
 
 
+def test_v4_to_v5_sets_retrievals_empty(tmp_path: Path, cfg: Config) -> None:
+    """v4 → v5：存量 log 的 retrievals 写 '[]'，其余数据原样保留。"""
+    v4 = tmp_path / "workspace.v4.db"
+    conn = open_db(v4, cfg)
+    try:
+        conn.execute(
+            "INSERT INTO logs(id, at, day, content, access_count) VALUES (?,?,?,?,?)",
+            ("l_old", 1_760_000_000_000, "2026-11-19", "一条老日志", 3),
+        )
+        # 把刚建好的 v5 库降级成 v4：去掉新列，改回版本号
+        conn.execute("ALTER TABLE logs DROP COLUMN retrievals")
+        conn.execute("UPDATE meta SET value = '4' WHERE key = 'schema_version'")
+    finally:
+        conn.close()
+
+    assert probe_schema_version(v4) == "v4"
+    preview = run(v4)
+    assert preview["chain"] == ["v4 → v5"]
+
+    out = tmp_path / "workspace.v5.db"
+    report = run(v4, out)
+    assert report["ok"] is True, report
+    assert report["checks"]["all_ok"] is True, report["checks"]
+    assert probe_schema_version(out) == "v5"
+
+    check = sqlite3.connect(str(out))
+    check.row_factory = sqlite3.Row
+    _load_vec(check)
+    try:
+        row = check.execute(
+            "SELECT content, access_count, retrievals FROM logs WHERE id = ?",
+            ("l_old",),
+        ).fetchone()
+        assert row is not None
+        assert row["content"] == "一条老日志"
+        assert row["access_count"] == 3
+        assert row["retrievals"] == "[]", "历史 JSONL 不追溯，从升级时刻起算"
+        version = check.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        assert version == "5"
+    finally:
+        check.close()
+
+
 def test_upgrade_refuses_to_overwrite(tmp_path: Path) -> None:
     db = make_v3_db(tmp_path / "workspace.db")
     out = tmp_path / "exists.db"
@@ -373,7 +422,7 @@ def test_upgrade_rejects_already_current_and_garbage(tmp_path: Path, cfg: Config
 
     report = run(current)
     assert report["ok"] is False
-    assert "已经是 v4" in report["reason"]
+    assert "已经是 v5" in report["reason"]
 
     garbage = tmp_path / "garbage.db"
     garbage.write_bytes(b"not sqlite at all")
@@ -402,7 +451,7 @@ def test_inplace_swaps_and_keeps_v3_archive(tmp_path: Path) -> None:
     assert report["ok"] is True, report
     assert report["in_place"] is True
     assert report["swapped"] is True
-    assert probe_schema_version(db) == "v4"
+    assert probe_schema_version(db) == "v5"
 
     # 原件必须还在，且真的是 v3 —— 回退就是把名字改回去
     archived = tmp_path / report["archived"]
@@ -427,7 +476,7 @@ def test_inplace_is_idempotent(tmp_path: Path) -> None:
 
     assert again["ok"] is True
     assert again["noop"] is True
-    assert "已经是 v4" in again["reason"]
+    assert "已经是 v5" in again["reason"]
     assert len(list(tmp_path.glob("workspace.db.v3-*"))) == 1, "重复拖不该再留一份档"
 
 

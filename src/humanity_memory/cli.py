@@ -1150,6 +1150,7 @@ def cmd_retrieval_report(args: argparse.Namespace) -> int:
     from .reports import (
         latest_judge_snapshot,
         level_thresholds,
+        read_item_contents,
         read_node_activity,
         read_retrievals,
     )
@@ -1179,8 +1180,19 @@ def cmd_retrieval_report(args: argparse.Namespace) -> int:
             for n in (snapshot or {}).get("nodes", [])
         ]
 
+        # 单文件报告是离线产物，页面没法向后端懒取正文，只能在生成时内联。
+        # 只取日志里真正出现过的 id（记录可能跨几十天，全库内联没必要）。
+        hit_ids = [str(h.get("id")) for r in records for h in (r.get("hits") or [])]
+        contents = {
+            item_id: item["content"]
+            for item_id, item in read_item_contents(
+                store.layout.workspace_db, [x for x in hit_ids if x]
+            ).items()
+        }
+
         html = render_retrieval_html(
             records,
+            contents=contents,
             meta={
                 "db": str(store.layout.workspace_db),
                 "days": args.days,
@@ -1213,6 +1225,24 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     mcp_server.main()
     return 0
+
+
+def cmd_analyze(args: argparse.Namespace) -> int:
+    """启动本地可视化分析工具（HTTP 后端 + 浏览器前端，全程只读）。"""
+    from .webtool import serve
+    from .webtool.datasource import SourceError
+
+    try:
+        return serve(
+            args.target,
+            port=args.port,
+            open_browser=not args.no_browser,
+        )
+    except SourceError as exc:
+        print(f"无法启动观测台：{exc.message}", file=sys.stderr)
+        for line in exc.checklist:
+            print(f"  - {line}", file=sys.stderr)
+        return 2
 
 
 def cmd_starmap(args: argparse.Namespace) -> int:
@@ -1591,6 +1621,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_star.set_defaults(func=cmd_starmap)
+
+    p_an = sub.add_parser(
+        "analyze", help="本地可视化分析工具：HTTP 后端 + 浏览器前端（只读）"
+    )
+    p_an.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help=(
+            "库根目录 / token 文件 / 项目根 / workspace.db。"
+            "省略 = 列出 registry 里全部已登记的库，页面右上角下拉切换"
+        ),
+    )
+    p_an.add_argument("--port", type=int, default=8765, help="监听端口（默认 8765）")
+    p_an.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    p_an.set_defaults(func=cmd_analyze)
 
     p_up = sub.add_parser(
         "upgrade",

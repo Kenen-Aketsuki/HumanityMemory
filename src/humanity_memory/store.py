@@ -96,6 +96,74 @@ def _lexical_coverage(query: str, text: str) -> float | None:
     hit = sum(1 for t in terms if t.lower() in low)
     return hit / len(terms) if hit else None
 
+
+def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
+    """两条已埋好的向量求余弦（重放时 q_vec 与条目 vec 都在内存里）。"""
+    if not a or not b:
+        return 0.0
+    n = min(len(a), len(b))
+    va, vb = [float(a[i]) for i in range(n)], [float(b[i]) for i in range(n)]
+    dot = sum(x * y for x, y in zip(va, vb))
+    na = sum(x * x for x in va) ** 0.5
+    nb = sum(y * y for y in vb) ** 0.5
+    if na <= 0 or nb <= 0:
+        return 0.0
+    return max(0.0, min(1.0, dot / (na * nb)))
+
+
+def _normalize_query(query: str) -> str:
+    """查询归一化：strip + 折叠空白，作为 retrievals 的去重键。"""
+    return re.sub(r"\s+", " ", (query or "").strip())
+
+
+def merge_retrieval(
+    raw: str | list[dict[str, Any]],
+    query: str,
+    *,
+    sim: float,
+    heat: float,
+    now: int,
+    cap: int = 32,
+) -> str:
+    """把一次 recall 命中合并进 log 的检索条件流水，返回 JSON 字符串。
+
+    同一 query 只占一项：`n` 累加、`heat` 累加、更新最近的 `sim` / `at`。
+    热度没有独立字段——它就藏在每项的 `heat` 里（历次 `activity_contribution`
+    之和），复盘时现场派生。超出 `cap` 个不同 query 时淘汰 `at` 最旧的。
+
+    数据是库内正式列（随事务、随备份、随 purge），不是旁路 JSONL。
+    """
+    try:
+        items = json.loads(raw) if isinstance(raw, str) else list(raw or [])
+    except (TypeError, ValueError):
+        items = []
+    if not isinstance(items, list):
+        items = []
+
+    q = _normalize_query(query)
+    if q:
+        for item in items:
+            if isinstance(item, dict) and str(item.get("q", "")) == q:
+                item["n"] = int(item.get("n", 0) or 0) + 1
+                item["sim"] = round(float(sim), 4)
+                item["heat"] = round(float(item.get("heat", 0.0) or 0.0) + float(heat), 4)
+                item["at"] = int(now)
+                break
+        else:
+            items.append(
+                {
+                    "q": q,
+                    "n": 1,
+                    "sim": round(float(sim), 4),
+                    "heat": round(float(heat), 4),
+                    "at": int(now),
+                }
+            )
+
+    if cap > 0 and len(items) > cap:
+        items = sorted(items, key=lambda it: int(it.get("at", 0) or 0))[-cap:]
+    return json.dumps(items, ensure_ascii=False)
+
 # 经历的压缩级别越高越「精炼」，检索权重越高；
 # 刚复盘出来的完整叙述（level 0）内容长、冗余多，降权避免挤占结果。
 EPISODE_LEVEL_WEIGHT = {0: 0.88, 1: 0.93, 2: 0.96, 3: 0.96}
@@ -507,6 +575,8 @@ class MemoryStore:
         verified_at: int | None = None,
         meta: dict[str, Any] | None = None,
         allow_duplicate: bool = False,
+        activity: float | None = None,
+        vec: Sequence[float] | None = None,
     ) -> Experience:
         """写一条经验，写之前先查重。
 
@@ -524,14 +594,16 @@ class MemoryStore:
         now = now_ms()
         imp = importance if importance is not None else self._default_importance("experience")
         imp = max(0.0, min(1.0, float(imp)))
-        vectors = self.embedder.try_embed([content])
+        vectors = self.embedder.try_embed([content]) if vec is None else [vec]
         vec = vectors[0] if vectors else None
 
         if vec and not allow_duplicate:
             dup = self._dedup_probe(conn, db_name, vec)
             if dup is not None:
                 kept, sim = dup
-                bonus = self.cfg.dedup_bonus
+                # 继承值与 dup_bonus 是同一份证据的两种表达：取大不相加，
+                # 免得热 log 提炼出的结论因为"既算继承又算重复"而虚高。
+                bonus = max(self.cfg.dedup_bonus, float(activity or 0.0))
                 with transaction(conn):
                     conn.execute(
                         f"UPDATE {EXPERIENCE.table} SET activity = activity + ? WHERE rowid = ?",
@@ -546,7 +618,7 @@ class MemoryStore:
                         from_value="write",
                         to_value="reinforced",
                         delta=bonus,
-                        reason=f"重复录入已拦下（相似度 {sim:.3f}）：{content[:80]}",
+                        reason=f"重复录入已拦下（相似度 {sim:.3f}，补偿 {bonus:.3f}）：{content[:80]}",
                     )
                 kept.activity += bonus
                 kept.deduped = True
@@ -583,6 +655,10 @@ class MemoryStore:
                 # 只有调用方明确给了初值才写；没给就让 schema 默认生效
                 columns.append("confidence")
                 values.append(max(0.0, min(1.0, float(confidence))))
+            if activity is not None:
+                # 复盘继承来的活跃度：不传则落 schema 默认 0
+                columns.append("activity")
+                values.append(max(0.0, min(1.0, float(activity))))
             marks = ",".join("?" * len(columns))
             cur = conn.execute(
                 f"INSERT INTO {EXPERIENCE.table}({', '.join(columns)}) VALUES ({marks})",
@@ -605,6 +681,8 @@ class MemoryStore:
         source: str | None = None,
         meta: dict[str, Any] | None = None,
         compression_level: int | None = None,
+        activity: float | None = None,
+        vec: Sequence[float] | None = None,
     ) -> Episode:
         """写一条经历：一条一个单一事务，时间戳必填（不填就是此刻）。"""
         text, _ = _check_writable(content, "episode", label="write_episode")
@@ -620,31 +698,38 @@ class MemoryStore:
         else:
             lvl = initial_compression_level(imp)
         ep_id = new_id("e")
-        vectors = self.embedder.try_embed([text])
+        vectors = self.embedder.try_embed([text]) if vec is None else [vec]
         vec = vectors[0] if vectors else None
 
         with transaction(conn):
+            columns = [
+                "id", "content", "at", "day", "tags", "importance",
+                "created_at", "digest_id", "compression_level", "embedded", "meta",
+                "forget_level", "period_start",
+            ]
+            values: list[Any] = [
+                ep_id,
+                text,
+                ts,
+                day or day_of(ts),
+                json.dumps(_as_tags(tags), ensure_ascii=False),
+                imp,
+                now_ms(),
+                digest_id,
+                lvl,
+                1 if vec else 0,
+                json.dumps(meta or {}, ensure_ascii=False),
+                # 经历同样按 importance 定初始等级；周期从事件发生时刻起算
+                initial_level(imp, self.cfg.initial_bands),
+                ts,
+            ]
+            if activity is not None:
+                columns.append("activity")
+                values.append(max(0.0, min(1.0, float(activity))))
+            marks = ",".join("?" * len(values))
             cur = conn.execute(
-                "INSERT INTO episodes(id, content, at, day, tags, importance,"
-                " created_at, digest_id, compression_level, embedded, meta,"
-                " forget_level, period_start)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    ep_id,
-                    text,
-                    ts,
-                    day or day_of(ts),
-                    json.dumps(_as_tags(tags), ensure_ascii=False),
-                    imp,
-                    now_ms(),
-                    digest_id,
-                    lvl,
-                    1 if vec else 0,
-                    json.dumps(meta or {}, ensure_ascii=False),
-                    # 经历同样按 importance 定初始等级；周期从事件发生时刻起算
-                    initial_level(imp, self.cfg.initial_bands),
-                    ts,
-                ),
+                f"INSERT INTO episodes({', '.join(columns)}) VALUES ({marks})",
+                tuple(values),
             )
             if vec:
                 self._vec_put(conn, EPISODE, int(cur.lastrowid), vec)
@@ -1570,7 +1655,7 @@ class MemoryStore:
             str(hit.item.id): float(getattr(hit.item, "activity", 0.0) or 0.0)
             for hit in hits
         }
-        self._reinforce(hits)
+        self._reinforce(hits, context)
 
         deep_used = False
         if deep and self._is_miss(hits):
@@ -1629,8 +1714,12 @@ class MemoryStore:
                     "delta": None if prior is None else round(after - prior, 4),
                     "activity_after": round(after, 4),
                     "forgotten": bool(getattr(hit, "forgotten", False)),
+                    # 这条是否由宽泛层（RRF / maxpool）兜底召回；precision 低于严格命中
+                    "fallback": bool(getattr(hit, "fallback", False)),
                 }
             )
+        # mode 语义与 mcp_server.py 的 search 返回一致：只要有一条来自宽泛层就算 fallback。
+        # 与 deep（遗忘层回忆）是两个独立维度——deep 是"去哪找"，mode 是"怎么找/多严格"。
         append_retrieval(
             self.layout.workspace_dir,
             self.cfg,
@@ -1638,6 +1727,7 @@ class MemoryStore:
                 "at": moment,
                 "query": query,
                 "deep": deep_used,
+                "mode": "fallback" if any(r["fallback"] for r in rows) else "strict",
                 "elapsed_ms": round(elapsed_ms, 1),
                 "hit_count": len(rows),
                 "hits": rows,
@@ -1968,7 +2058,7 @@ class MemoryStore:
         total = sum(w for w, _ in parts)
         return sum(w * v for w, v in parts) / total
 
-    def _reinforce(self, hits: Sequence[Hit]) -> None:
+    def _reinforce(self, hits: Sequence[Hit], query: str = "") -> None:
         if not hits:
             return
         now = now_ms()
@@ -1978,29 +2068,29 @@ class MemoryStore:
             if isinstance(hit.item, Experience):
                 table = EXPERIENCE.table
             elif isinstance(hit.item, Episode):
-                table = "episodes"
+                table = EPISODE.table
             else:
-                table = "logs"
+                table = LOG.table
             grouped.setdefault((db_name, table), []).append(hit)
 
         floor = self.cfg.activity_sim_floor
         power = self.cfg.activity_curve_power
+        cap = self.cfg.retrievals_cap
         for (db_name, table), group in grouped.items():
             try:
                 _, conn = self._conn_for(db_name)
             except ScopeError:
                 continue
-            # 日志没有 activity 列：它不进等级体系，复盘完就被清掉
+            # 日志不进等级体系、没有 activity 字段：它记的是"被什么问过"
             traces = table in (EXPERIENCE.table, EPISODE.table)
             with transaction(conn):
                 for hit in group:
+                    sim = self._fuse(hit.vector_similarity, hit.lexical_score)
+                    # 活跃度按相关性平方累加：擦边十次不如命中一次
+                    delta = activity_contribution(
+                        sim, sim_floor=floor, curve_power=power
+                    )
                     if traces:
-                        # 活跃度按相关性平方累加：擦边十次不如命中一次
-                        delta = activity_contribution(
-                            self._fuse(hit.vector_similarity, hit.lexical_score),
-                            sim_floor=floor,
-                            curve_power=power,
-                        )
                         conn.execute(
                             f"UPDATE {table} SET access_count = access_count + 1,"
                             " last_accessed_at = ?, activity = activity + ? WHERE rowid = ?",
@@ -2008,15 +2098,145 @@ class MemoryStore:
                         )
                         hit.item.activity = float(getattr(hit.item, "activity", 0.0) or 0.0) + delta
                     else:
+                        retrievals = merge_retrieval(
+                            getattr(hit.item, "retrievals", []),
+                            query,
+                            sim=sim,
+                            heat=delta,
+                            now=now,
+                            cap=cap,
+                        )
                         conn.execute(
                             f"UPDATE {table} SET access_count = access_count + 1,"
-                            " last_accessed_at = ? WHERE rowid = ?",
-                            (now, hit.item.rowid),
+                            " last_accessed_at = ?, retrievals = ? WHERE rowid = ?",
+                            (now, retrievals, hit.item.rowid),
                         )
+                        hit.item.retrievals = json.loads(retrievals)
                     hit.item.access_count += 1
                     hit.item.last_accessed_at = now
 
     # ================================================================ 复盘
+
+    def infer_source_logs(
+        self,
+        conn: Any,
+        pending: Sequence[LogEntry],
+        vec: Sequence[float] | None,
+    ) -> tuple[list[LogEntry], bool]:
+        """来源日志自动映射：新条目 vec vs 当天 pending logs_vec 做 top-k。
+
+        模型零参与——这是"减少 LLM 依赖"的关键一刀。向量不可用或一条都没
+        匹配上时回落全量（digest 级关联），不抛错、不中断、不需要模型补填。
+        返回 (来源日志, 是否自动匹配命中)。
+        """
+        if not pending:
+            return [], False
+        if not vec or self.cfg.source_match_floor <= 0:
+            return list(pending), False
+        by_rowid = {int(log.rowid): log for log in pending}
+        try:
+            rows = conn.execute(
+                f"SELECT rowid, distance FROM {LOG.vec}"
+                " WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                (serialize_float32(vec), max(1, min(len(by_rowid), 20))),
+            ).fetchall()
+        except Exception:  # noqa: BLE001 — 向量表缺失/扩展不可用都降级
+            return list(pending), False
+
+        matched: list[LogEntry] = []
+        for row in rows:
+            log = by_rowid.get(int(row["rowid"]))
+            if log is None:
+                continue
+            sim = similarity_from_cosine_distance(float(row["distance"]))
+            if sim >= self.cfg.source_match_floor:
+                matched.append(log)
+        if not matched:
+            return list(pending), False
+        return matched, True
+
+    def replay_queries(
+        self,
+        source_logs: Sequence[LogEntry],
+        content: str,
+        vec: Sequence[float] | None,
+    ) -> tuple[float, dict[str, Any] | None]:
+        """按来源 log 记下的查询条件重放一次检索：新条目接不接得住？
+
+        返回 (I_replay, 失配对照)。query 跨 log 去重，复用写入时算好的 vec，
+        不重复请求 embedder；embedder 不可用时整个口径降级为 0。
+        """
+        queries: dict[str, float] = {}
+        for log in source_logs:
+            for item in log.retrievals:
+                if not isinstance(item, dict):
+                    continue
+                q = _normalize_query(str(item.get("q", "")))
+                if not q:
+                    continue
+                old_sim = float(item.get("sim", 0.0) or 0.0)
+                if q not in queries or old_sim > queries[q]:
+                    queries[q] = old_sim
+        if not queries or not vec:
+            return 0.0, None
+
+        qs = list(queries)
+        try:
+            vectors = self.embedder.try_embed(qs)
+        except Exception:  # noqa: BLE001
+            vectors = None
+        if not vectors or len(vectors) != len(qs):
+            return 0.0, None
+
+        best = 0.0
+        detail: dict[str, Any] | None = None
+        best_sim = -1.0
+        floor = self.cfg.activity_sim_floor
+        power = self.cfg.activity_curve_power
+        for q, q_vec in zip(qs, vectors):
+            vec_sim = _cosine_similarity(q_vec, vec)
+            lex = _lexical_coverage(q, content)
+            sim = self._fuse(vec_sim, lex)
+            score = activity_contribution(sim, sim_floor=floor, curve_power=power)
+            # 对照取"现在最像"的 query —— 即使它一分不得（失配时正需要它）
+            if sim > best_sim:
+                best_sim = sim
+                detail = {
+                    "query": q,
+                    "old_sim": round(queries[q], 4),
+                    "now_sim": round(sim, 4),
+                }
+            if score > best:
+                best = score
+        return best, detail
+
+    def _inherited_activity(
+        self,
+        conn: Any,
+        pending: Sequence[LogEntry],
+        content: str,
+        vec: Sequence[float] | None,
+    ) -> dict[str, Any]:
+        """两条口径取大：I_num 历史保底，I_replay 验证增益。全程机器算。"""
+        source, auto_matched = self.infer_source_logs(conn, pending, vec)
+        heat = sum(
+            float(item.get("heat", 0.0) or 0.0)
+            for log in source
+            for item in log.retrievals
+            if isinstance(item, dict)
+        )
+        num = min(heat, self.cfg.activity_inherit_cap)
+        replay, detail = self.replay_queries(source, content, vec)
+        total = max(num, replay)
+        return {
+            "num": round(num, 4),
+            "replay": round(replay, 4),
+            "total": round(total, 4),
+            "source_log_ids": [log.id for log in source],
+            "source_mode": "auto" if auto_matched else "all",
+            # 失配只是观测信号：继承已取 max 保底，不要求模型返工
+            "mismatch": detail if (replay < 1e-6 and num > 0 and detail) else None,
+        }
 
     def _latest_pending_day(self) -> str | None:
         """最近一个还有未复盘日志的日期。定时任务靠它自动补齐积压。"""
@@ -2051,7 +2271,9 @@ class MemoryStore:
                 "可长，带上时间。**不要把可复用的结论写进 episode**。\n"
                 "然后调用 consolidate_apply 提交，purge=true 会清空已复盘的原始日志。\n"
                 "不需要读存量经验做逐条比对：查重在写入时由工具完成，"
-                "只有你确信某条旧结论被这次发现推翻时才带 invalidates。"
+                "只有你确信某条旧结论被这次发现推翻时才带 invalidates。\n"
+                "也不要判断新条目来自哪条日志、不要计算活跃度："
+                "来源由向量自动匹配、活跃度由工具从检索条件重放派生，你只交内容与初值。"
             ),
         }
 
@@ -2098,9 +2320,11 @@ class MemoryStore:
         created_episodes: list[Episode] = []
         skipped_experience: list[dict[str, Any]] = []
         deduped_experience: list[str] = []
+        inherited_audit: list[dict[str, Any]] = []
+        mismatch_notes: list[str] = []
 
         existing = {
-            f.content.strip()
+            f.content.strip(): f
             for f in self.list_experience(scope="all", include_invalid=False, limit=1000)
         }
 
@@ -2109,7 +2333,36 @@ class MemoryStore:
         with transaction(conn):
             for index, raw in enumerate(prepared_experience):
                 content = raw["content"]
+                # 来源与继承值全由工具算：模型只交了 content + 初值
+                vecs = self.embedder.try_embed([content])
+                vec = vecs[0] if vecs else None
+                inherited = self._inherited_activity(conn, pending, content, vec)
+                inherited_audit.append(
+                    {"kind": "experience", "index": index, **inherited}
+                )
+
                 if content in existing:
+                    # 精确重复跳过：不新建，但继承值仍补给存量
+                    kept = existing[content]
+                    if inherited["total"] > 0:
+                        delta = inherited["total"]
+                        conn.execute(
+                            f"UPDATE {EXPERIENCE.table} SET activity = activity + ?"
+                            " WHERE rowid = ?",
+                            (delta, kept.rowid),
+                        )
+                        kept.activity += delta
+                        _record_event(
+                            conn,
+                            moment=now,
+                            table=EXPERIENCE.table,
+                            item_id=kept.id,
+                            event="dedup",
+                            from_value="consolidate-skip",
+                            to_value="reinforced",
+                            delta=delta,
+                            reason=f"复盘精确重复跳过，补继承活跃度 {delta:.3f}",
+                        )
                     skipped_experience.append(
                         {"index": index, "content": content, "reason": "duplicate"}
                     )
@@ -2125,12 +2378,14 @@ class MemoryStore:
                         # 复盘里写明「这条取代旧结论」时不能查重：
                         # 拦下来会让旧条失效、新条没写，等于空掉一条
                         allow_duplicate=bool(raw.get("invalidates")),
+                        activity=inherited["total"],
+                        vec=vec,
                     )
                 except (ValueError, ScopeError) as exc:
                     raise ConsolidationRejected(
                         f"experience[{index}] 写入失败：{exc}"
                     ) from exc
-                existing.add(content)
+                existing[content] = item
                 created_experience.append(item)
                 if getattr(item, "deduped", False):
                     # 命中了存量，没新建：digest 的产出数不能把它算进去
@@ -2141,25 +2396,44 @@ class MemoryStore:
                         self.invalidate(str(old_id), invalidated_by=item.id)
                     except NotFound:
                         pass
+                if inherited["mismatch"]:
+                    m = inherited["mismatch"]
+                    mismatch_notes.append(
+                        f"经验[{index}] 接不住来源 log 的历史查询"
+                        f"（当时 sim={m['old_sim']:.2f} → 现在 {m['now_sim']:.2f}）"
+                    )
 
             last_at = max(log.at for log in pending)
-            for index, item in enumerate(prepared_episodes):
+            for index, raw in enumerate(prepared_episodes):
+                content = raw["content"]
+                vecs = self.embedder.try_embed([content])
+                vec = vecs[0] if vecs else None
+                inherited = self._inherited_activity(conn, pending, content, vec)
+                inherited_audit.append({"kind": "episode", "index": index, **inherited})
                 try:
                     created_episodes.append(
                         self.write_episode(
-                            item["content"],
-                            importance=item.get("importance"),
-                            tags=item.get("tags"),
+                            content,
+                            importance=raw.get("importance"),
+                            tags=raw.get("tags"),
                             at=last_at,
                             day=target,
                             digest_id=digest_id,
                             source=f"digest:{digest_id}",
+                            activity=inherited["total"],
+                            vec=vec,
                         )
                     )
                 except (ValueError, ScopeError) as exc:
                     raise ConsolidationRejected(
                         f"episodes[{index}] 写入失败：{exc}"
                     ) from exc
+                if inherited["mismatch"]:
+                    m = inherited["mismatch"]
+                    mismatch_notes.append(
+                        f"经历[{index}] 接不住来源 log 的历史查询"
+                        f"（当时 sim={m['old_sim']:.2f} → 现在 {m['now_sim']:.2f}）"
+                    )
 
             # 只有条目全部写成功，才标记日志 / 写 digest / 删除原始日志
             for log in pending:
@@ -2181,7 +2455,13 @@ class MemoryStore:
                     summary,
                     1 if purge else 0,
                     model,
-                    json.dumps({"log_ids": [x.id for x in pending]}, ensure_ascii=False),
+                    json.dumps(
+                        {
+                            "log_ids": [x.id for x in pending],
+                            "inherited": inherited_audit,
+                        },
+                        ensure_ascii=False,
+                    ),
                 ),
             )
             purged = self._purge_logs(digest_id) if purge else 0
@@ -2192,6 +2472,8 @@ class MemoryStore:
                 f"{len(deduped_experience)} 条经验与存量高度重复，未新建，已给原条目加活跃度："
                 + ", ".join(deduped_experience)
             )
+        # 失配只是观测信号：继承已取 max 保底，不影响写入、不要求模型返工
+        warnings.extend(mismatch_notes)
         if pending and not prepared_experience and not prepared_episodes:
             warnings.append(
                 f"当天有 {len(pending)} 条日志却零产出："

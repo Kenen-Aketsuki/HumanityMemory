@@ -6,7 +6,7 @@
 每个用例都对应文档里的一个承诺：
 - §5.2 四态，一态都不许含糊；
 - §5.5 第 4/6 步：令牌被复制或手改必须拒绝；
-- §6.4 拒绝态只剩 bind_*；接进去之后它们当场出现（R-11 自救）；
+- §6 拒绝契约：未接入时读写工具调用返回拒绝 + checklist（2026-11-24 起不再裁剪工具面）；
 - A4 库级配置跟着库走，共享组里 A、B 读到同一份。
 """
 
@@ -253,10 +253,19 @@ def test_library_level_config_follows_the_library(env: Path) -> None:
     assert [name for name, _ in cfg_a.layers][-1] == "库"
 
 
-# ---------------------------------------------------------------- 工具面裁剪
+# -------------------------------------- 拒绝态工具面（2026-11-24 改版：不裁剪，改拒绝应答）
 
 
-def test_refusal_exposes_only_bind_tools(env: Path) -> None:
+def _call(server, name: str, arguments: dict | None = None) -> dict:
+    """走 MCPServer.call_tool 调工具，把 dict 结果从 content 里拆出来。"""
+    result = asyncio.run(server.call_tool(name, arguments or {}))
+    if isinstance(result, dict):
+        return result
+    return json.loads(result.content[0].text)
+
+
+def test_refusal_registers_all_tools_and_refuses_reads(env: Path) -> None:
+    """工具面不再随接入状态变化：全量注册；拒绝态下读写调用返回 code + checklist。"""
     root = env / "plain"
     root.mkdir()
     session = bindings.resolve_session(root)
@@ -266,36 +275,53 @@ def test_refusal_exposes_only_bind_tools(env: Path) -> None:
     )
 
     names = _tool_names(server)
-    assert names == sorted(
-        [
-            "memory_bind_status",
-            "memory_bind_new",
-            "memory_bind_existing",
-            "memory_bind_adopt",
-            "memory_bind_decline",
-            "memory_use_workspace",
-        ]
-    ), "拒绝态不该暴露任何读写工具"
+    assert len(names) == 29, "未接入时工具也应全量可见，不再裁剪"
+    assert "memory_search" in names
+    assert "memory_bind_new" in names
+
+    payload = _call(server, "memory_stats")
+    assert payload["ok"] is False
+    assert payload["code"] == "no_token"
+    assert payload["checklist"], "拒绝必须带清单，否则用户不知道下一步"
 
 
-def test_adopt_activates_the_full_toolset(env: Path) -> None:
-    """R-11：boot 实例落在未接入目录，接进去之后工具必须当场出现。"""
-    root = env / "alpha"
+def test_declined_state_refuses_reads_with_declined_code(env: Path) -> None:
+    root = env / "declined_ws"
     _project(root)
-
+    bindings.bind_decline(root)
     session = bindings.resolve_session(root)
     server = build_server(
         _cfg(env / "home"), layout=paths.empty_layout(root=root), session=session
     )
-    assert len(_tool_names(server)) == 6
 
-    # 走同一份 bindings 逻辑（MCP 工具与 CLI 都调它）
-    bound = bindings.bind_adopt(root)
-    assert bound.ok
+    payload = _call(server, "memory_stats")
+    assert payload["ok"] is False
+    assert payload["code"] == "declined"
 
-    server2 = build_server(_cfg(env / "home", bound.library_dir), layout=bound.layout, session=bound)
-    assert "memory_search" in _tool_names(server2)
-    assert len(_tool_names(server2)) == 29
+
+def test_rescue_tools_stay_usable_and_binding_unblocks_reads(env: Path) -> None:
+    """拒绝范围只盖原被裁剪的读写工具；bind / use_workspace 自救通道不堵。"""
+    root = env / "plain"
+    root.mkdir()
+    session = bindings.resolve_session(root)
+    server = build_server(
+        _cfg(env / "home"), layout=paths.empty_layout(root=root), session=session
+    )
+
+    # 自救通道在拒绝态下照常应答
+    payload = _call(server, "memory_bind_status")
+    assert payload["ok"] is False
+    assert payload["code"] == "no_token"
+
+    # 同一 server 实例内接进去：store 就位，读写立刻放行，无需重建或重挂载
+    bound = env / "alpha"
+    _project(bound)
+    bindings.bind_adopt(bound)
+    payload = _call(server, "memory_use_workspace", {"path": str(bound)})
+    assert payload["ok"] is True, f"use_workspace 应放行：{payload}"
+
+    payload = _call(server, "memory_stats")
+    assert payload["ok"] is True, f"接入后读写应立刻放行：{payload}"
 
 
 # ---------------------------------------------------------------- 搬家

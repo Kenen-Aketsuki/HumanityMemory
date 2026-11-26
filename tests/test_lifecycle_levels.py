@@ -77,20 +77,20 @@ def _set_clock(store: MemoryStore, moment: int) -> None:
 def test_decide_three_bands(env) -> None:
     """三组验收：3 级 → 升 / 死区 / 降。
 
-    按出厂等级表，3 级的死区是 [down=2.8, up=5.0)：
-    6 → 升 4；4 → 维持 3；2 → 降 2（2 < 2.8）。
+    按出厂等级表，3 级的死区是 [down=0.45, up=0.9)：
+    1.0 → 升 4；0.7 → 维持 3；0.3 → 降 2（0.3 < 0.45）。
     """
     cfg, _ = env
     table = LevelTable.from_config(cfg)
 
-    up = table.decide(3, 6.0, PERIOD_EXPERIENCE)
+    up = table.decide(3, 1.0, PERIOD_EXPERIENCE)
     assert (up.level, up.action) == (4, "up")
 
-    hold = table.decide(3, 4.0, PERIOD_EXPERIENCE)
+    hold = table.decide(3, 0.7, PERIOD_EXPERIENCE)
     assert (hold.level, hold.action) == (3, "hold")
     assert "死区" in hold.reason
 
-    down = table.decide(3, 2.0, PERIOD_EXPERIENCE)
+    down = table.decide(3, 0.3, PERIOD_EXPERIENCE)
     assert (down.level, down.action) == (2, "down")
 
 
@@ -234,7 +234,7 @@ def test_judge_hold_still_resets_period(env) -> None:
         table="knowledge",
         item_id=item.id,
         forget_level=3,
-        activity=4.0,
+        activity=0.7,  # L3 死区 [0.45, 0.9)
         period_start=now - int(4 * DAY_MS),
     )
     _set_clock(store, now - int(DAY_MS))

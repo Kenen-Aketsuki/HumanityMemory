@@ -31,7 +31,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from urllib.parse import quote
 
 from .lifecycle import DAY_MS, period_kind
@@ -456,6 +456,124 @@ def read_node_activity(workspace_dir: Path) -> dict[str, dict[str, Any]]:
                     "activity": round(float(activity or 0.0), 4),
                     "level": int(level) if level is not None else None,
                 }
+    except sqlite3.Error:
+        return out
+    finally:
+        conn.close()
+    return out
+
+
+# ---------------------------------------------------------------- 条目正文反查
+
+# 检索记录 / 裁定快照里只有 id，没有正文。页面上把 id 悬停出正文需要回库反查：
+# 这个函数就是那一次只读查询的落点（不建表、不写列、不碰 activity）。
+# `digests` 没有 content 列，用 summary 当正文 —— 复盘条目本来就只有摘要。
+_CONTENT_TABLES: tuple[tuple[str, str, str], ...] = (
+    ("knowledge", "experience", "content"),
+    ("episodes", "episode", "content"),
+    ("logs", "log", "content"),
+    ("digests", "digest", "summary"),
+)
+
+CONTENT_LIMIT = 500
+
+# SQLite 单条语句的绑定变量上限是 999（老版本），分批留足余量
+_CONTENT_BATCH = 400
+
+
+def read_item_contents(
+    db: Path, ids: Sequence[str] | None = None, *, limit: int = CONTENT_LIMIT
+) -> dict[str, dict[str, Any]]:
+    """按 id 反查条目正文与少量元信息，键是 id。
+
+    ``ids=None`` 表示全量读（给单文件报告一次性内联用）；给列表就只查这些 id。
+
+    返回 ``{id: {id, kind, content, level, activity, invalidated_by, archived}}``。
+    查不到的 id 不会出现在结果里 —— 调用方据此显示「已删除」，而不是假装有内容。
+
+    正文按 ``limit`` 截断并注明原文字数：浮层只是「看一眼是什么」，不该把几十 KB
+    的日志整条塞进 DOM。任何异常都当「没有数据」：浮层少一行内容，不该让页面崩。
+    """
+    db = Path(db)
+    if not db.is_file():
+        return {}
+    try:
+        # 与 read_node_activity 同一套写法：as_posix + quote 才能吃下带中文/空格的路径
+        uri = "file:" + quote(db.as_posix(), safe="/:") + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return {}
+
+    wanted: list[str] | None = None
+    if ids is not None:
+        wanted = []
+        seen: set[str] = set()
+        for raw in ids:
+            item_id = str(raw or "").strip()
+            if item_id and item_id not in seen:
+                seen.add(item_id)
+                wanted.append(item_id)
+
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        for table, kind, text_col in _CONTENT_TABLES:
+            try:
+                cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            except sqlite3.Error:
+                continue
+            if text_col not in cols:
+                continue  # 老库没有这张表 / 没有这一列，跳过
+
+            sel = ["id", f"{text_col} AS content"]
+            for extra in ("forget_level", "activity", "invalidated_by", "archived_at"):
+                if extra in cols:
+                    sel.append(extra)
+            base = "SELECT " + ", ".join(sel) + f" FROM {table}"
+
+            if wanted is None:
+                batches: list[list[str] | None] = [None]
+            else:
+                batches = [
+                    wanted[i : i + _CONTENT_BATCH]
+                    for i in range(0, len(wanted), _CONTENT_BATCH)
+                ]
+            for batch in batches:
+                query, argv = base, ()
+                if batch is not None:
+                    if not batch:
+                        continue
+                    query += " WHERE id IN (" + ",".join("?" * len(batch)) + ")"
+                    argv = tuple(batch)
+                try:
+                    rows = conn.execute(query, argv).fetchall()
+                except sqlite3.Error:
+                    continue
+                for row in rows:
+                    item_id = str(row["id"])
+                    if item_id in out:
+                        continue  # 先到先得：knowledge → episodes → logs → digests
+                    keys = set(row.keys())
+                    text = str(row["content"] or "")
+                    if len(text) > limit:
+                        text = text[:limit] + f"…（已截断，原文 {len(text)} 字）"
+                    out[item_id] = {
+                        "id": item_id,
+                        "kind": kind,
+                        "content": text,
+                        "level": int(row["forget_level"])
+                        if "forget_level" in keys and row["forget_level"] is not None
+                        else None,
+                        "activity": round(float(row["activity"] or 0.0), 2)
+                        if "activity" in keys
+                        else None,
+                        "invalidated_by": row["invalidated_by"]
+                        if "invalidated_by" in keys
+                        else None,
+                        "archived": bool(row["archived_at"])
+                        if "archived_at" in keys
+                        else False,
+                    }
     except sqlite3.Error:
         return out
     finally:

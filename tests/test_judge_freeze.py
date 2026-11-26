@@ -67,17 +67,17 @@ def _clock(store: MemoryStore) -> int | None:
 # ---------------------------------------------------------------- 冻结生效
 
 
-def test_freeze_protects_l3_and_above(env) -> None:
-    """上限 2 天 = 「L3 及以上保住，L2 及以下照常掉」。
+def test_freeze_protects_l2_and_above(env) -> None:
+    """上限 1 天 = 「L2 及以上保住，L1 照常掉」。
 
-    L3 周期 3 天（2 < 3 → 静默后仍不到期）；L2 周期 2 天（2 ≤ 2 → 照常降）。
-    这条边界就是取值 2 的全部理由，改上限就会把它挪走。
+    L2 周期 2 天（1 < 2 → 静默后仍不到期）；L1 周期 1 天（1 ≤ 1 → 照常降）。
+    这条边界就是取值 1 的全部理由，改上限就会把它挪走。
     """
     cfg, store = env
     now = 3_000_000_000_000
-    keep = store.write_memory("3 级该保住", importance=0.9)
-    drop = store.write_memory("2 级该掉下去", importance=0.9)
-    for item, level in ((keep, 3), (drop, 2)):
+    keep = store.write_memory("2 级该保住", importance=0.9)
+    drop = store.write_memory("1 级该掉下去", importance=0.9)
+    for item, level in ((keep, 2), (drop, 1)):
         _force(
             store,
             table="knowledge",
@@ -91,11 +91,11 @@ def test_freeze_protects_l3_and_above(env) -> None:
     report = store.judge_due(now=now)
 
     assert report["frozen_days"] == pytest.approx(90 - cfg.forget_max_gap_days, abs=0.1)
-    assert _row(store, table="knowledge", item_id=keep.id)["forget_level"] == 3, (
-        "L3 周期 3 天 > 上限 2 天，静默后必须保住"
+    assert _row(store, table="knowledge", item_id=keep.id)["forget_level"] == 2, (
+        "L2 周期 2 天 > 上限 1 天，静默后必须保住"
     )
-    assert _row(store, table="knowledge", item_id=drop.id)["forget_level"] == 1, (
-        "L2 周期 2 天 ≤ 上限，静默后照常降一级"
+    assert _row(store, table="knowledge", item_id=drop.id)["forget_level"] == 0, (
+        "L1 周期 1 天 ≤ 上限，静默后照常降级进遗忘层"
     )
 
 
@@ -108,7 +108,7 @@ def test_freeze_never_drops_more_than_one_level(env) -> None:
         store,
         table="knowledge",
         item_id=item.id,
-        forget_level=2,
+        forget_level=1,
         activity=0.0,
         period_start=now - int(365 * DAY_MS),
     )
@@ -116,8 +116,8 @@ def test_freeze_never_drops_more_than_one_level(env) -> None:
 
     store.judge_due(now=now)
 
-    assert _row(store, table="knowledge", item_id=item.id)["forget_level"] == 1, (
-        "365 天被压成 2 天，2 级（2 天周期）到期降 1 —— 只降一级，不是连降"
+    assert _row(store, table="knowledge", item_id=item.id)["forget_level"] == 0, (
+        "365 天被压成 1 天，1 级（1 天周期）到期降 1 进遗忘层 —— 只降一级，不是连跳"
     )
 
 
@@ -150,11 +150,11 @@ def test_freeze_saves_memory_that_outlived_its_period(env) -> None:
 
 
 def test_no_freeze_when_gap_within_cap(env) -> None:
-    """间隔在上限内就照常算，不许凭空冻结。"""
+    """间隔在上限内（含正好等于上限）就照常算，不许凭空冻结。"""
     cfg, store = env
     now = 3_000_000_000_000
-    gap_days = cfg.forget_max_gap_days - 1
-    item = store.write_memory("三天前算过", importance=0.9)
+    gap_days = cfg.forget_max_gap_days
+    item = store.write_memory("上限内算过", importance=0.9)
     _force(
         store,
         table="knowledge",
@@ -169,7 +169,7 @@ def test_no_freeze_when_gap_within_cap(env) -> None:
 
     assert report["frozen_days"] == 0
     assert _row(store, table="knowledge", item_id=item.id)["forget_level"] == 0, (
-        "1 级 + 6 天冷落 → 该掉进遗忘层"
+        "1 级 + 1 天冷落 → 该掉进遗忘层"
     )
 
 
@@ -278,7 +278,7 @@ def test_dry_run_preview_matches_actual(env) -> None:
         store,
         table="knowledge",
         item_id=item.id,
-        forget_level=2,
+        forget_level=1,
         activity=0.0,
         period_start=now - int(90 * DAY_MS),
     )
@@ -288,7 +288,7 @@ def test_dry_run_preview_matches_actual(env) -> None:
     assert preview["frozen_days"] > 0
     assert preview["due"] == 1
     assert preview["settled"] == 0
-    assert _row(store, table="knowledge", item_id=item.id)["forget_level"] == 2, (
+    assert _row(store, table="knowledge", item_id=item.id)["forget_level"] == 1, (
         "干跑不能写库"
     )
     assert _row(store, table="knowledge", item_id=item.id)["period_start"] == now - int(
