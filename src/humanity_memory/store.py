@@ -1393,11 +1393,15 @@ class MemoryStore:
         include_archived: bool = False,
         limit: int = 8,
         min_score: float | None = None,
+        level_filter: str = "live",
     ) -> list[Hit]:
         """混合检索。
 
         `kinds` 接受 None / "all" / "experience" / ["experience", "episode"]，
         也认中文「经验 / 经历 / 日志」。类型就是表，所以这里只做表级选择。
+
+        `level_filter` = live（常规视野）| forgotten（遗忘层，deep_recall 专用）。
+        门槛、排序、兜底逻辑对两层完全一致 —— 范围变了，要求不变。
 
         **门槛与排序都只看相关性**（`Hit.retrieval`），重要度 / 等级 / 类型权重
         不参与过滤和排序 —— 它们只影响 `score` 的展示值。
@@ -1416,13 +1420,14 @@ class MemoryStore:
         hits, _ = self._collect(query, kinds=kinds, scope=scope,
                                 include_invalid=include_invalid,
                                 include_archived=include_archived, limit=limit,
-                                min_score=floor)
+                                min_score=floor, level_filter=level_filter)
         # 严格层一条都没捞到，才退回宽泛层再找一遍
         if use_fallback and len(hits) < self.cfg.fallback_min_hits:
             broad = self._broad_search(
                 query, kinds=kinds, scope=scope,
                 include_invalid=include_invalid,
                 include_archived=include_archived, limit=limit,
+                level_filter=level_filter,
             )
             if broad:
                 return broad
@@ -1439,6 +1444,7 @@ class MemoryStore:
         include_invalid: bool,
         include_archived: bool,
         limit: int,
+        level_filter: str = "live",
     ) -> list[Hit]:
         """宽泛层：严格阈值捞不到时的兜底。
 
@@ -1451,11 +1457,13 @@ class MemoryStore:
             return self._broad_rrf(
                 query, kinds=kinds, scope=scope, include_invalid=include_invalid,
                 include_archived=include_archived, limit=limit,
+                level_filter=level_filter,
             )
         if mode == "maxpool":
             return self._broad_maxpool(
                 query, kinds=kinds, scope=scope, include_invalid=include_invalid,
                 include_archived=include_archived, limit=limit,
+                level_filter=level_filter,
             )
         return []
 
@@ -1473,6 +1481,7 @@ class MemoryStore:
         include_invalid: bool,
         include_archived: bool,
         limit: int,
+        level_filter: str = "live",
     ) -> list[Hit]:
         """逐词检索 + Reciprocal Rank Fusion。
 
@@ -1489,7 +1498,7 @@ class MemoryStore:
             hits, _ = self._collect(
                 term, kinds=kinds, scope=scope,
                 include_invalid=include_invalid, include_archived=include_archived,
-                limit=topk, min_score=0.0,
+                limit=topk, min_score=0.0, level_filter=level_filter,
             )
             if hits:
                 routes.append(hits)
@@ -1524,6 +1533,7 @@ class MemoryStore:
         include_invalid: bool,
         include_archived: bool,
         limit: int,
+        level_filter: str = "live",
     ) -> list[Hit]:
         """整句 + 逐词的向量相似度取最大。
 
@@ -1543,7 +1553,7 @@ class MemoryStore:
             hits, _ = self._collect(
                 variant, kinds=kinds, scope=scope,
                 include_invalid=include_invalid, include_archived=include_archived,
-                limit=topk, min_score=0.0,
+                limit=topk, min_score=0.0, level_filter=level_filter,
             )
             for hit in hits:
                 key = str(hit.item.id)
@@ -1762,6 +1772,11 @@ class MemoryStore:
     ) -> dict[str, Any]:
         """深度回忆：**只在遗忘层（0 级）里检索**（§3.2）。
 
+        检索逻辑与常规 `search` 完全一致 —— 同一条 `min_retrieval` 验收线、
+        同一套宽泛层兜底（maxpool / rrf），只是 `level_filter` 换成遗忘层：
+        范围变了，要求不变。（`deep_recall_floor` 只在 `recall` 里当「常规捞不到
+        才翻遗忘层」的触发线，不参与遗忘层的验收。）
+
         命中的条目会被记一次 `revive_hits`；累计到 `revive_hits` 就复活到
         `revive_to_level`（默认 1），周期起点推到现在、活跃度清零。
         回 1 级而不是 3 级：想起一次不代表记住了，它得在下个周期再证明一次。
@@ -1771,18 +1786,19 @@ class MemoryStore:
         """
         query = (query or "").strip()
         if not query:
-            return {"hits": [], "revived": [], "count": 0, "floor": 0.0}
+            return {
+                "hits": [], "revived": [], "count": 0,
+                "floor": self.cfg.min_retrieval,
+            }
 
-        floor = self.cfg.deep_recall_floor
-        hits, _ = self._collect(
-            query, kinds=kinds, scope=scope,
-            include_invalid=False, include_archived=False,
-            limit=max(limit * 2, 10), level_filter="forgotten",
+        hits = self.search(
+            query, kinds=kinds, scope=scope, limit=limit, level_filter="forgotten"
         )
-        # 遗忘层里也得够相关才算「想起」：否则任何一点词法重叠都会给复合计次
-        hits = [h for h in hits if self._similarity_of(h) >= floor][:limit]
         if not hits:
-            return {"hits": [], "revived": [], "count": 0, "floor": floor}
+            return {
+                "hits": [], "revived": [], "count": 0,
+                "floor": self.cfg.min_retrieval,
+            }
 
         moment = now_ms()
         revived: list[str] = []
@@ -1797,7 +1813,7 @@ class MemoryStore:
             "hits": hits,
             "revived": revived,
             "count": len(hits),
-            "floor": floor,
+            "floor": self.cfg.min_retrieval,
             "note": (
                 "这些是已落到遗忘层的记忆：正文完整，但不在常规检索里。"
                 "经历需要被深度回忆命中多次才复活，经验没有复活计数（只能人工恢复）。"
